@@ -71,7 +71,7 @@ pub fn parse_eviction_policy(s: &str) -> EvictionPolicy {
 #[inline(always)]
 pub fn eviction_enabled(store: &Store) -> bool {
     let cfg = store.config().eviction;
-    cfg.max_memory > 0 && cfg.policy != EvictionPolicy::NoEviction
+    cfg.max_memory > 0
 }
 
 pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
@@ -190,11 +190,7 @@ fn evict_random(store: &Store, volatile_only: bool) -> bool {
 
 pub fn is_write_command(cmd: &[u8]) -> bool {
     fn eq(input: &[u8], expected: &[u8]) -> bool {
-        input.len() == expected.len()
-            && input
-                .iter()
-                .zip(expected)
-                .all(|(a, b)| a.to_ascii_uppercase() == *b)
+        input.eq_ignore_ascii_case(expected)
     }
     eq(cmd, b"SET")
         || eq(cmd, b"SETNX")

@@ -8,6 +8,8 @@ sdk/dist/
 # nix
 /result
 examples/*/node_modules/
+harness-rules.toml
+.worktrees
 
 # secrets
 .env

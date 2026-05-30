@@ -11,8 +11,7 @@ pub fn cmd_del(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'del' command");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[1..].to_vec();
-    resp::write_integer(out, store.del(&keys));
+    resp::write_integer(out, store.del(&args[1..]));
     CmdResult::Written
 }
 
@@ -30,8 +29,7 @@ pub fn cmd_exists(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'exists' command");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[1..].to_vec();
-    resp::write_integer(out, store.exists(&keys, now));
+    resp::write_integer(out, store.exists(&args[1..], now));
     CmdResult::Written
 }
 
@@ -355,6 +353,19 @@ pub fn cmd_object(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
                             "raw"
                         }
                     }
+                    StoreValue::StrBuf(s) => {
+                        if let Ok(ss) = std::str::from_utf8(s) {
+                            if ss.parse::<i64>().is_ok() {
+                                "int"
+                            } else if s.len() <= 44 {
+                                "embstr"
+                            } else {
+                                "raw"
+                            }
+                        } else {
+                            "raw"
+                        }
+                    }
                     StoreValue::List(l) => {
                         if l.len() <= 128 {
                             "listpack"
@@ -414,6 +425,7 @@ pub fn cmd_memory(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
                     + 64
                     + match &entry.value {
                         StoreValue::Str(s) => s.len() + 16,
+                        StoreValue::StrBuf(s) => s.len() + 16,
                         StoreValue::List(l) => l.iter().map(|b| b.len() + 16).sum::<usize>(),
                         StoreValue::Hash(h) => {
                             h.iter().map(|(k, v)| k.len() + v.len() + 32).sum::<usize>()

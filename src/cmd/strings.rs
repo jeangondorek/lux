@@ -132,7 +132,9 @@ pub fn cmd_get(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         resp::write_error(out, "ERR wrong number of arguments for 'get' command");
         return CmdResult::Written;
     }
-    resp::write_optional_bulk_raw(out, &store.get(args[1], now));
+    let idx = store.shard_for_key(args[1]);
+    let shard = store.lock_read_shard(idx);
+    Store::get_and_write(&shard.data, args[1], now, out);
     CmdResult::Written
 }
 
@@ -240,7 +242,9 @@ pub fn cmd_mget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     }
     resp::write_array_header(out, args.len() - 1);
     for key in &args[1..] {
-        resp::write_optional_bulk_raw(out, &store.get(key, now));
+        let idx = store.shard_for_key(key);
+        let shard = store.lock_read_shard(idx);
+        Store::get_and_write(&shard.data, key, now, out);
     }
     CmdResult::Written
 }
@@ -250,11 +254,7 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'mset' command");
         return CmdResult::Written;
     }
-    let mut i = 1;
-    while i < args.len() {
-        store.set(args[i], args[i + 1], None, now);
-        i += 2;
-    }
+    store.mset_from_args(&args[1..], now);
     resp::write_ok(out);
     CmdResult::Written
 }
@@ -374,8 +374,8 @@ pub fn cmd_incrbyfloat(
     let mut shard = store.lock_write_shard(idx);
     let ks = arg_str(args[1]);
     let current: f64 = match shard.data.get(ks) {
-        Some(e) if !e.is_expired_at(now) => match &e.value {
-            StoreValue::Str(s) => {
+        Some(e) if !e.is_expired_at(now) => match e.value.string_bytes() {
+            Some(s) => {
                 let ss = std::str::from_utf8(s).unwrap_or("");
                 if ss.contains(' ') {
                     resp::write_error(out, "ERR value is not a valid float");
@@ -393,7 +393,7 @@ pub fn cmd_incrbyfloat(
                     }
                 }
             }
-            _ => {
+            None => {
                 resp::write_error(
                     out,
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -415,7 +415,7 @@ pub fn cmd_incrbyfloat(
     };
     let expires_at = shard.data.get(ks).and_then(|e| e.expires_at);
     shard.version += 1;
-    shard.data.insert(
+    let old = shard.data.insert(
         ks.to_string(),
         Entry {
             value: StoreValue::Str(Bytes::from(new_str.clone())),
@@ -423,6 +423,9 @@ pub fn cmd_incrbyfloat(
             lru_clock: store.lru_clock(),
         },
     );
+    if old.is_none() {
+        store.key_added();
+    }
     resp::write_bulk(out, &new_str);
     CmdResult::Written
 }
