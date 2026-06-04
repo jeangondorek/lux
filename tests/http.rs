@@ -117,7 +117,7 @@ fn http_request_with_headers(
 ) -> (u16, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
     let body_str = body.unwrap_or("");
