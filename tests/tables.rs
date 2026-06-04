@@ -1,8 +1,6 @@
 use std::io::{BufRead, BufReader, Read as IoRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 fn start_server(port: u16) -> Child {
@@ -28,15 +26,11 @@ fn start_server(port: u16) -> Child {
 }
 
 fn alloc_port() -> u16 {
-    static NEXT_PORT: OnceLock<AtomicU16> = OnceLock::new();
-    let start = 20_000 + (std::process::id() % 20_000) as u16;
-    let next = NEXT_PORT.get_or_init(|| AtomicU16::new(start));
-    loop {
-        let port = next.fetch_add(1, Ordering::Relaxed);
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral test port")
+        .local_addr()
+        .expect("read ephemeral test port")
+        .port()
 }
 
 fn wait_for_port(port: u16) {

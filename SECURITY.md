@@ -48,7 +48,7 @@ This policy covers:
 
 - The Lux database engine ([github.com/lux-db/lux](https://github.com/lux-db/lux))
 - Lux Cloud ([luxdb.dev](https://luxdb.dev))
-- The luxctl CLI
+- The Lux CLI
 - The @luxdb/sdk npm package
 
 ## Contact

@@ -1,4 +1,6 @@
 import Redis, { type RedisOptions } from 'ioredis';
+import { LuxAuthClient, type LuxAuthOptions } from './auth';
+import { createProjectClient, LuxProjectClient, type LuxProjectOptions } from './project';
 import { TimeSeriesNamespace, VectorNamespace } from './namespaces';
 import { LuxRealtimeManager } from './realtime';
 import { TableQueryBuilder, type TableQueryBuilderOptions } from './table';
@@ -12,6 +14,35 @@ import type {
 	VSearchResult,
 } from './types';
 
+export type {
+	LuxAuthKey,
+	LuxAuthChangeEvent,
+	LuxAuthOptions,
+	LuxAuthSession,
+	LuxAuthStateChangeCallback,
+	LuxAuthStorage,
+	LuxAuthSubscription,
+	LuxAuthUser,
+	LuxOAuthProvider,
+	LuxOAuthUrl,
+	LuxSignInWithOAuthOptions,
+	LuxCreateApiKeyOptions,
+	LuxSignInOptions,
+	LuxSignUpOptions,
+} from './auth';
+export {
+	createProjectClient,
+	LuxProjectClient,
+};
+export { createBrowserClient } from './browser';
+export type { LuxBrowserClientOptions } from './browser';
+export { createServerClient } from './ssr';
+export type { LuxCookieMethods, LuxCookieOptions, LuxServerClientOptions } from './ssr';
+export type {
+	LuxProjectOptions,
+	LuxTableColumn,
+	LuxVectorSearchOptions,
+} from './project';
 export type {
 	KSubEvent,
 	LuxError,
@@ -30,21 +61,54 @@ export type {
 export { TableQueryBuilder, TableSubscription } from './table';
 export type { TableQueryBuilderOptions } from './table';
 
+export type LuxClientOptions = RedisOptions & LuxAuthOptions;
+export type LuxAuthNamespace = Redis['auth'] & LuxAuthClient;
+
+function createAuthNamespace(redis: Redis, options: LuxAuthOptions): LuxAuthNamespace {
+	const client = new LuxAuthClient(options);
+	const redisAuth = ((...args: unknown[]) => {
+		return (redis as any).call('AUTH', ...args);
+	}) as LuxAuthNamespace;
+
+	return new Proxy(redisAuth, {
+		get(target, prop, receiver) {
+			if (prop in client) {
+				const value = (client as any)[prop];
+				return typeof value === 'function' ? value.bind(client) : value;
+			}
+			return Reflect.get(target, prop, receiver);
+		},
+		set(_target, prop, value) {
+			(client as any)[prop] = value;
+			return true;
+		},
+	}) as LuxAuthNamespace;
+}
+
 export class Lux extends Redis {
 	vectors: VectorNamespace;
 	timeseries: TimeSeriesNamespace;
+	auth: LuxAuthNamespace;
+	authApi: LuxAuthClient;
 	private realtimeManager?: LuxRealtimeManager;
 
-	constructor(options?: RedisOptions | string) {
+	constructor(options?: LuxClientOptions | RedisOptions | string) {
+		let authOptions: LuxAuthOptions = {};
 		if (typeof options === 'string') {
 			if (options.startsWith('rediss://') || options.startsWith('luxs://')) {
 				throw new Error('TLS is not yet supported');
 			}
 			options = options.replace(/^lux:\/\//, 'redis://');
+		} else if (options) {
+			const { httpUrl, apiKey, authToken, fetch: fetchImpl, ...redisOptions } = options as LuxClientOptions;
+			authOptions = { httpUrl, apiKey, authToken, fetch: fetchImpl };
+			options = redisOptions as RedisOptions;
 		}
 		super(options as any);
 		this.vectors = new VectorNamespace(this);
 		this.timeseries = new TimeSeriesNamespace(this);
+		this.auth = createAuthNamespace(this, authOptions);
+		this.authApi = this.auth;
 	}
 
 	table<T extends TableRow = TableRow>(name: string, options?: TableQueryBuilderOptions<T>): TableQueryBuilder<T> {
@@ -258,8 +322,21 @@ export class Lux extends Redis {
 	}
 }
 
-export function createClient(options?: RedisOptions | string): Lux {
-	return new Lux(options);
+export function createClient(url: string, key: string, options?: Omit<LuxProjectOptions, 'url' | 'key'>): LuxProjectClient;
+export function createClient(options?: LuxClientOptions | RedisOptions | string): Lux;
+export function createClient(
+	optionsOrUrl?: LuxClientOptions | RedisOptions | string,
+	key?: string,
+	projectOptions?: Omit<LuxProjectOptions, 'url' | 'key'>
+): Lux | LuxProjectClient {
+	if (typeof optionsOrUrl === 'string' && typeof key === 'string') {
+		return createProjectClient({ ...(projectOptions ?? {}), url: optionsOrUrl, key });
+	}
+	return new Lux(optionsOrUrl);
+}
+
+export function createAuthClient(options: LuxAuthOptions): LuxAuthClient {
+	return new LuxAuthClient(options);
 }
 
 export default Lux;

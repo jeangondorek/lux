@@ -2,7 +2,7 @@
 set -e
 
 REPO="lux-db/lux"
-BINARY="luxctl"
+BINARY="lux"
 INSTALL_DIR="/usr/local/bin"
 
 OS="$(uname -s)"
@@ -20,10 +20,10 @@ case "$ARCH" in
     *)             echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-ARTIFACT="${BINARY}-${OS_NAME}-${ARCH_NAME}"
-LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" | grep -o '"tag_name": *"luxctl-v[^"]*"' | head -1 | grep -o 'luxctl-v[^"]*')
+ARTIFACT="lux-cli-${OS_NAME}-${ARCH_NAME}"
+LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" | grep -o '"tag_name": *"cli-v[^"]*"' | head -1 | grep -o 'cli-v[^"]*')
 if [ -z "$LATEST_TAG" ]; then
-    echo "Could not find a luxctl release. Check https://github.com/${REPO}/releases"
+    echo "Could not find a Lux CLI release. Check https://github.com/${REPO}/releases"
     exit 1
 fi
 LATEST_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ARTIFACT}.tar.gz"
@@ -51,4 +51,4 @@ chmod +x "$INSTALL_DIR/$BINARY"
 
 echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
 echo ""
-echo "Run 'luxctl login' to get started."
+echo "Run 'lux login' to get started."

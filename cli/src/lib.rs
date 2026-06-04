@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -8,27 +9,38 @@ use std::path::PathBuf;
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
 
 #[derive(Parser)]
-#[command(name = "luxctl", version, about = "CLI for Lux Cloud")]
+#[command(name = "lux", version, about = "CLI for Lux")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    #[arg(long, global = true, env = "LUXCTL_API_URL")]
+    #[arg(long, global = true, env = "LUX_API_URL")]
     api_url: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    Init,
     Login,
     Logout,
-    Projects,
-    Status {
+    Link {
         #[arg(help = "Project name or ID")]
         project: String,
     },
-    Exec {
+    Projects,
+    Status {
         #[arg(help = "Project name or ID")]
+        project: Option<String>,
+    },
+    Exec {
+        #[arg(help = "Project name, ID, or connection URL")]
         project: String,
+        #[arg(short = 'H', long, help = "Host for direct connection")]
+        host: Option<String>,
+        #[arg(short, long, help = "Port for direct connection")]
+        port: Option<u16>,
+        #[arg(short = 'a', long, help = "Password for direct connection")]
+        password: Option<String>,
         #[arg(
             trailing_var_arg = true,
             help = "Command to execute (quote wildcards: KEYS '*')"
@@ -37,7 +49,7 @@ enum Commands {
     },
     Logs {
         #[arg(help = "Project name or ID")]
-        project: String,
+        project: Option<String>,
         #[arg(short, long, default_value = "100")]
         lines: usize,
     },
@@ -56,7 +68,7 @@ enum Commands {
     },
     Restart {
         #[arg(help = "Project name or ID")]
-        project: String,
+        project: Option<String>,
     },
     Destroy {
         #[arg(help = "Project name or ID")]
@@ -78,9 +90,21 @@ enum Commands {
         #[arg(long, help = "Check for updates without installing")]
         check: bool,
     },
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
+    },
     Migrate {
         #[command(subcommand)]
         action: MigrateAction,
+    },
+    Seed {
+        #[command(subcommand)]
+        action: SeedAction,
     },
 }
 
@@ -89,10 +113,14 @@ enum MigrateAction {
     New {
         #[arg(help = "Migration name (e.g. create_users)")]
         name: String,
+        #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
+        dir: PathBuf,
     },
     Status {
         #[arg(help = "Project name, ID, or connection URL")]
         project: Option<String>,
+        #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
+        dir: PathBuf,
         #[arg(short = 'H', long, help = "Host for direct connection")]
         host: Option<String>,
         #[arg(short, long, help = "Port for direct connection")]
@@ -103,6 +131,56 @@ enum MigrateAction {
     Run {
         #[arg(help = "Project name, ID, or connection URL")]
         project: Option<String>,
+        #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
+        dir: PathBuf,
+        #[arg(short = 'H', long, help = "Host for direct connection")]
+        host: Option<String>,
+        #[arg(short, long, help = "Port for direct connection")]
+        port: Option<u16>,
+        #[arg(short = 'a', long, help = "Password for direct connection")]
+        password: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    List {
+        #[arg(help = "Project name or ID")]
+        project: Option<String>,
+    },
+    Create {
+        #[arg(long, help = "Project name or ID")]
+        project: Option<String>,
+        #[arg(long, help = "publishable or secret")]
+        kind: String,
+        #[arg(long, help = "Human-readable key name")]
+        name: Option<String>,
+    },
+    Revoke {
+        #[arg(help = "Key ID")]
+        id: String,
+        #[arg(long, help = "Project name or ID")]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnvAction {
+    Pull {
+        #[arg(help = "Project name or ID")]
+        project: Option<String>,
+        #[arg(short, long, default_value = ".env.local", help = "Output env file")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SeedAction {
+    Run {
+        #[arg(help = "Project name, ID, or connection URL")]
+        project: Option<String>,
+        #[arg(long, default_value = "lux/seed.lux", help = "Seed file")]
+        file: PathBuf,
         #[arg(short = 'H', long, help = "Host for direct connection")]
         host: Option<String>,
         #[arg(short, long, help = "Port for direct connection")]
@@ -116,6 +194,12 @@ enum MigrateAction {
 struct Config {
     token: String,
     api_url: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct LocalConfig {
+    project_id: Option<String>,
+    project_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -133,10 +217,51 @@ struct Instance {
     memory_mb: u32,
     port: Option<u16>,
     worker_host: Option<String>,
-    password: String,
     #[serde(default)]
     #[allow(dead_code)]
     current_image: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InstanceDetail {
+    public_endpoints: Option<PublicEndpoints>,
+}
+
+#[derive(Deserialize)]
+struct PublicEndpoints {
+    http: String,
+}
+
+#[derive(Deserialize)]
+struct Credentials {
+    resp: String,
+}
+
+#[derive(Deserialize)]
+struct AuthCredentials {
+    publishable_key: Option<String>,
+    secret_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProjectKey {
+    id: String,
+    kind: String,
+    name: String,
+    prefix: String,
+    #[serde(default)]
+    default: bool,
+}
+
+#[derive(Deserialize)]
+struct ProjectKeys {
+    keys: Vec<ProjectKey>,
+}
+
+#[derive(Deserialize)]
+struct CreatedKey {
+    key: ProjectKey,
+    plain_key: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -172,9 +297,112 @@ fn delete_config() {
     std::fs::remove_file(path).ok();
 }
 
+fn local_config_path() -> PathBuf {
+    PathBuf::from("lux").join("config.toml")
+}
+
+fn load_local_config() -> Option<LocalConfig> {
+    let data = std::fs::read_to_string(local_config_path()).ok()?;
+    let mut config = LocalConfig::default();
+
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        match key.trim() {
+            "project_id" => config.project_id = parse_config_string(value),
+            "project_name" => config.project_name = parse_config_string(value),
+            _ => {}
+        }
+    }
+
+    Some(config)
+}
+
+fn save_local_config(config: &LocalConfig) {
+    let path = local_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let data = format!(
+        "project_id = \"{}\"\nproject_name = \"{}\"\n",
+        escape_config_string(config.project_id.as_deref().unwrap_or("")),
+        escape_config_string(config.project_name.as_deref().unwrap_or(""))
+    );
+    std::fs::write(path, data).unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to write lux/config.toml:".red());
+        std::process::exit(1);
+    });
+}
+
+fn parse_config_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    let value = value.replace("\\\"", "\"").replace("\\\\", "\\");
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn escape_config_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn parse_connection_url(url: &str) -> (String, u16, String, String) {
+    let url = url
+        .trim_start_matches("lux://")
+        .trim_start_matches("redis://");
+    let (auth, hostport) = if let Some(at) = url.find('@') {
+        (
+            Some(url[..at].trim_start_matches(':').to_string()),
+            &url[at + 1..],
+        )
+    } else {
+        (None, url)
+    };
+    let parts: Vec<&str> = hostport.split(':').collect();
+    let host = parts.first().copied().unwrap_or("localhost").to_string();
+    let port = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(6379);
+    let name = format!("{host}:{port}");
+    (host, port, auth.unwrap_or_default(), name)
+}
+
+fn linked_project_or(project: Option<&str>) -> Option<String> {
+    if let Some(project) = project {
+        if !project.trim().is_empty() {
+            return Some(project.to_string());
+        }
+    }
+    load_local_config()
+        .and_then(|config| config.project_id.or(config.project_name))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn require_project_arg(project: Option<&str>) -> String {
+    linked_project_or(project).unwrap_or_else(|| {
+        eprintln!(
+            "{} Provide a project name/ID or run {} first.",
+            "Error:".red(),
+            "lux link <project>".bold()
+        );
+        std::process::exit(1);
+    })
+}
+
 fn get_client(api_url_override: &Option<String>) -> (reqwest::Client, String, String) {
     let config = load_config().unwrap_or_else(|| {
-        eprintln!("{}", "Not logged in. Run `luxctl login` first.".red());
+        eprintln!("{}", "Not logged in. Run `lux login` first.".red());
         std::process::exit(1);
     });
 
@@ -229,12 +457,58 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-#[tokio::main]
-async fn main() {
+pub async fn run() {
     let cli = Cli::parse();
     let api_url_override = cli.api_url.clone();
 
     match cli.command {
+        Commands::Init => {
+            let migrations_dir = PathBuf::from("lux/migrations");
+            std::fs::create_dir_all(&migrations_dir).unwrap_or_else(|e| {
+                eprintln!("{} {e}", "Failed to create lux/migrations:".red());
+                std::process::exit(1);
+            });
+
+            let config_path = local_config_path();
+            if !config_path.exists() {
+                save_local_config(&LocalConfig::default());
+            }
+
+            let env_example = PathBuf::from(".env.example");
+            if !env_example.exists() {
+                std::fs::write(
+                    &env_example,
+                    [
+                        "LUX_PROJECT_ID=",
+                        "LUX_URL=",
+                        "LUX_AUTH_URL=",
+                        "LUX_HTTP_URL=",
+                        "LUX_DIRECT_URL=",
+                        "LUX_PUBLISHABLE_KEY=",
+                        "LUX_SECRET_KEY=",
+                        "",
+                    ]
+                    .join("\n"),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to write .env.example:".red());
+                    std::process::exit(1);
+                });
+            }
+
+            let seed_path = PathBuf::from("lux/seed.lux");
+            if !seed_path.exists() {
+                std::fs::write(&seed_path, "").unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to write lux/seed.lux:".red());
+                    std::process::exit(1);
+                });
+            }
+
+            println!("{}", "Initialized Lux project.".green());
+            println!("{} {}", "Migrations:".bold(), migrations_dir.display());
+            println!("{} {}", "Config:".bold(), config_path.display());
+        }
+
         Commands::Login => {
             println!("{}", "Paste your Lux Cloud access token.".bold());
             println!(
@@ -285,6 +559,17 @@ async fn main() {
             println!("{}", "Logged out.".green());
         }
 
+        Commands::Link { project } => {
+            let (client, api_url, token) = get_client(&api_url_override);
+            let inst = find_project(&client, &api_url, &token, &project).await;
+            save_local_config(&LocalConfig {
+                project_id: Some(inst.id.clone()),
+                project_name: Some(inst.name.clone()),
+            });
+            println!("{} Linked to project '{}'", "Done.".green(), inst.name);
+            println!("{} {}", "ID:".bold(), inst.id);
+        }
+
         Commands::Projects => {
             let (client, api_url, token) = get_client(&api_url_override);
 
@@ -298,39 +583,42 @@ async fn main() {
                     std::process::exit(1);
                 });
 
-            let body: ApiResponse<Vec<Instance>> = res.json().await.unwrap();
+            let body: ApiResponse<Vec<Instance>> = res.json().await.unwrap_or_else(|e| {
+                eprintln!("{} {e}", "Failed to parse response:".red());
+                std::process::exit(1);
+            });
+            let instances = unwrap_api(body);
 
-            if let Some(instances) = body.data {
-                if instances.is_empty() {
-                    println!("{}", "No projects found.".dimmed());
-                    return;
-                }
+            if instances.is_empty() {
+                println!("{}", "No projects found.".dimmed());
+                return;
+            }
+
+            println!(
+                "  {:<16}  {:<10}  {:<6}  {}",
+                "NAME".dimmed(),
+                "STATUS".dimmed(),
+                "REGION".dimmed(),
+                "MEMORY".dimmed()
+            );
+
+            for inst in &instances {
+                let status = match inst.status.as_str() {
+                    "running" => inst.status.green().to_string(),
+                    "error" => inst.status.red().to_string(),
+                    _ => inst.status.yellow().to_string(),
+                };
 
                 println!(
-                    "  {:<16}  {:<10}  {:<6}  {}",
-                    "NAME".dimmed(),
-                    "STATUS".dimmed(),
-                    "REGION".dimmed(),
-                    "MEMORY".dimmed()
+                    "  {:<16}  {:<10}  {:<6}  {}MB",
+                    inst.name, status, inst.region, inst.memory_mb,
                 );
-
-                for inst in &instances {
-                    let status = match inst.status.as_str() {
-                        "running" => inst.status.green().to_string(),
-                        "error" => inst.status.red().to_string(),
-                        _ => inst.status.yellow().to_string(),
-                    };
-
-                    println!(
-                        "  {:<16}  {:<10}  {:<6}  {}MB",
-                        inst.name, status, inst.region, inst.memory_mb,
-                    );
-                }
             }
         }
 
         Commands::Status { project } => {
             let (client, api_url, token) = get_client(&api_url_override);
+            let project = require_project_arg(project.as_deref());
             let inst = find_project(&client, &api_url, &token, &project).await;
 
             let status = match inst.status.as_str() {
@@ -378,37 +666,39 @@ async fn main() {
             }
         }
 
-        Commands::Exec { project, cmd } => {
+        Commands::Exec {
+            project,
+            host,
+            port,
+            password,
+            cmd,
+        } => {
             if cmd.is_empty() {
                 eprintln!("{}", "No command provided.".red());
                 std::process::exit(1);
             }
 
-            let (client, api_url, token) = get_client(&api_url_override);
-            let inst = find_project(&client, &api_url, &token, &project).await;
-            let command = cmd.join(" ");
-
-            let res = client
-                .post(format!("{api_url}/console/{}/exec", inst.id))
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&serde_json::json!({ "command": command }))
-                .send()
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed:".red());
+            match exec_cli_command_args(
+                &project,
+                host.as_deref(),
+                port,
+                password.as_deref(),
+                &api_url_override,
+                &cmd,
+            )
+            .await
+            {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("{} {error}", "Error:".red());
                     std::process::exit(1);
-                });
-
-            let body: serde_json::Value = res.json().await.unwrap();
-            if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
-                eprintln!("{} {error}", "Error:".red());
-            } else {
-                println!("{}", format_json_value(&body));
+                }
             }
         }
 
         Commands::Logs { project, lines } => {
             let (client, api_url, token) = get_client(&api_url_override);
+            let project = require_project_arg(project.as_deref());
             let inst = find_project(&client, &api_url, &token, &project).await;
 
             let res = client
@@ -523,13 +813,14 @@ async fn main() {
                 println!(
                     "\n{} Run {} to check when it's ready",
                     "Tip:".bold(),
-                    format!("luxctl status {}", inst.name).cyan()
+                    format!("lux status {}", inst.name).cyan()
                 );
             }
         }
 
         Commands::Restart { project } => {
             let (client, api_url, token) = get_client(&api_url_override);
+            let project = require_project_arg(project.as_deref());
             let inst = find_project(&client, &api_url, &token, &project).await;
 
             println!("{} Restarting '{}'...", "...".dimmed(), inst.name);
@@ -604,58 +895,39 @@ async fn main() {
             password,
         } => {
             let project = project.unwrap_or_default();
-            let (conn_host, conn_port, conn_pass, conn_name) =
-                if project.starts_with("lux://") || project.starts_with("redis://") {
-                    let url = project
-                        .trim_start_matches("lux://")
-                        .trim_start_matches("redis://");
-                    let (auth, hostport) = if let Some(at) = url.find('@') {
-                        (
-                            Some(url[..at].trim_start_matches(':').to_string()),
-                            &url[at + 1..],
-                        )
-                    } else {
-                        (None, url)
-                    };
-                    let parts: Vec<&str> = hostport.split(':').collect();
-                    let h = parts[0].to_string();
-                    let p: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(6379);
-                    (
-                        h,
-                        p,
-                        auth.unwrap_or_default(),
-                        format!("{}:{}", parts[0], p),
-                    )
-                } else if host.is_some() || port.is_some() {
-                    let h = host.unwrap_or_else(|| "localhost".to_string());
-                    let p = port.unwrap_or(6379);
-                    let pw = password.unwrap_or_default();
-                    let name = format!("{h}:{p}");
-                    (h, p, pw, name)
-                } else if project.is_empty() {
+            let (conn_host, conn_port, conn_pass, conn_name) = if is_connection_url(&project) {
+                parse_connection_url(&project)
+            } else if host.is_some() || port.is_some() {
+                let h = host.unwrap_or_else(|| "localhost".to_string());
+                let p = port.unwrap_or(6379);
+                let pw = password.unwrap_or_default();
+                let name = format!("{h}:{p}");
+                (h, p, pw, name)
+            } else if project.is_empty() {
+                eprintln!(
+                    "{} Provide a project name, connection URL, or --host/--port flags",
+                    "Error:".red()
+                );
+                std::process::exit(1);
+            } else {
+                let (client, api_url, token) = get_client(&api_url_override);
+                let inst = find_project(&client, &api_url, &token, &project).await;
+
+                if inst.status != "running" {
                     eprintln!(
-                        "{} Provide a project name, connection URL, or --host/--port flags",
-                        "Error:".red()
+                        "{} Project '{}' is not running (status: {})",
+                        "Error:".red(),
+                        inst.name,
+                        inst.status
                     );
                     std::process::exit(1);
-                } else {
-                    let (client, api_url, token) = get_client(&api_url_override);
-                    let inst = find_project(&client, &api_url, &token, &project).await;
+                }
 
-                    if inst.status != "running" {
-                        eprintln!(
-                            "{} Project '{}' is not running (status: {})",
-                            "Error:".red(),
-                            inst.name,
-                            inst.status
-                        );
-                        std::process::exit(1);
-                    }
-
-                    let h = inst.worker_host.unwrap_or_else(|| "localhost".to_string());
-                    let p = inst.port.unwrap_or(6379);
-                    (h, p, inst.password, inst.name)
-                };
+                let credentials =
+                    get_instance_credentials(&client, &api_url, &token, &inst.id).await;
+                let (h, p, pw, _) = parse_connection_url(&credentials.resp);
+                (h, p, pw, inst.name)
+            };
 
             println!("{} {}:{}", "Connecting to".bold(), conn_host, conn_port);
 
@@ -769,7 +1041,7 @@ async fn main() {
             println!("{}", "Checking for updates...".dimmed());
 
             let client = reqwest::Client::builder()
-                .user_agent("luxctl")
+                .user_agent("lux-cli")
                 .build()
                 .unwrap();
 
@@ -786,12 +1058,12 @@ async fn main() {
             let latest_tag = releases
                 .iter()
                 .filter_map(|r| r.get("tag_name")?.as_str())
-                .find(|t| t.starts_with("luxctl-v"));
+                .find(|t| t.starts_with("cli-v"));
 
             let latest_version = match latest_tag {
-                Some(tag) => tag.trim_start_matches("luxctl-v"),
+                Some(tag) => tag.trim_start_matches("cli-v"),
                 None => {
-                    eprintln!("{}", "No luxctl releases found.".yellow());
+                    eprintln!("{}", "No Lux CLI releases found.".yellow());
                     std::process::exit(1);
                 }
             };
@@ -807,7 +1079,7 @@ async fn main() {
             );
 
             if check {
-                println!("Run {} to install.", "luxctl update".cyan());
+                println!("Run {} to install.", "lux update".cyan());
                 return;
             }
 
@@ -829,7 +1101,7 @@ async fn main() {
                 std::process::exit(1);
             };
 
-            let artifact = format!("luxctl-{os}-{arch}");
+            let artifact = format!("lux-cli-{os}-{arch}");
             let download_url = format!(
                 "https://github.com/lux-db/lux/releases/download/{}/{artifact}.tar.gz",
                 latest_tag.unwrap()
@@ -857,9 +1129,9 @@ async fn main() {
                 std::process::exit(1);
             });
 
-            let tmp_dir = std::env::temp_dir().join("luxctl-update");
+            let tmp_dir = std::env::temp_dir().join("lux-cli-update");
             std::fs::create_dir_all(&tmp_dir).ok();
-            let tar_path = tmp_dir.join("luxctl.tar.gz");
+            let tar_path = tmp_dir.join("lux-cli.tar.gz");
             std::fs::write(&tar_path, &tar_bytes).unwrap_or_else(|e| {
                 eprintln!("{} {e}", "Failed to write temp file:".red());
                 std::process::exit(1);
@@ -899,7 +1171,7 @@ async fn main() {
                 let copy_result = std::fs::copy(&new_binary, &current_exe);
                 if copy_result.is_err() {
                     eprintln!(
-                        "{} Could not replace binary. Try: sudo luxctl update",
+                        "{} Could not replace binary. Try: sudo lux update",
                         "Permission denied:".red()
                     );
                     std::process::exit(1);
@@ -910,11 +1182,104 @@ async fn main() {
             println!("{} Updated to v{latest_version}", "Done.".green());
         }
 
+        Commands::Keys { action } => match action {
+            KeysAction::List { project } => {
+                let (client, api_url, token) = get_client(&api_url_override);
+                let project = require_project_arg(project.as_deref());
+                let inst = find_project(&client, &api_url, &token, &project).await;
+                let keys = list_project_keys(&client, &api_url, &token, &inst.id).await;
+
+                if keys.is_empty() {
+                    println!("{}", "No active keys.".dimmed());
+                    return;
+                }
+
+                println!(
+                    "  {:<36}  {:<12}  {:<24}  {:<14}  {}",
+                    "ID".dimmed(),
+                    "KIND".dimmed(),
+                    "NAME".dimmed(),
+                    "PREFIX".dimmed(),
+                    "DEFAULT".dimmed()
+                );
+                for key in keys {
+                    println!(
+                        "  {:<36}  {:<12}  {:<24}  {:<14}  {}",
+                        key.id,
+                        key.kind,
+                        truncate(&key.name, 24),
+                        key.prefix,
+                        if key.default { "yes" } else { "no" }
+                    );
+                }
+            }
+            KeysAction::Create {
+                project,
+                kind,
+                name,
+            } => {
+                if kind != "publishable" && kind != "secret" {
+                    eprintln!("{}", "kind must be publishable or secret".red());
+                    std::process::exit(1);
+                }
+                let (client, api_url, token) = get_client(&api_url_override);
+                let project = require_project_arg(project.as_deref());
+                let inst = find_project(&client, &api_url, &token, &project).await;
+                let created =
+                    create_project_key(&client, &api_url, &token, &inst.id, &kind, name).await;
+                println!(
+                    "{} Created {} key '{}'",
+                    "Done.".green(),
+                    created.key.kind,
+                    created.key.name
+                );
+                println!();
+                println!("{}", "Copy this now. It will not be shown again:".yellow());
+                println!("{}", created.plain_key);
+            }
+            KeysAction::Revoke { id, project } => {
+                let (client, api_url, token) = get_client(&api_url_override);
+                let project = require_project_arg(project.as_deref());
+                let inst = find_project(&client, &api_url, &token, &project).await;
+                revoke_project_key(&client, &api_url, &token, &inst.id, &id).await;
+                println!("{} Revoked key {}", "Done.".green(), id);
+            }
+        },
+
+        Commands::Env { action } => match action {
+            EnvAction::Pull { project, output } => {
+                let (client, api_url, token) = get_client(&api_url_override);
+                let project = require_project_arg(project.as_deref());
+                let inst = find_project(&client, &api_url, &token, &project).await;
+                let detail = get_instance_detail(&client, &api_url, &token, &inst.id).await;
+                let credentials =
+                    get_instance_credentials(&client, &api_url, &token, &inst.id).await;
+                let auth = get_auth_credentials(&client, &api_url, &token, &inst.id).await;
+                let http_url = detail
+                    .public_endpoints
+                    .as_ref()
+                    .map(|endpoints| endpoints.http.clone())
+                    .unwrap_or_default();
+                let content = build_project_env(
+                    &inst.id,
+                    &api_url,
+                    &http_url,
+                    &credentials.resp,
+                    auth.publishable_key.as_deref(),
+                    auth.secret_key.as_deref(),
+                );
+                std::fs::write(&output, content).unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to write env file:".red());
+                    std::process::exit(1);
+                });
+                println!("{} Wrote {}", "Done.".green(), output.display());
+            }
+        },
+
         Commands::Migrate { action } => match action {
-            MigrateAction::New { name } => {
-                let dir = PathBuf::from("lux/migrations");
+            MigrateAction::New { name, dir } => {
                 std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed to create migrations dir:".red());
+                    eprintln!("{} {e}", "Failed to create migration dir:".red());
                     std::process::exit(1);
                 });
                 let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
@@ -929,6 +1294,7 @@ async fn main() {
 
             MigrateAction::Status {
                 project,
+                dir,
                 host,
                 port,
                 password,
@@ -943,10 +1309,14 @@ async fn main() {
                 .await;
 
                 let applied = get_applied_migrations(&mut target).await;
-                let local = get_local_migrations();
+                let local = get_local_migrations(&dir);
 
                 if local.is_empty() {
-                    println!("{}", "No migration files found in lux/migrations/".dimmed());
+                    println!(
+                        "{} {}",
+                        "No migration files found in".dimmed(),
+                        dir.display()
+                    );
                     return;
                 }
 
@@ -963,6 +1333,7 @@ async fn main() {
 
             MigrateAction::Run {
                 project,
+                dir,
                 host,
                 port,
                 password,
@@ -979,7 +1350,7 @@ async fn main() {
                 ensure_migrations_table(&mut target).await;
 
                 let applied = get_applied_migrations(&mut target).await;
-                let local = get_local_migrations();
+                let local = get_local_migrations(&dir);
 
                 let pending: Vec<_> = local
                     .iter()
@@ -1001,17 +1372,17 @@ async fn main() {
                     print!("  {} {}...", "Applying".dimmed(), filename);
                     std::io::stdout().flush().ok();
 
-                    let lines: Vec<&str> = content
-                        .lines()
-                        .map(|l| l.trim())
-                        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("--"))
-                        .collect();
+                    let commands = parse_migration_commands(content).unwrap_or_else(|e| {
+                        println!(" {}", "FAILED".red());
+                        eprintln!("    {} {}", "Error:".red(), e);
+                        std::process::exit(1);
+                    });
 
                     let mut failed = false;
-                    for line in &lines {
-                        if let Err(e) = target.exec(line).await {
+                    for command in &commands {
+                        if let Err(e) = target.exec_args(command).await {
                             println!(" {}", "FAILED".red());
-                            eprintln!("    {} {}", "Command:".dimmed(), line);
+                            eprintln!("    {} {}", "Command:".dimmed(), command.join(" "));
                             eprintln!("    {} {}", "Error:".red(), e);
                             failed = true;
                             break;
@@ -1027,13 +1398,17 @@ async fn main() {
                     }
 
                     let checksum = simple_hash(content);
-                    let record_cmd = format!(
-                        "TINSERT __migrations filename {} checksum {} applied_at {}",
-                        filename,
+                    let record_cmd = vec![
+                        "TINSERT".to_string(),
+                        "__migrations".to_string(),
+                        "filename".to_string(),
+                        filename.to_string(),
+                        "checksum".to_string(),
                         checksum,
-                        chrono::Utc::now().timestamp()
-                    );
-                    if let Err(e) = target.exec(&record_cmd).await {
+                        "applied_at".to_string(),
+                        chrono::Utc::now().timestamp().to_string(),
+                    ];
+                    if let Err(e) = target.exec_args(&record_cmd).await {
                         println!(" {}", "FAILED".red());
                         eprintln!("    {} Failed to record migration: {}", "Error:".red(), e);
                         std::process::exit(1);
@@ -1049,7 +1424,63 @@ async fn main() {
                 );
             }
         },
+
+        Commands::Seed { action } => match action {
+            SeedAction::Run {
+                project,
+                file,
+                host,
+                port,
+                password,
+            } => {
+                let mut target = resolve_migrate_target(
+                    project.as_deref(),
+                    host.as_deref(),
+                    port,
+                    password.as_deref(),
+                    &api_url_override,
+                )
+                .await;
+                run_command_file(&mut target, &file, "Seed").await;
+            }
+        },
     }
+}
+
+async fn run_command_file(target: &mut MigrateTarget, file: &PathBuf, label: &str) {
+    let content = std::fs::read_to_string(file).unwrap_or_else(|e| {
+        eprintln!(
+            "{} Failed to read {}: {}",
+            "Error:".red(),
+            file.display(),
+            e
+        );
+        std::process::exit(1);
+    });
+    let commands = parse_migration_commands(&content).unwrap_or_else(|e| {
+        eprintln!("{} {}", "Error:".red(), e);
+        std::process::exit(1);
+    });
+
+    if commands.is_empty() {
+        println!("{} {} has no commands.", label, file.display());
+        return;
+    }
+
+    println!(
+        "{} {} command(s) from {}",
+        "Running".bold(),
+        commands.len(),
+        file.display()
+    );
+    for command in &commands {
+        if let Err(e) = target.exec_args(command).await {
+            eprintln!("{} {}", "FAILED".red(), command.join(" "));
+            eprintln!("{} {}", "Error:".red(), e);
+            std::process::exit(1);
+        }
+    }
+    println!("{} {} complete.", "Done.".green(), label);
 }
 
 async fn exec_command(
@@ -1084,6 +1515,69 @@ async fn exec_command(
     Ok(format_json_value(&body))
 }
 
+async fn exec_command_args(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+    command: &[String],
+) -> Result<String, String> {
+    let res = client
+        .post(format!("{api_url}/console/{instance_id}/exec"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "command": command }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = res.status();
+    let body: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
+
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+
+    Ok(format_json_value(&body))
+}
+
+async fn exec_cli_command_args(
+    project: &str,
+    host: Option<&str>,
+    port: Option<u16>,
+    password: Option<&str>,
+    api_url_override: &Option<String>,
+    command: &[String],
+) -> Result<String, String> {
+    if host.is_some() || port.is_some() {
+        let h = host.unwrap_or(project);
+        let p = port.unwrap_or(6379);
+        let pw = password.unwrap_or("");
+        let mut conn = DirectConn::connect(h, p, pw)?;
+        return conn.exec_args(command);
+    }
+
+    if is_connection_url(project) {
+        let (h, p, pw, _) = parse_connection_url(project);
+        let mut conn = DirectConn::connect(&h, p, &pw)?;
+        return conn.exec_args(command);
+    }
+
+    let (client, api_url, token) = get_client(api_url_override);
+    let inst = find_project(&client, &api_url, &token, project).await;
+    exec_command_args(&client, &api_url, &token, &inst.id, command).await
+}
+
+fn is_connection_url(value: &str) -> bool {
+    value.starts_with("lux://") || value.starts_with("redis://")
+}
+
 async fn exec_command_json(
     client: &reqwest::Client,
     api_url: &str,
@@ -1116,6 +1610,169 @@ async fn exec_command_json(
     Ok(body)
 }
 
+async fn get_instance_detail(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+) -> InstanceDetail {
+    let res = client
+        .get(format!("{api_url}/instances/{instance_id}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed:".red());
+            std::process::exit(1);
+        });
+    let body: ApiResponse<InstanceDetail> = res.json().await.unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to parse response:".red());
+        std::process::exit(1);
+    });
+    unwrap_api(body)
+}
+
+async fn get_instance_credentials(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+) -> Credentials {
+    let res = client
+        .get(format!("{api_url}/instances/{instance_id}/credentials"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed:".red());
+            std::process::exit(1);
+        });
+    let body: ApiResponse<Credentials> = res.json().await.unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to parse response:".red());
+        std::process::exit(1);
+    });
+    unwrap_api(body)
+}
+
+async fn get_auth_credentials(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+) -> AuthCredentials {
+    let res = client
+        .get(format!(
+            "{api_url}/instances/{instance_id}/auth/credentials"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed:".red());
+            std::process::exit(1);
+        });
+    let body: ApiResponse<AuthCredentials> = res.json().await.unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to parse response:".red());
+        std::process::exit(1);
+    });
+    unwrap_api(body)
+}
+
+async fn list_project_keys(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+) -> Vec<ProjectKey> {
+    let res = client
+        .get(format!("{api_url}/instances/{instance_id}/auth/keys"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed:".red());
+            std::process::exit(1);
+        });
+    let body: ApiResponse<ProjectKeys> = res.json().await.unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to parse response:".red());
+        std::process::exit(1);
+    });
+    unwrap_api(body).keys
+}
+
+async fn create_project_key(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+    kind: &str,
+    name: Option<String>,
+) -> CreatedKey {
+    let res = client
+        .post(format!("{api_url}/instances/{instance_id}/auth/keys"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "kind": kind, "name": name }))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed:".red());
+            std::process::exit(1);
+        });
+    let body: ApiResponse<CreatedKey> = res.json().await.unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to parse response:".red());
+        std::process::exit(1);
+    });
+    unwrap_api(body)
+}
+
+async fn revoke_project_key(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+    key_id: &str,
+) {
+    let res = client
+        .delete(format!(
+            "{api_url}/instances/{instance_id}/auth/keys/{key_id}"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed:".red());
+            std::process::exit(1);
+        });
+    let body: ApiResponse<serde_json::Value> = res.json().await.unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to parse response:".red());
+        std::process::exit(1);
+    });
+    let _ = unwrap_api(body);
+}
+
+fn unwrap_api<T>(body: ApiResponse<T>) -> T {
+    if let Some(error) = body.error {
+        eprintln!("{} {error}", "Error:".red());
+        std::process::exit(1);
+    }
+    body.data.unwrap_or_else(|| {
+        eprintln!("{}", "API response did not include data.".red());
+        std::process::exit(1);
+    })
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
+}
+
 fn format_json_value(val: &serde_json::Value) -> String {
     match val {
         serde_json::Value::Null => "(nil)".to_string(),
@@ -1131,12 +1788,43 @@ fn format_json_value(val: &serde_json::Value) -> String {
     }
 }
 
+fn build_project_env(
+    instance_id: &str,
+    api_url: &str,
+    http_url: &str,
+    direct_url: &str,
+    publishable_key: Option<&str>,
+    secret_key: Option<&str>,
+) -> String {
+    let project_api_url = format!("{api_url}/v1/{instance_id}");
+    let auth_url = format!("{api_url}/v1/{instance_id}/auth/v1");
+    [
+        format!("LUX_PROJECT_ID={instance_id}"),
+        format!("LUX_URL={project_api_url}"),
+        format!("LUX_AUTH_URL={auth_url}"),
+        format!("LUX_HTTP_URL={http_url}"),
+        format!("LUX_DIRECT_URL={direct_url}"),
+        format!(
+            "LUX_PUBLISHABLE_KEY={}",
+            publishable_key.unwrap_or_default()
+        ),
+        format!("LUX_SECRET_KEY={}", secret_key.unwrap_or_default()),
+        String::new(),
+    ]
+    .join("\n")
+}
+
 fn resp_encode(args: &[&str]) -> Vec<u8> {
     let mut cmd = format!("*{}\r\n", args.len());
     for a in args {
         cmd.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
     }
     cmd.into_bytes()
+}
+
+fn resp_encode_strings(args: &[String]) -> Vec<u8> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    resp_encode(&refs)
 }
 
 fn resp_read_line(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
@@ -1238,6 +1926,16 @@ impl DirectConn {
         resp_read_response(&mut self.reader)
     }
 
+    fn exec_args(&mut self, args: &[String]) -> Result<String, String> {
+        if args.is_empty() {
+            return Err("empty command".to_string());
+        }
+        self.stream
+            .write_all(&resp_encode_strings(args))
+            .map_err(|e| format!("write error: {e}"))?;
+        resp_read_response(&mut self.reader)
+    }
+
     /// Execute a table select command and return rows as Vec<Vec<String>>
     /// (each row is [field, value, field, value, ...]).
     fn exec_table_rows(&mut self, command: &str) -> Result<Vec<Vec<String>>, String> {
@@ -1302,6 +2000,18 @@ impl MigrateTarget {
             MigrateTarget::Direct(conn) => conn.exec(command),
         }
     }
+
+    async fn exec_args(&mut self, command: &[String]) -> Result<String, String> {
+        match self {
+            MigrateTarget::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => exec_command_args(client, api_url, token, instance_id, command).await,
+            MigrateTarget::Direct(conn) => conn.exec_args(command),
+        }
+    }
 }
 
 async fn resolve_migrate_target(
@@ -1324,7 +2034,8 @@ async fn resolve_migrate_target(
         }
     }
 
-    let project = match project {
+    let linked = linked_project_or(project);
+    let project = match linked.as_deref() {
         Some(p) if !p.is_empty() => p,
         _ => {
             // No project and no host/port: default to localhost
@@ -1338,8 +2049,8 @@ async fn resolve_migrate_target(
                     );
                     eprintln!(
                         "Usage: {} or {}",
-                        "luxctl migrate run <project>".bold(),
-                        "luxctl migrate run --host <host> --port <port>".bold()
+                        "lux migrate run <project>".bold(),
+                        "lux migrate run --host <host> --port <port>".bold()
                     );
                     std::process::exit(1);
                 }
@@ -1348,7 +2059,7 @@ async fn resolve_migrate_target(
     };
 
     // Check if it's a connection URL
-    if project.starts_with("lux://") || project.starts_with("redis://") {
+    if is_connection_url(project) {
         let url = project
             .trim_start_matches("redis://")
             .trim_start_matches("lux://");
@@ -1374,6 +2085,8 @@ async fn resolve_migrate_target(
     }
 
     // Cloud project
+    let project_owned = project.to_string();
+    let project = project_owned.as_str();
     let (client, api_url, token) = get_client(api_url_override);
     let inst = find_project(&client, &api_url, &token, project).await;
     MigrateTarget::Cloud {
@@ -1401,12 +2114,14 @@ async fn ensure_migrations_table(target: &mut MigrateTarget) {
     }
 }
 
-async fn get_applied_migrations(target: &mut MigrateTarget) -> std::collections::HashSet<String> {
-    let mut applied = std::collections::HashSet::new();
+async fn get_applied_migrations(target: &mut MigrateTarget) -> HashSet<String> {
+    let mut applied = HashSet::new();
 
     match target {
         MigrateTarget::Direct(conn) => {
-            if let Ok(rows) = conn.exec_table_rows("TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000") {
+            if let Ok(rows) = conn
+                .exec_table_rows("TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000")
+            {
                 // Each row: ["field", value, "field", value, ...]
                 for row in &rows {
                     for i in 0..row.len().saturating_sub(1) {
@@ -1457,12 +2172,11 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> std::collections:
     applied
 }
 
-fn get_local_migrations() -> Vec<(String, String)> {
-    let dir = PathBuf::from("lux/migrations");
+fn get_local_migrations(dir: &PathBuf) -> Vec<(String, String)> {
     if !dir.exists() {
         return vec![];
     }
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
+    let mut files: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|_| {
             eprintln!("{}", "Failed to read lux/migrations/".red());
             std::process::exit(1);
@@ -1484,10 +2198,230 @@ fn get_local_migrations() -> Vec<(String, String)> {
     files
 }
 
+fn parse_migration_commands(content: &str) -> Result<Vec<Vec<String>>, String> {
+    let mut commands = Vec::new();
+    for (index, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("--") {
+            continue;
+        }
+        if line.starts_with('[') {
+            let parsed: Vec<String> = serde_json::from_str(line)
+                .map_err(|e| format!("line {} is not a valid JSON argv array: {e}", index + 1))?;
+            if parsed.is_empty() {
+                return Err(format!("line {} has an empty command", index + 1));
+            }
+            commands.push(parsed);
+            continue;
+        }
+        let parsed = split_command_line(line)
+            .map_err(|e| format!("line {} could not be parsed: {e}", index + 1))?;
+        if !parsed.is_empty() {
+            commands.push(parsed);
+        }
+    }
+    Ok(commands)
+}
+
+fn split_command_line(input: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => {
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                } else if ch.is_whitespace() {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                } else {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+
+    if let Some(q) = quote {
+        return Err(format!("unterminated {q} quote"));
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    Ok(args)
+}
+
 fn simple_hash(content: &str) -> String {
     let mut hash: u64 = 5381;
     for byte in content.bytes() {
         hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
     }
     format!("{:016x}", hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_lux_connection_urls_with_password() {
+        let (host, port, password, name) =
+            parse_connection_url("lux://:secret@db.example.com:10000");
+
+        assert_eq!(host, "db.example.com");
+        assert_eq!(port, 10000);
+        assert_eq!(password, "secret");
+        assert_eq!(name, "db.example.com:10000");
+    }
+
+    #[test]
+    fn parses_connection_urls_without_password_or_port() {
+        let (host, port, password, name) = parse_connection_url("redis://localhost");
+
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 6379);
+        assert_eq!(password, "");
+        assert_eq!(name, "localhost:6379");
+    }
+
+    #[test]
+    fn identifies_direct_connection_urls() {
+        assert!(is_connection_url("lux://:secret@localhost:10000"));
+        assert!(is_connection_url("redis://localhost"));
+        assert!(!is_connection_url("cache"));
+        assert!(!is_connection_url("localhost:10000"));
+    }
+
+    #[test]
+    fn splits_command_lines_with_quotes_and_escapes() {
+        let args = split_command_line(
+            r#"TINSERT users name "Matty Hogan" title 'Founder CEO' note "quote: \"ok\"""#,
+        )
+        .expect("command should parse");
+
+        assert_eq!(
+            args,
+            vec![
+                "TINSERT",
+                "users",
+                "name",
+                "Matty Hogan",
+                "title",
+                "Founder CEO",
+                "note",
+                "quote: \"ok\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unterminated_quotes() {
+        let err = split_command_line(r#"SET key "unterminated"#).unwrap_err();
+
+        assert!(err.contains("unterminated"));
+    }
+
+    #[test]
+    fn parses_migration_files_with_comments_json_and_shell_style_lines() {
+        let commands = parse_migration_commands(
+            r#"
+            # ignored
+            -- also ignored
+            ["TCREATE","users","id UUID PRIMARY KEY,","email STR UNIQUE"]
+            TINSERT users id usr_1 email "user@example.com"
+            "#,
+        )
+        .expect("migration should parse");
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0][0], "TCREATE");
+        assert_eq!(commands[0][2], "id UUID PRIMARY KEY,");
+        assert_eq!(
+            commands[1],
+            vec![
+                "TINSERT",
+                "users",
+                "id",
+                "usr_1",
+                "email",
+                "user@example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_json_migration_lines() {
+        let err = parse_migration_commands("[\"PING\"").unwrap_err();
+
+        assert!(err.contains("valid JSON argv array"));
+    }
+
+    #[test]
+    fn local_migrations_are_lux_only_and_sorted() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux-cli-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("20260202000000_second.lux"), "PING second").unwrap();
+        std::fs::write(dir.join("README.md"), "ignore").unwrap();
+        std::fs::write(dir.join("20260101000000_first.lux"), "PING first").unwrap();
+
+        let migrations = get_local_migrations(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations[0].0, "20260101000000_first.lux");
+        assert_eq!(migrations[1].0, "20260202000000_second.lux");
+    }
+
+    #[test]
+    fn formats_project_env_values() {
+        let env = build_project_env(
+            "inst_123",
+            "https://api.luxdb.dev",
+            "https://inst.luxdb.dev/v1",
+            "lux://:pw@host:10000",
+            Some("lux_pub_test"),
+            Some("lux_sec_test"),
+        );
+
+        assert!(env.contains("LUX_PROJECT_ID=inst_123"));
+        assert!(env.contains("LUX_URL=https://api.luxdb.dev/v1/inst_123"));
+        assert!(env.contains("LUX_AUTH_URL=https://api.luxdb.dev/v1/inst_123/auth/v1"));
+        assert!(env.contains("LUX_HTTP_URL=https://inst.luxdb.dev/v1"));
+        assert!(env.contains("LUX_DIRECT_URL=lux://:pw@host:10000"));
+        assert!(env.contains("LUX_PUBLISHABLE_KEY=lux_pub_test"));
+        assert!(env.contains("LUX_SECRET_KEY=lux_sec_test"));
+    }
+
+    #[test]
+    fn truncates_by_chars_not_bytes() {
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("éclair", 4), "écl…");
+    }
+
+    #[test]
+    fn simple_hash_is_stable() {
+        assert_eq!(simple_hash("PING\n"), simple_hash("PING\n"));
+        assert_ne!(simple_hash("PING\n"), simple_hash("PONG\n"));
+    }
 }

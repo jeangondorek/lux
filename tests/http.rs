@@ -3,16 +3,18 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
+mod common;
+
 fn find_lux_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let target_dir = exe.parent()?.parent()?.parent()?;
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return Some(release);
-    }
     let debug = target_dir.join("debug").join("lux");
     if debug.exists() {
         return Some(debug);
+    }
+    let release = target_dir.join("release").join("lux");
+    if release.exists() {
+        return Some(release);
     }
     None
 }
@@ -31,13 +33,33 @@ impl Drop for LuxServer {
 }
 
 fn start_lux(resp_port: u16, http_port: u16, password: &str) -> LuxServer {
-    let bin = find_lux_binary().expect("no lux binary found");
+    start_lux_with_env(resp_port, http_port, password, &[])
+}
+
+fn start_lux_with_env(
+    resp_port: u16,
+    http_port: u16,
+    password: &str,
+    extra_env: &[(&str, &str)],
+) -> LuxServer {
     let tmpdir = std::env::temp_dir().join(format!(
         "lux_http_test_{}_{}",
         std::process::id(),
         http_port
     ));
     std::fs::create_dir_all(&tmpdir).unwrap();
+    let child = spawn_lux_with_data_dir(resp_port, http_port, password, extra_env, &tmpdir);
+    LuxServer { child, tmpdir }
+}
+
+fn spawn_lux_with_data_dir(
+    resp_port: u16,
+    http_port: u16,
+    password: &str,
+    extra_env: &[(&str, &str)],
+    data_dir: &std::path::Path,
+) -> std::process::Child {
+    let bin = find_lux_binary().expect("no lux binary found");
 
     // Wait for the port to be free before starting (previous test may still be releasing it)
     for _ in 0..40 {
@@ -47,28 +69,31 @@ fn start_lux(resp_port: u16, http_port: u16, password: &str) -> LuxServer {
         thread::sleep(Duration::from_millis(50));
     }
 
-    let mut cmd = std::process::Command::new(&bin);
+    let mut cmd = common::lux_command(&bin);
     cmd.env("LUX_PORT", resp_port.to_string())
         .env("LUX_HTTP_PORT", http_port.to_string())
         .env("LUX_SHARDS", "4")
         .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
+        .env("LUX_DATA_DIR", data_dir.to_str().unwrap())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     if !password.is_empty() {
         cmd.env("LUX_PASSWORD", password);
     }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
-    let child = cmd.spawn().expect("failed to start lux");
-    let server = LuxServer { child, tmpdir };
+    let mut child = cmd.spawn().expect("failed to start lux");
 
     for _ in 0..60 {
         if TcpStream::connect(format!("127.0.0.1:{http_port}")).is_ok() {
-            return server;
+            return child;
         }
         thread::sleep(Duration::from_millis(50));
     }
+    common::terminate_child(&mut child);
     panic!("lux http did not start on port {http_port}");
 }
 
@@ -208,6 +233,641 @@ fn http_auth_required() {
 
     let resp = get(17603, "/v1/ping", "secret");
     assert!(resp.contains("PONG"), "correct auth: {resp}");
+}
+
+#[test]
+fn http_auth_routes_are_disabled_unless_enabled() {
+    let _server = start_lux(17700, 17701, "");
+
+    let (status, body) = http_request(17701, "GET", "/auth/v1/health", None, None);
+    assert_eq!(status, 404, "auth should be disabled by default: {body}");
+    assert!(body.contains("auth is not enabled"), "{body}");
+}
+
+#[test]
+fn http_auth_signup_login_user_logout_and_admin_routes() {
+    let _server = start_lux_with_env(17702, 17703, "rootsecret", &[("LUX_AUTH_ENABLED", "true")]);
+
+    let (status, health) = http_request(17703, "GET", "/auth/v1/health", None, None);
+    assert_eq!(status, 200, "health: {health}");
+
+    let (status, signup_body) = http_request(
+        17703,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"http-auth@example.com","password":"password123"}"#),
+        None,
+    );
+    assert_eq!(status, 200, "signup: {signup_body}");
+    let signup_json: serde_json::Value = serde_json::from_str(&signup_body).unwrap();
+    let signup_access = signup_json["access_token"]
+        .as_str()
+        .expect("signup should return access token");
+    assert_eq!(signup_json["user"]["email"], "http-auth@example.com");
+
+    let (status, user_body) =
+        http_request(17703, "GET", "/auth/v1/user", None, Some(signup_access));
+    assert_eq!(status, 200, "user: {user_body}");
+    assert!(user_body.contains("http-auth@example.com"), "{user_body}");
+
+    let (status, login_body) = http_request(
+        17703,
+        "POST",
+        "/auth/v1/token",
+        Some(
+            r#"{"grant_type":"password","email":"http-auth@example.com","password":"password123"}"#,
+        ),
+        None,
+    );
+    assert_eq!(status, 200, "login: {login_body}");
+    let login_json: serde_json::Value = serde_json::from_str(&login_body).unwrap();
+    let login_access = login_json["access_token"]
+        .as_str()
+        .expect("login should return access token");
+    let refresh_token = login_json["refresh_token"]
+        .as_str()
+        .expect("login should return refresh token");
+
+    let (status, refresh_body) = http_request(
+        17703,
+        "POST",
+        "/auth/v1/token",
+        Some(&format!(
+            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+            refresh_token
+        )),
+        None,
+    );
+    assert_eq!(status, 200, "refresh: {refresh_body}");
+
+    let (status, admin_body) = http_request(
+        17703,
+        "GET",
+        "/auth/v1/admin/users",
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "admin users: {admin_body}");
+    assert!(admin_body.contains("http-auth@example.com"), "{admin_body}");
+    let admin_json: serde_json::Value = serde_json::from_str(&admin_body).unwrap();
+    let user_id = admin_json["users"][0]["id"]
+        .as_str()
+        .expect("admin users should include id");
+
+    let (status, grant_body) = http_request(
+        17703,
+        "POST",
+        "/auth/v1/admin/grants",
+        Some(&format!(
+            r#"{{"user_id":"{}","capability":"live.channel.room:*"}}"#,
+            user_id
+        )),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "grant: {grant_body}");
+    let grant_json: serde_json::Value = serde_json::from_str(&grant_body).unwrap();
+    let grant_id = grant_json["grant"]["id"]
+        .as_str()
+        .expect("grant should include id");
+
+    let (status, grants_body) = http_request(
+        17703,
+        "GET",
+        &format!("/auth/v1/admin/users/{user_id}/grants"),
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "list grants: {grants_body}");
+    assert!(grants_body.contains("live.channel.room:*"), "{grants_body}");
+
+    let (status, revoke_body) = http_request(
+        17703,
+        "DELETE",
+        &format!("/auth/v1/admin/grants/{grant_id}"),
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "revoke grant: {revoke_body}");
+
+    let (status, grants_body) = http_request(
+        17703,
+        "GET",
+        &format!("/auth/v1/admin/users/{user_id}/grants"),
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "list grants after revoke: {grants_body}");
+    assert!(
+        !grants_body.contains("live.channel.room:*"),
+        "revoked grant should not be active: {grants_body}"
+    );
+
+    let (status, table_body) = http_request(
+        17703,
+        "GET",
+        "/v1/tables/auth.users",
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "auth tables should be readable: {table_body}");
+    assert!(table_body.contains("http-auth@example.com"), "{table_body}");
+
+    let (status, logout_body) = http_request(
+        17703,
+        "POST",
+        "/auth/v1/logout",
+        Some(&format!(r#"{{"refresh_token":"{}"}}"#, refresh_token)),
+        None,
+    );
+    assert_eq!(status, 200, "logout: {logout_body}");
+
+    let (status, user_body) = http_request(17703, "GET", "/auth/v1/user", None, Some(login_access));
+    assert_eq!(
+        status, 401,
+        "revoked login access token should not authenticate: {user_body}"
+    );
+
+    let (status, refresh_body) = http_request(
+        17703,
+        "POST",
+        "/auth/v1/token",
+        Some(&format!(
+            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+            refresh_token
+        )),
+        None,
+    );
+    assert_eq!(
+        status, 401,
+        "revoked refresh token should not refresh: {refresh_body}"
+    );
+}
+
+#[test]
+fn http_auth_grants_gate_data_apis() {
+    let _server = start_lux_with_env(17704, 17705, "rootsecret", &[("LUX_AUTH_ENABLED", "true")]);
+
+    let (status, signup_body) = http_request(
+        17705,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"http-data@example.com","password":"password123"}"#),
+        None,
+    );
+    assert_eq!(status, 200, "signup: {signup_body}");
+    let signup_json: serde_json::Value = serde_json::from_str(&signup_body).unwrap();
+    let access_token = signup_json["access_token"]
+        .as_str()
+        .expect("signup should return access token");
+    let user_id = signup_json["user"]["id"]
+        .as_str()
+        .expect("signup should return user id");
+
+    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, None);
+    assert_eq!(status, 401, "anonymous data read should be denied: {body}");
+
+    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, Some(access_token));
+    assert_eq!(status, 403, "ungranted kv read should be denied: {body}");
+    assert!(body.contains("kv.doc:1.read"), "{body}");
+
+    let (status, body) = http_request(
+        17705,
+        "PUT",
+        "/v1/kv/doc:1",
+        Some(r#"{"value":"hello"}"#),
+        Some(access_token),
+    );
+    assert_eq!(status, 403, "ungranted kv write should be denied: {body}");
+
+    for capability in [
+        "kv.doc:1.write",
+        "kv.doc:1.read",
+        "table.messages.write",
+        "table.messages.read",
+        "ts.cpu:host1.write",
+        "ts.cpu:host1.read",
+        "vector.write",
+        "vector.read",
+        "vector.search",
+    ] {
+        let (status, body) = http_request(
+            17705,
+            "POST",
+            "/auth/v1/admin/grants",
+            Some(&format!(
+                r#"{{"user_id":"{}","capability":"{}"}}"#,
+                user_id, capability
+            )),
+            Some("rootsecret"),
+        );
+        assert_eq!(status, 200, "grant {capability}: {body}");
+    }
+
+    let (status, body) = http_request(
+        17705,
+        "PUT",
+        "/v1/kv/doc:1",
+        Some(r#"{"value":"hello"}"#),
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "granted kv write: {body}");
+    assert!(body.contains("\"OK\""), "{body}");
+
+    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, Some(access_token));
+    assert_eq!(status, 200, "granted kv read: {body}");
+    assert!(body.contains("\"hello\""), "{body}");
+
+    let (status, body) = http_request(
+        17705,
+        "POST",
+        "/v1/tables",
+        Some(r#"{"name":"messages","columns":["body STR","channel STR"]}"#),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "operator table create: {body}");
+
+    let (status, body) = http_request(
+        17705,
+        "POST",
+        "/v1/tables/messages",
+        Some(r#"{"body":"hello","channel":"general"}"#),
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "granted table write: {body}");
+
+    let (status, body) = http_request(
+        17705,
+        "GET",
+        "/v1/tables/messages",
+        None,
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "granted table read: {body}");
+    assert!(body.contains("hello"), "{body}");
+
+    let (status, body) = http_request(
+        17705,
+        "POST",
+        "/v1/ts/cpu:host1",
+        Some(r#"{"timestamp":"1000","value":72.5,"labels":{"host":"server1"}}"#),
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "granted timeseries write: {body}");
+
+    let (status, body) = http_request(
+        17705,
+        "GET",
+        "/v1/ts/cpu:host1/latest",
+        None,
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "granted timeseries read: {body}");
+    assert!(body.contains("72.5"), "{body}");
+
+    let (status, body) = http_request(
+        17705,
+        "POST",
+        "/v1/vectors/doc:1",
+        Some(r#"{"vector":[0.1,0.2,0.3],"metadata":{"title":"hello"}}"#),
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "granted vector write: {body}");
+
+    let (status, body) = http_request(
+        17705,
+        "POST",
+        "/v1/vectors/search",
+        Some(r#"{"vector":[0.1,0.2,0.3],"k":1}"#),
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "granted vector search: {body}");
+    assert!(body.contains("doc:1"), "{body}");
+
+    let (status, body) = http_request(17705, "GET", "/v1/vectors/doc:1", None, Some(access_token));
+    assert_eq!(status, 200, "granted vector read: {body}");
+    assert!(body.contains("0.1"), "{body}");
+
+    let (status, body) = http_request(
+        17705,
+        "POST",
+        "/auth/v1/logout",
+        Some("{}"),
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "logout: {body}");
+
+    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, Some(access_token));
+    assert_eq!(
+        status, 401,
+        "revoked access token should not reach granted data API: {body}"
+    );
+}
+
+#[test]
+fn http_auth_sessions_grants_keys_and_revocation_survive_restart() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let first_env = [
+        ("LUX_AUTH_ENABLED", "true"),
+        ("LUX_STORAGE_MODE", "tiered"),
+        ("LUX_AUTH_PUBLISHABLE_KEY", "lux_pub_persist"),
+        ("LUX_AUTH_SECRET_KEY", "lux_sec_persist"),
+    ];
+    let auth_only_env = [("LUX_AUTH_ENABLED", "true"), ("LUX_STORAGE_MODE", "tiered")];
+
+    let mut child =
+        spawn_lux_with_data_dir(17706, 17707, "rootsecret", &first_env, data_dir.path());
+
+    let (status, signup_body) = http_request_with_headers(
+        17707,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"persist-auth@example.com","password":"password123"}"#),
+        None,
+        &["apikey: lux_pub_persist"],
+    );
+    assert_eq!(status, 200, "signup: {signup_body}");
+    let signup_json: serde_json::Value = serde_json::from_str(&signup_body).unwrap();
+    let access_token = signup_json["access_token"]
+        .as_str()
+        .expect("signup should return access token")
+        .to_string();
+    let refresh_token = signup_json["refresh_token"]
+        .as_str()
+        .expect("signup should return refresh token")
+        .to_string();
+    let user_id = signup_json["user"]["id"]
+        .as_str()
+        .expect("signup should return user id")
+        .to_string();
+
+    for capability in ["kv.persist.write", "kv.persist.read"] {
+        let (status, body) = http_request(
+            17707,
+            "POST",
+            "/auth/v1/admin/grants",
+            Some(&format!(
+                r#"{{"user_id":"{}","capability":"{}"}}"#,
+                user_id, capability
+            )),
+            Some("lux_sec_persist"),
+        );
+        assert_eq!(status, 200, "grant {capability}: {body}");
+    }
+
+    let (status, body) = http_request(
+        17707,
+        "PUT",
+        "/v1/kv/persist",
+        Some(r#"{"value":"survived"}"#),
+        Some(&access_token),
+    );
+    assert_eq!(status, 200, "granted write before restart: {body}");
+
+    common::terminate_child(&mut child);
+
+    let mut child =
+        spawn_lux_with_data_dir(17706, 17707, "rootsecret", &auth_only_env, data_dir.path());
+
+    let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
+    assert_eq!(
+        status, 200,
+        "access token should validate after restart via persisted signing key/session: {body}"
+    );
+    assert!(body.contains("persist-auth@example.com"), "{body}");
+
+    let (status, body) = http_request(17707, "GET", "/v1/kv/persist", None, Some(&access_token));
+    assert_eq!(
+        status, 200,
+        "persisted grants should authorize data API after restart: {body}"
+    );
+    assert!(body.contains("survived"), "{body}");
+
+    let (status, body) = http_request(
+        17707,
+        "GET",
+        "/auth/v1/admin/users",
+        None,
+        Some("lux_sec_persist"),
+    );
+    assert_eq!(
+        status, 200,
+        "persisted secret api key should authorize admin route without config reseed: {body}"
+    );
+
+    let (status, body) = http_request_with_headers(
+        17707,
+        "POST",
+        "/auth/v1/token",
+        Some(&format!(
+            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+            refresh_token
+        )),
+        None,
+        &["apikey: lux_pub_persist"],
+    );
+    assert_eq!(
+        status, 200,
+        "persisted publishable api key and refresh session should work after restart: {body}"
+    );
+    let refreshed_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rotated_access_token = refreshed_json["access_token"]
+        .as_str()
+        .expect("refresh should return access token")
+        .to_string();
+    let rotated_refresh_token = refreshed_json["refresh_token"]
+        .as_str()
+        .expect("refresh should return refresh token")
+        .to_string();
+
+    let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
+    assert_eq!(
+        status, 200,
+        "refresh should not immediately revoke in-flight access tokens: {body}"
+    );
+
+    let (status, body) = http_request_with_headers(
+        17707,
+        "POST",
+        "/auth/v1/token",
+        Some(&format!(
+            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+            refresh_token
+        )),
+        None,
+        &["apikey: lux_pub_persist"],
+    );
+    assert_eq!(
+        status, 401,
+        "old refresh token should be revoked after rotation: {body}"
+    );
+
+    let (status, body) = http_request(
+        17707,
+        "POST",
+        "/auth/v1/logout",
+        Some("{}"),
+        Some(&rotated_access_token),
+    );
+    assert_eq!(status, 200, "logout after restart: {body}");
+
+    common::terminate_child(&mut child);
+
+    let mut child =
+        spawn_lux_with_data_dir(17706, 17707, "rootsecret", &auth_only_env, data_dir.path());
+
+    let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
+    assert_eq!(
+        status, 401,
+        "family logout should revoke pre-refresh access token after restart: {body}"
+    );
+
+    let (status, body) = http_request(
+        17707,
+        "GET",
+        "/auth/v1/user",
+        None,
+        Some(&rotated_access_token),
+    );
+    assert_eq!(
+        status, 401,
+        "family logout should revoke rotated access token after restart: {body}"
+    );
+
+    let (status, body) = http_request_with_headers(
+        17707,
+        "POST",
+        "/auth/v1/token",
+        Some(&format!(
+            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+            rotated_refresh_token
+        )),
+        None,
+        &["apikey: lux_pub_persist"],
+    );
+    assert_eq!(
+        status, 401,
+        "revoked refresh session should stay revoked after restart: {body}"
+    );
+
+    common::terminate_child(&mut child);
+}
+
+#[test]
+fn http_auth_admin_keys_can_be_created_listed_and_revoked() {
+    let _server = start_lux_with_env(
+        17708,
+        17709,
+        "rootsecret",
+        &[
+            ("LUX_AUTH_ENABLED", "true"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_bootstrap"),
+        ],
+    );
+
+    let (status, body) = http_request(
+        17709,
+        "POST",
+        "/auth/v1/admin/keys",
+        Some(r#"{"kind":"publishable","name":"browser client"}"#),
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(status, 200, "create publishable key: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let plain_key = created["plain_key"]
+        .as_str()
+        .expect("created key should return one-time plaintext");
+    assert!(
+        plain_key.starts_with("lux_pub_"),
+        "publishable key should be prefixed: {plain_key}"
+    );
+    let key_id = created["key"]["id"]
+        .as_str()
+        .expect("created key should include id");
+    assert_eq!(created["key"]["name"], "browser client");
+
+    let (status, body) = http_request(
+        17709,
+        "GET",
+        "/auth/v1/admin/keys",
+        None,
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(status, 200, "list keys: {body}");
+    assert!(body.contains("browser client"), "{body}");
+    assert!(
+        !body.contains(plain_key),
+        "list response must not expose plaintext key: {body}"
+    );
+
+    let (status, body) = http_request_with_headers(
+        17709,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"keyed@example.com","password":"password123"}"#),
+        None,
+        &[&format!("apikey: {plain_key}")],
+    );
+    assert_eq!(
+        status, 200,
+        "new publishable key should authorize signup: {body}"
+    );
+
+    let (status, body) = http_request(
+        17709,
+        "DELETE",
+        &format!("/auth/v1/admin/keys/{key_id}"),
+        None,
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(status, 200, "revoke key: {body}");
+
+    let (status, body) = http_request_with_headers(
+        17709,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"revoked-key@example.com","password":"password123"}"#),
+        None,
+        &[&format!("apikey: {plain_key}")],
+    );
+    assert_eq!(
+        status, 401,
+        "revoked publishable key should not authorize signup: {body}"
+    );
+
+    let (status, body) = http_request(
+        17709,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"bootstrap@example.com","password":"password123"}"#),
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(
+        status, 200,
+        "bootstrap secret key should still work because it is persisted: {body}"
+    );
+}
+
+#[test]
+fn http_options_allows_auth_api_key_header() {
+    let _server = start_lux_with_env(17710, 17711, "", &[("LUX_AUTH_ENABLED", "true")]);
+
+    let (status, body) = http_request_with_headers(
+        17711,
+        "OPTIONS",
+        "/auth/v1/signup",
+        None,
+        None,
+        &[
+            "Origin: http://localhost:5173",
+            "Access-Control-Request-Method: POST",
+            "Access-Control-Request-Headers: apikey, content-type",
+        ],
+    );
+    assert_eq!(status, 204, "options should succeed: {body}");
+    assert!(
+        body.is_empty(),
+        "options should have no response body: {body}"
+    );
 }
 
 #[test]
