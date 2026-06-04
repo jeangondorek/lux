@@ -507,7 +507,7 @@ fn parse_ref_spec(spec: &str) -> Result<(String, String), String> {
     }
     let table = spec[..paren].trim().to_string();
     let column = spec[paren + 1..spec.len() - 1].trim().to_string();
-    if !is_valid_name(&table) {
+    if !is_valid_table_name(&table) {
         return Err(format!("ERR invalid referenced table name '{}'", table));
     }
     if !is_valid_name(&column) {
@@ -3131,6 +3131,15 @@ mod tests {
         let f = parse_field_def("user_id INT REFERENCES users(id)").unwrap();
         let fk = f.references.unwrap();
         assert_eq!(fk.table, "users");
+        assert_eq!(fk.column, "id");
+        assert_eq!(fk.on_delete, OnDelete::Restrict);
+    }
+
+    #[test]
+    fn parse_field_references_namespaced_table() {
+        let f = parse_field_def("user_id STR REFERENCES auth.users(id)").unwrap();
+        let fk = f.references.unwrap();
+        assert_eq!(fk.table, "auth.users");
         assert_eq!(fk.column, "id");
         assert_eq!(fk.on_delete, OnDelete::Restrict);
     }

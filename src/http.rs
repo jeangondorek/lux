@@ -182,7 +182,7 @@ async fn handle_request(
         let response = "HTTP/1.1 204 No Content\r\n\
              Access-Control-Allow-Origin: *\r\n\
              Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Authorization, Content-Type, Prefer\r\n\
+             Access-Control-Allow-Headers: Authorization, Content-Type, Prefer, apikey\r\n\
              Content-Length: 0\r\n\r\n"
             .to_string();
         socket.write_all(response.as_bytes()).await?;
@@ -196,9 +196,11 @@ async fn handle_request(
     let params = parse_query_string(&query_string);
 
     if path.starts_with("/auth/v1") {
-        let (status, status_text, result) =
-            crate::auth::route_http(&method, &path, &body, &params, &headers, store, cache);
-        return send_json(socket, status, status_text, &result).await;
+        let response = crate::auth::route_http_response(
+            &method, &path, &body, &params, &headers, store, cache,
+        )
+        .await;
+        return send_auth_response(socket, response).await;
     }
 
     let password = &store.config().password;
@@ -556,6 +558,32 @@ async fn send_json(
         body
     );
     socket.write_all(response.as_bytes()).await?;
+    Ok(true)
+}
+
+async fn send_auth_response(
+    socket: &mut tokio::net::TcpStream,
+    response: crate::auth::AuthHttpResponse,
+) -> std::io::Result<bool> {
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Content-Length: {}\r\n",
+        response.status,
+        response.status_text,
+        response.content_type,
+        response.body.len()
+    );
+    for (key, value) in response.headers {
+        head.push_str(&key);
+        head.push_str(": ");
+        head.push_str(&value.replace(['\r', '\n'], ""));
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    head.push_str(&response.body);
+    socket.write_all(head.as_bytes()).await?;
     Ok(true)
 }
 
@@ -985,6 +1013,9 @@ async fn build_live_subscription(
     }
     if kind == "table" || spec.get("table").is_some() {
         let table_spec = parse_live_table_spec(spec)?;
+        if let Some(err) = crate::auth::reserved_table_access_error(&table_spec.table) {
+            return Err(live_error("FORBIDDEN", &err));
+        }
         require_live_capability(
             store,
             cache,

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -9,6 +9,8 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::runtime::RuntimeFlavor;
+use tokio::task::block_in_place;
 
 use crate::store::Store;
 use crate::tables::{self, CmpOp, SelectPlan, SelectResult, SharedSchemaCache, WhereClause};
@@ -20,9 +22,12 @@ pub(crate) const SESSIONS_TABLE: &str = "auth.sessions";
 pub(crate) const KEYS_TABLE: &str = "auth.keys";
 pub(crate) const SIGNING_KEYS_TABLE: &str = "auth.signing_keys";
 pub(crate) const GRANTS_TABLE: &str = "auth.grants";
+pub(crate) const PROVIDERS_TABLE: &str = "auth.providers";
 
 const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
 const AUTH_SCHEMA_VERSION: &[u8] = b"1";
+const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApiKeyKind {
@@ -39,6 +44,37 @@ struct AccessClaims {
     role: String,
     iat: usize,
     exp: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AuthHttpResponse {
+    pub status: u16,
+    pub status_text: &'static str,
+    pub body: String,
+    pub content_type: &'static str,
+    pub headers: Vec<(String, String)>,
+}
+
+impl AuthHttpResponse {
+    fn json(status: u16, status_text: &'static str, body: String) -> Self {
+        Self {
+            status,
+            status_text,
+            body,
+            content_type: "application/json",
+            headers: Vec::new(),
+        }
+    }
+
+    fn redirect(location: String) -> Self {
+        Self {
+            status: 302,
+            status_text: "Found",
+            body: String::new(),
+            content_type: "text/plain",
+            headers: vec![("Location".to_string(), location)],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,12 +116,8 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
     }
 }
 
-pub(crate) fn reserved_table_access_error(table: &str) -> Option<String> {
-    if is_reserved_auth_table(table) {
-        Some(reserved_table_error(table))
-    } else {
-        None
-    }
+pub(crate) fn reserved_table_access_error(_table: &str) -> Option<String> {
+    None
 }
 
 fn reserved_table_error(table: &str) -> String {
@@ -201,8 +233,68 @@ pub(crate) fn bootstrap(
         ],
         now,
     )?;
+    create_table_if_missing(
+        store,
+        cache,
+        PROVIDERS_TABLE,
+        &[
+            "provider STR PRIMARY KEY,",
+            "enabled BOOL,",
+            "client_id STR,",
+            "client_secret STR,",
+            "redirect_uri STR,",
+            "scopes STR,",
+            "created_at INT,",
+            "updated_at INT",
+        ],
+        now,
+    )?;
     store.set(AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION, None, now);
     Ok(())
+}
+
+pub(crate) async fn route_http_response(
+    method: &str,
+    path: &str,
+    body: &str,
+    params: &[(String, String)],
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> AuthHttpResponse {
+    if !store.config().auth.enabled {
+        let (status, status_text, body) = error(404, "Not Found", "auth is not enabled");
+        return AuthHttpResponse::json(status, status_text, body);
+    }
+
+    let path = path.trim_start_matches('/');
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let base = match segments.as_slice() {
+        ["auth", "v1", rest @ ..] => rest,
+        _ => {
+            let (status, status_text, body) = error(404, "Not Found", "not found");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+
+    match (method, base) {
+        ("GET", ["authorize"]) => oauth_authorize(params, headers, store, cache),
+        ("GET", ["callback", provider]) => {
+            oauth_callback(provider, params, headers, store, cache).await
+        }
+        _ => {
+            let (status, status_text, body) = route_http(
+                method,
+                &format!("/{}", path),
+                body,
+                params,
+                headers,
+                store,
+                cache,
+            );
+            AuthHttpResponse::json(status, status_text, body)
+        }
+    }
 }
 
 pub(crate) fn bootstrap_runtime(
@@ -295,6 +387,36 @@ pub(crate) fn route_http(
             }
             admin_list_user_grants(user_id, store, cache)
         }
+        ("GET", ["admin", "keys"]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_list_keys(store, cache)
+        }
+        ("POST", ["admin", "keys"]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_create_key(body, store, cache)
+        }
+        ("DELETE", ["admin", "keys", key_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_revoke_key(key_id, store, cache)
+        }
+        ("GET", ["admin", "providers"]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_list_providers(store, cache)
+        }
+        ("POST", ["admin", "providers", provider]) | ("PUT", ["admin", "providers", provider]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_upsert_provider(provider, body, store, cache)
+        }
         _ => error(404, "Not Found", "not found"),
     }
 }
@@ -380,10 +502,25 @@ fn signup(
         ],
         now,
     ) {
+        let _ = durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
         return error(400, "Bad Request", &e);
     }
 
-    issue_session_response(store, cache, headers, &user_id, &email, now)
+    match issue_session_response(store, cache, headers, &user_id, &email, now) {
+        response @ (200, _, _) => response,
+        response => {
+            let _ = durable_table_delete_where(
+                store,
+                cache,
+                IDENTITIES_TABLE,
+                &["user_id", "=", &user_id],
+                now,
+            );
+            let _ =
+                durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+            response
+        }
+    }
 }
 
 fn token(
@@ -505,7 +642,36 @@ fn refresh_token_grant(
         return response;
     }
     let email = user.get("email").cloned().unwrap_or_default();
-    issue_session_response(store, cache, headers, user_id, &email, now)
+    let now_sec = unix_seconds().to_string();
+    if let Err(e) = durable_table_update_where(
+        store,
+        cache,
+        SESSIONS_TABLE,
+        &[
+            ("revoked_at", now_sec.as_str()),
+            ("updated_at", now_sec.as_str()),
+        ],
+        &[
+            "id",
+            "=",
+            session.get("id").map(String::as_str).unwrap_or(""),
+        ],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    issue_session_response_with_family(
+        store,
+        cache,
+        headers,
+        user_id,
+        &email,
+        session
+            .get("refresh_token_family")
+            .map(String::as_str)
+            .unwrap_or_else(|| session.get("id").map(String::as_str).unwrap_or("")),
+        now,
+    )
 }
 
 fn issue_session_response(
@@ -516,10 +682,27 @@ fn issue_session_response(
     email: &str,
     now: Instant,
 ) -> (u16, &'static str, String) {
+    issue_session_response_with_family(store, cache, headers, user_id, email, "", now)
+}
+
+fn issue_session_response_with_family(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    headers: &[(String, String)],
+    user_id: &str,
+    email: &str,
+    refresh_token_family: &str,
+    now: Instant,
+) -> (u16, &'static str, String) {
     let now_sec = unix_seconds();
     let refresh_token = random_token(32);
     let refresh_hash = hash_secret(&refresh_token);
     let session_id = random_id("ses");
+    let refresh_token_family = if refresh_token_family.is_empty() {
+        session_id.as_str()
+    } else {
+        refresh_token_family
+    };
     let expires_at = now_sec + store.config().auth.refresh_token_ttl.as_secs();
     let user_agent = header_value(headers, "user-agent")
         .unwrap_or("")
@@ -533,7 +716,7 @@ fn issue_session_response(
             ("id", session_id.as_str()),
             ("user_id", user_id),
             ("refresh_token_hash", refresh_hash.as_str()),
-            ("refresh_token_family", session_id.as_str()),
+            ("refresh_token_family", refresh_token_family),
             ("user_agent", user_agent.as_str()),
             ("ip", ""),
             ("expires_at", &expires_at.to_string()),
@@ -592,34 +775,25 @@ fn logout(
     let now = Instant::now();
     let now_sec = unix_seconds().to_string();
     if let Ok(claims) = claims_from_bearer(headers, store, cache) {
-        let _ = durable_table_update_where(
-            store,
-            cache,
-            SESSIONS_TABLE,
-            &[
-                ("revoked_at", now_sec.as_str()),
-                ("updated_at", now_sec.as_str()),
-            ],
-            &["id", "=", &claims.session_id],
-            now,
-        );
+        let _ = revoke_session_family_access(store, cache, &claims.session_id, &now_sec, now);
         return ok(json!({"result":"OK"}));
     }
 
     if let Ok(parsed) = serde_json::from_str::<Value>(body) {
         if let Some(refresh_token) = parsed.get("refresh_token").and_then(Value::as_str) {
             let token_hash = hash_secret(refresh_token);
-            let _ = durable_table_update_where(
+            if let Ok(Some(session)) = find_row_by_field(
                 store,
                 cache,
                 SESSIONS_TABLE,
-                &[
-                    ("revoked_at", now_sec.as_str()),
-                    ("updated_at", now_sec.as_str()),
-                ],
-                &["refresh_token_hash", "=", &token_hash],
+                "refresh_token_hash",
+                &token_hash,
                 now,
-            );
+            ) {
+                if let Some(session_id) = session.get("id") {
+                    let _ = revoke_session_family_access(store, cache, session_id, &now_sec, now);
+                }
+            }
             return ok(json!({"result":"OK"}));
         }
     }
@@ -654,6 +828,439 @@ fn admin_create_user(
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     signup(body, &[], store, cache)
+}
+
+fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    let plan = SelectPlan {
+        table: PROVIDERS_TABLE.to_string(),
+        alias: None,
+        projections: Vec::new(),
+        aggregates: Vec::new(),
+        joins: Vec::new(),
+        conditions: Vec::new(),
+        order_by: None,
+        limit: Some(100),
+        offset: None,
+    };
+    match tables::table_select(store, cache, &plan, Instant::now()) {
+        Ok(SelectResult::Rows(rows)) => {
+            let providers: Vec<Value> = rows.into_iter().map(provider_row_json).collect();
+            ok(json!({"providers": providers}))
+        }
+        Ok(SelectResult::Aggregate(_)) => ok(json!({"providers": []})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_upsert_provider(
+    provider: &str,
+    body: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let provider = match normalize_oauth_provider(provider) {
+        Ok(provider) => provider,
+        Err(response) => return response,
+    };
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let client_id = match required_string(&parsed, "client_id") {
+        Ok(client_id) => client_id.trim(),
+        Err(response) => return response,
+    };
+    let client_secret = parsed
+        .get("client_secret")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let redirect_uri = match required_string(&parsed, "redirect_uri") {
+        Ok(redirect_uri) => redirect_uri.trim(),
+        Err(response) => return response,
+    };
+    let enabled = parsed
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        .to_string();
+    let scopes = parsed
+        .get("scopes")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|scopes| !scopes.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_oauth_scopes(&provider).to_string());
+
+    let now = Instant::now();
+    let now_sec = unix_seconds().to_string();
+    match find_row_by_field(store, cache, PROVIDERS_TABLE, "provider", &provider, now) {
+        Ok(Some(existing)) => {
+            let secret = if client_secret.is_empty() {
+                existing
+                    .get("client_secret")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                client_secret.to_string()
+            };
+            match durable_table_update_where(
+                store,
+                cache,
+                PROVIDERS_TABLE,
+                &[
+                    ("enabled", enabled.as_str()),
+                    ("client_id", client_id),
+                    ("client_secret", secret.as_str()),
+                    ("redirect_uri", redirect_uri),
+                    ("scopes", scopes.as_str()),
+                    ("updated_at", now_sec.as_str()),
+                ],
+                &["provider", "=", &provider],
+                now,
+            ) {
+                Ok(_) => match oauth_provider_config(store, cache, &provider, now) {
+                    Ok(Some(config)) => ok(json!({"provider": provider_config_json(&config)})),
+                    Ok(None) => error(404, "Not Found", "provider not found"),
+                    Err(e) => error(400, "Bad Request", &e),
+                },
+                Err(e) => error(400, "Bad Request", &e),
+            }
+        }
+        Ok(None) => {
+            if client_secret.is_empty() {
+                return error(400, "Bad Request", "missing client_secret");
+            }
+            match durable_table_insert(
+                store,
+                cache,
+                PROVIDERS_TABLE,
+                &[
+                    ("provider", provider.as_str()),
+                    ("enabled", enabled.as_str()),
+                    ("client_id", client_id),
+                    ("client_secret", client_secret),
+                    ("redirect_uri", redirect_uri),
+                    ("scopes", scopes.as_str()),
+                    ("created_at", now_sec.as_str()),
+                    ("updated_at", now_sec.as_str()),
+                ],
+                now,
+            ) {
+                Ok(_) => match oauth_provider_config(store, cache, &provider, now) {
+                    Ok(Some(config)) => ok(json!({"provider": provider_config_json(&config)})),
+                    Ok(None) => error(404, "Not Found", "provider not found"),
+                    Err(e) => error(400, "Bad Request", &e),
+                },
+                Err(e) => error(400, "Bad Request", &e),
+            }
+        }
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn oauth_authorize(
+    params: &[(String, String)],
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> AuthHttpResponse {
+    let provider = match get_param(params, "provider") {
+        Some(provider) => match normalize_oauth_provider(provider) {
+            Ok(provider) => provider,
+            Err((status, status_text, body)) => {
+                return AuthHttpResponse::json(status, status_text, body)
+            }
+        },
+        None => {
+            let (status, status_text, body) = error(400, "Bad Request", "missing provider");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let redirect_to = get_param(params, "redirect_to")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/");
+    let redirect_to = sanitize_header_value(redirect_to);
+    let config = match oauth_provider_config(store, cache, &provider, Instant::now()) {
+        Ok(Some(config)) if config.enabled => config,
+        Ok(Some(_)) => {
+            let (status, status_text, body) = error(400, "Bad Request", "provider is disabled");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+        Ok(None) => {
+            let (status, status_text, body) = error(404, "Not Found", "provider not configured");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+        Err(e) => {
+            let (status, status_text, body) = error(400, "Bad Request", &e);
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let state = random_token(32);
+    let state_key = oauth_state_key(&state);
+    let payload = json!({
+        "provider": provider,
+        "redirect_to": redirect_to,
+        "created_at": unix_seconds(),
+    });
+    store.set(
+        state_key.as_bytes(),
+        payload.to_string().as_bytes(),
+        Some(OAUTH_STATE_TTL),
+        Instant::now(),
+    );
+
+    let callback = if config.redirect_uri.is_empty() {
+        default_callback_url(headers, &provider)
+    } else {
+        config.redirect_uri.clone()
+    };
+    let url = oauth_authorization_url(&config, &callback, &state);
+    AuthHttpResponse::redirect(url)
+}
+
+async fn oauth_callback(
+    provider: &str,
+    params: &[(String, String)],
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> AuthHttpResponse {
+    let provider = match normalize_oauth_provider(provider) {
+        Ok(provider) => provider,
+        Err((status, status_text, body)) => {
+            return AuthHttpResponse::json(status, status_text, body)
+        }
+    };
+    if let Some(oauth_error) = get_param(params, "error") {
+        return redirect_oauth_error(params, oauth_error);
+    }
+    let code = match get_param(params, "code") {
+        Some(code) if !code.is_empty() => code,
+        _ => {
+            let (status, status_text, body) = error(400, "Bad Request", "missing code");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let state = match get_param(params, "state") {
+        Some(state) if !state.is_empty() => state,
+        _ => {
+            let (status, status_text, body) = error(400, "Bad Request", "missing state");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let state_key = oauth_state_key(state);
+    let Some(raw_state) = store.get(state_key.as_bytes(), Instant::now()) else {
+        let (status, status_text, body) = error(400, "Bad Request", "invalid oauth state");
+        return AuthHttpResponse::json(status, status_text, body);
+    };
+    let _ = store.del(&[state_key.as_bytes()]);
+    let state_value: Value = serde_json::from_slice(&raw_state).unwrap_or_else(|_| json!({}));
+    if state_value.get("provider").and_then(Value::as_str) != Some(provider.as_str()) {
+        let (status, status_text, body) =
+            error(400, "Bad Request", "oauth state provider mismatch");
+        return AuthHttpResponse::json(status, status_text, body);
+    }
+    let redirect_to = state_value
+        .get("redirect_to")
+        .and_then(Value::as_str)
+        .unwrap_or("/");
+    let redirect_to = sanitize_header_value(redirect_to);
+    let config = match oauth_provider_config(store, cache, &provider, Instant::now()) {
+        Ok(Some(config)) if config.enabled => config,
+        Ok(Some(_)) => {
+            return AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "provider_disabled"))
+        }
+        Ok(None) => {
+            return AuthHttpResponse::redirect(oauth_error_url(
+                &redirect_to,
+                "provider_not_configured",
+            ))
+        }
+        Err(_) => {
+            return AuthHttpResponse::redirect(oauth_error_url(
+                &redirect_to,
+                "provider_config_error",
+            ))
+        }
+    };
+    let callback = if config.redirect_uri.is_empty() {
+        default_callback_url(headers, &provider)
+    } else {
+        config.redirect_uri.clone()
+    };
+    let oauth_user = match exchange_oauth_code(&config, code, &callback).await {
+        Ok(user) => user,
+        Err(e) => return AuthHttpResponse::redirect(oauth_error_url(&redirect_to, &e)),
+    };
+    match oauth_sign_in(&oauth_user, headers, store, cache) {
+        (200, _, body) => match serde_json::from_str::<Value>(&body) {
+            Ok(session) => AuthHttpResponse::redirect(oauth_success_url(&redirect_to, &session)),
+            Err(_) => AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "invalid_session")),
+        },
+        (_, _, body) => AuthHttpResponse::redirect(oauth_error_url(
+            &redirect_to,
+            &json_error_message(&body).unwrap_or_else(|| "oauth_sign_in_failed".to_string()),
+        )),
+    }
+}
+
+fn oauth_sign_in(
+    oauth_user: &OAuthUser,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let provider = oauth_user.provider.as_str();
+    let provider_user_id = oauth_user.provider_id.as_str();
+    let email = normalize_email(&oauth_user.email);
+    let email_confirmed = oauth_user.email_verified;
+    let user_meta = oauth_user.user_metadata.clone();
+    let identity_data = oauth_user.identity_data.clone();
+    let stored_provider_id = oauth_provider_id(provider, provider_user_id);
+
+    let now = Instant::now();
+    if let Some(identity) = match find_row_by_field(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        "provider_id",
+        &stored_provider_id,
+        now,
+    ) {
+        Ok(identity) => identity,
+        Err(e) => return error(400, "Bad Request", &e),
+    } {
+        let Some(user_id) = identity.get("user_id") else {
+            return error(
+                500,
+                "Internal Server Error",
+                "identity row is missing user_id",
+            );
+        };
+        let Some(user) = (match find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now) {
+            Ok(user) => user,
+            Err(e) => return error(400, "Bad Request", &e),
+        }) else {
+            return error(401, "Unauthorized", "user not found");
+        };
+        if let Err(response) = validate_user_active(&user, unix_seconds()) {
+            return response;
+        }
+        let user_email = user.get("email").cloned().unwrap_or_else(|| email.clone());
+        let now_sec = unix_seconds().to_string();
+        let merged_app_meta =
+            app_metadata_with_provider(user.get("raw_app_meta_data").map(String::as_str), provider);
+        let _ = durable_table_update_where(
+            store,
+            cache,
+            USERS_TABLE,
+            &[
+                ("raw_app_meta_data", merged_app_meta.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &["id", "=", user_id],
+            now,
+        );
+        let identity_payload =
+            oauth_identity_data(provider, provider_user_id, &email, identity_data);
+        let _ = durable_table_update_where(
+            store,
+            cache,
+            IDENTITIES_TABLE,
+            &[
+                ("identity_data", identity_payload.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &[
+                "id",
+                "=",
+                identity.get("id").map(String::as_str).unwrap_or(""),
+            ],
+            now,
+        );
+        return issue_session_response(store, cache, headers, user_id, &user_email, now);
+    }
+
+    let now_sec = unix_seconds();
+    let existing_user = match find_row_by_field(store, cache, USERS_TABLE, "email", &email, now) {
+        Ok(user) => user,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    let (user_id, created_user) = if let Some(user) = existing_user {
+        let Some(user_id) = user.get("id").cloned() else {
+            return error(500, "Internal Server Error", "auth user row is missing id");
+        };
+        let merged_app_meta =
+            app_metadata_with_provider(user.get("raw_app_meta_data").map(String::as_str), provider);
+        if let Err(e) = durable_table_update_where(
+            store,
+            cache,
+            USERS_TABLE,
+            &[
+                ("raw_app_meta_data", merged_app_meta.as_str()),
+                ("updated_at", &now_sec.to_string()),
+            ],
+            &["id", "=", &user_id],
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+        (user_id, false)
+    } else {
+        let user_id = random_id("usr");
+        let user_meta = user_meta.to_string();
+        let app_meta = app_metadata_with_provider(None, provider);
+        let email_confirmed_at = if email_confirmed {
+            now_sec.to_string()
+        } else {
+            String::new()
+        };
+        if let Err(e) = durable_table_insert(
+            store,
+            cache,
+            USERS_TABLE,
+            &[
+                ("id", user_id.as_str()),
+                ("email", email.as_str()),
+                ("email_confirmed_at", email_confirmed_at.as_str()),
+                ("raw_user_meta_data", user_meta.as_str()),
+                ("raw_app_meta_data", app_meta.as_str()),
+                ("created_at", &now_sec.to_string()),
+                ("updated_at", &now_sec.to_string()),
+            ],
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+        (user_id, true)
+    };
+
+    let identity_payload = oauth_identity_data(provider, provider_user_id, &email, identity_data);
+    if let Err(e) = durable_table_insert(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        &[
+            ("id", random_id("idn").as_str()),
+            ("user_id", user_id.as_str()),
+            ("provider", provider),
+            ("provider_id", stored_provider_id.as_str()),
+            ("identity_data", identity_payload.as_str()),
+            ("created_at", &now_sec.to_string()),
+            ("updated_at", &now_sec.to_string()),
+        ],
+        now,
+    ) {
+        if created_user {
+            let _ =
+                durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+        }
+        return error(400, "Bad Request", &e);
+    }
+
+    issue_session_response(store, cache, headers, &user_id, &email, now)
 }
 
 fn admin_create_grant(
@@ -738,6 +1345,85 @@ fn admin_list_user_grants(
     }
 }
 
+fn admin_list_keys(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    let plan = SelectPlan {
+        table: KEYS_TABLE.to_string(),
+        alias: None,
+        projections: Vec::new(),
+        aggregates: Vec::new(),
+        joins: Vec::new(),
+        conditions: Vec::new(),
+        order_by: None,
+        limit: Some(1000),
+        offset: None,
+    };
+    match tables::table_select(store, cache, &plan, Instant::now()) {
+        Ok(SelectResult::Rows(rows)) => {
+            let keys: Vec<Value> = rows.into_iter().map(key_row_json).collect();
+            ok(json!({"keys": keys}))
+        }
+        Ok(SelectResult::Aggregate(_)) => ok(json!({"keys": []})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_create_key(
+    body: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let kind = match required_string(&parsed, "kind") {
+        Ok("publishable") => ApiKeyKind::Publishable,
+        Ok("secret") => ApiKeyKind::Secret,
+        Ok(_) => return error(400, "Bad Request", "kind must be publishable or secret"),
+        Err(response) => return response,
+    };
+    let name = parsed
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(match kind {
+            ApiKeyKind::Publishable => "publishable",
+            ApiKeyKind::Secret => "secret",
+        });
+    let raw_key = match kind {
+        ApiKeyKind::Publishable => format!("lux_pub_{}", random_token(24)),
+        ApiKeyKind::Secret => format!("lux_sec_{}", random_token(32)),
+    };
+    match insert_api_key(store, cache, &raw_key, kind, name, Instant::now()) {
+        Ok(key) => ok(json!({"key": key, "plain_key": raw_key})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_revoke_key(
+    key_id: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let now = Instant::now();
+    let now_sec = unix_seconds().to_string();
+    match durable_table_update_where(
+        store,
+        cache,
+        KEYS_TABLE,
+        &[
+            ("revoked_at", now_sec.as_str()),
+            ("last_used_at", now_sec.as_str()),
+        ],
+        &["id", "=", key_id],
+        now,
+    ) {
+        Ok(0) => error(404, "Not Found", "key not found"),
+        Ok(_) => ok(json!({"result":"OK"})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
 fn create_table_if_missing(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -792,6 +1478,26 @@ fn durable_table_update_where(
     tables::table_update_where(store, cache, table, field_values, where_args, now)
 }
 
+fn durable_table_delete_where(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    where_args: &[&str],
+    now: Instant,
+) -> Result<i64, String> {
+    let mut args: Vec<Vec<u8>> = vec![
+        b"TDELETE".to_vec(),
+        b"FROM".to_vec(),
+        table.as_bytes().to_vec(),
+    ];
+    args.push(b"WHERE".to_vec());
+    for arg in where_args {
+        args.push(arg.as_bytes().to_vec());
+    }
+    log_command(store, &args)?;
+    tables::table_delete_where(store, cache, table, where_args, now)
+}
+
 fn log_command(store: &Store, args: &[Vec<u8>]) -> Result<(), String> {
     let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     store
@@ -834,31 +1540,53 @@ fn ensure_api_key(
     name: &str,
     now: Instant,
 ) -> Result<(), String> {
+    insert_api_key(store, cache, key, kind, name, now).map(|_| ())
+}
+
+fn insert_api_key(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    key: &str,
+    kind: ApiKeyKind,
+    name: &str,
+    now: Instant,
+) -> Result<Value, String> {
     let hash = hash_secret(key);
-    if find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, now)?.is_some() {
-        return Ok(());
+    if let Some(row) = find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, now)? {
+        return Ok(key_map_json(&row));
     }
     let now_sec = unix_seconds().to_string();
     let kind_str = match kind {
         ApiKeyKind::Publishable => "publishable",
         ApiKeyKind::Secret => "secret",
     };
+    let key_id = random_id("key");
+    let prefix = key_prefix(key);
     durable_table_insert(
         store,
         cache,
         KEYS_TABLE,
         &[
-            ("id", random_id("key").as_str()),
+            ("id", key_id.as_str()),
             ("name", name),
             ("kind", kind_str),
-            ("prefix", key_prefix(key).as_str()),
+            ("prefix", prefix.as_str()),
             ("key_hash", hash.as_str()),
             ("scopes", "auth"),
             ("created_at", now_sec.as_str()),
         ],
         now,
     )?;
-    Ok(())
+    Ok(json!({
+        "id": key_id,
+        "name": name,
+        "kind": kind_str,
+        "prefix": prefix,
+        "scopes": ["auth"],
+        "created_at": now_sec.parse::<u64>().unwrap_or_default(),
+        "revoked_at": Value::Null,
+        "last_used_at": Value::Null,
+    }))
 }
 
 fn require_publishable_or_secret(
@@ -904,27 +1632,6 @@ fn api_key_kind(
     let Some(key) = header_value(headers, "apikey").or_else(|| bearer_token(headers)) else {
         return Ok(None);
     };
-
-    if store
-        .config()
-        .auth
-        .initial_publishable_key
-        .as_deref()
-        .map(|expected| constant_time_eq(key.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false)
-    {
-        return Ok(Some(ApiKeyKind::Publishable));
-    }
-    if store
-        .config()
-        .auth
-        .initial_secret_key
-        .as_deref()
-        .map(|expected| constant_time_eq(key.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false)
-    {
-        return Ok(Some(ApiKeyKind::Secret));
-    }
 
     let hash = hash_secret(key);
     let Some(row) = find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, Instant::now())?
@@ -1060,7 +1767,10 @@ fn validate_access_claims(
     if session.get("user_id").map(String::as_str) != Some(claims.sub.as_str()) {
         return Err(error(401, "Unauthorized", "session user mismatch"));
     }
-    if row_field_is_set(&session, "revoked_at") {
+    if access_revoked_after(store, &claims.session_id, now)
+        .map(|revoked_after| claims.iat as u64 <= revoked_after)
+        .unwrap_or(false)
+    {
         return Err(error(401, "Unauthorized", "session revoked"));
     }
     let expires_at = session
@@ -1077,6 +1787,83 @@ fn validate_access_claims(
     validate_user_active(&user, now_sec)?;
 
     Ok(claims)
+}
+
+fn revoke_session_family_access(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    session_id: &str,
+    now_sec: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let Some(session) = find_row_by_field(store, cache, SESSIONS_TABLE, "id", session_id, now)?
+    else {
+        return Ok(());
+    };
+    let family = session
+        .get("refresh_token_family")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(session_id);
+    let sessions = find_rows_by_field(
+        store,
+        cache,
+        SESSIONS_TABLE,
+        "refresh_token_family",
+        family,
+        now,
+    )?;
+
+    for session in sessions {
+        if let Some(id) = session.get("id") {
+            persist_access_revocation(store, id, now_sec, now)?;
+        }
+    }
+
+    durable_table_update_where(
+        store,
+        cache,
+        SESSIONS_TABLE,
+        &[("revoked_at", now_sec), ("updated_at", now_sec)],
+        &["refresh_token_family", "=", family],
+        now,
+    )?;
+    Ok(())
+}
+
+fn persist_access_revocation(
+    store: &Store,
+    session_id: &str,
+    revoked_after: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let key = access_revoked_after_key(session_id);
+    let args = vec![
+        b"SET".to_vec(),
+        key.clone(),
+        revoked_after.as_bytes().to_vec(),
+    ];
+    log_command(store, &args)?;
+    store.set(
+        &key,
+        revoked_after.as_bytes(),
+        Some(store.config().auth.access_token_ttl),
+        now,
+    );
+    Ok(())
+}
+
+fn access_revoked_after(store: &Store, session_id: &str, now: Instant) -> Option<u64> {
+    let key = access_revoked_after_key(session_id);
+    store
+        .get(&key, now)
+        .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok())
+}
+
+fn access_revoked_after_key(session_id: &str) -> Vec<u8> {
+    let mut key = ACCESS_REVOKED_AFTER_PREFIX.to_vec();
+    key.extend_from_slice(session_id.as_bytes());
+    key
 }
 
 fn validate_user_active(
@@ -1188,6 +1975,383 @@ fn user_row_json(row: Vec<(String, String)>) -> Value {
     user_map_json(&map)
 }
 
+fn key_row_json(row: Vec<(String, String)>) -> Value {
+    let map: HashMap<String, String> = row.into_iter().collect();
+    key_map_json(&map)
+}
+
+fn provider_row_json(row: Vec<(String, String)>) -> Value {
+    let map: HashMap<String, String> = row.into_iter().collect();
+    provider_map_json(&map)
+}
+
+fn key_map_json(row: &HashMap<String, String>) -> Value {
+    let scopes = row
+        .get("scopes")
+        .map(|scopes| {
+            scopes
+                .split(',')
+                .filter(|scope| !scope.trim().is_empty())
+                .map(|scope| Value::String(scope.trim().to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "id": row.get("id").cloned().unwrap_or_default(),
+        "name": row.get("name").cloned().unwrap_or_default(),
+        "kind": row.get("kind").cloned().unwrap_or_default(),
+        "prefix": row.get("prefix").cloned().unwrap_or_default(),
+        "scopes": scopes,
+        "created_at": parse_optional_int(row.get("created_at")),
+        "revoked_at": parse_optional_int(row.get("revoked_at")),
+        "last_used_at": parse_optional_int(row.get("last_used_at")),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct OAuthProviderConfig {
+    provider: String,
+    enabled: bool,
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    scopes: String,
+    created_at: Value,
+    updated_at: Value,
+}
+
+#[derive(Clone, Debug)]
+struct OAuthUser {
+    provider: String,
+    provider_id: String,
+    email: String,
+    email_verified: bool,
+    user_metadata: Value,
+    identity_data: Value,
+}
+
+fn provider_map_json(row: &HashMap<String, String>) -> Value {
+    json!({
+        "provider": row.get("provider").cloned().unwrap_or_default(),
+        "enabled": parse_bool(row.get("enabled")),
+        "client_id": row.get("client_id").cloned().unwrap_or_default(),
+        "redirect_uri": row.get("redirect_uri").cloned().unwrap_or_default(),
+        "scopes": row.get("scopes").cloned().unwrap_or_default(),
+        "has_client_secret": row.get("client_secret").map(|s| !s.is_empty()).unwrap_or(false),
+        "created_at": parse_optional_int(row.get("created_at")),
+        "updated_at": parse_optional_int(row.get("updated_at")),
+    })
+}
+
+fn provider_config_json(config: &OAuthProviderConfig) -> Value {
+    json!({
+        "provider": config.provider,
+        "enabled": config.enabled,
+        "client_id": config.client_id,
+        "redirect_uri": config.redirect_uri,
+        "scopes": config.scopes,
+        "has_client_secret": !config.client_secret.is_empty(),
+        "created_at": config.created_at,
+        "updated_at": config.updated_at,
+    })
+}
+
+fn oauth_provider_config(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    provider: &str,
+    now: Instant,
+) -> Result<Option<OAuthProviderConfig>, String> {
+    let Some(row) = find_row_by_field(store, cache, PROVIDERS_TABLE, "provider", provider, now)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(OAuthProviderConfig {
+        provider: row.get("provider").cloned().unwrap_or_default(),
+        enabled: parse_bool(row.get("enabled")),
+        client_id: row.get("client_id").cloned().unwrap_or_default(),
+        client_secret: row.get("client_secret").cloned().unwrap_or_default(),
+        redirect_uri: row.get("redirect_uri").cloned().unwrap_or_default(),
+        scopes: row
+            .get("scopes")
+            .cloned()
+            .unwrap_or_else(|| default_oauth_scopes(provider).to_string()),
+        created_at: parse_optional_int(row.get("created_at")),
+        updated_at: parse_optional_int(row.get("updated_at")),
+    }))
+}
+
+fn normalize_oauth_provider(provider: &str) -> Result<String, (u16, &'static str, String)> {
+    let provider = provider.trim().to_ascii_lowercase();
+    match provider.as_str() {
+        "google" | "github" => Ok(provider),
+        _ => Err(error(400, "Bad Request", "unsupported provider")),
+    }
+}
+
+fn default_oauth_scopes(provider: &str) -> &'static str {
+    match provider {
+        "google" => "openid email profile",
+        "github" => "read:user user:email",
+        _ => "",
+    }
+}
+
+fn oauth_state_key(state: &str) -> String {
+    format!("_auth:oauth_state:{state}")
+}
+
+fn default_callback_url(headers: &[(String, String)], provider: &str) -> String {
+    let host = header_value(headers, "host").unwrap_or("localhost");
+    format!("http://{host}/auth/v1/callback/{provider}")
+}
+
+fn oauth_authorization_url(
+    config: &OAuthProviderConfig,
+    redirect_uri: &str,
+    state: &str,
+) -> String {
+    match config.provider.as_str() {
+        "google" => format!(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&prompt=consent",
+            url_encode(&config.client_id),
+            url_encode(redirect_uri),
+            url_encode(&config.scopes),
+            url_encode(state),
+        ),
+        "github" => format!(
+            "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",
+            url_encode(&config.client_id),
+            url_encode(redirect_uri),
+            url_encode(&config.scopes),
+            url_encode(state),
+        ),
+        _ => String::new(),
+    }
+}
+
+async fn exchange_oauth_code(
+    config: &OAuthProviderConfig,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<OAuthUser, String> {
+    match config.provider.as_str() {
+        "google" => exchange_google_code(config, code, redirect_uri).await,
+        "github" => exchange_github_code(config, code, redirect_uri).await,
+        _ => Err("unsupported_provider".to_string()),
+    }
+}
+
+async fn exchange_google_code(
+    config: &OAuthProviderConfig,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<OAuthUser, String> {
+    let client = reqwest::Client::new();
+    let body = form_body(&[
+        ("client_id", config.client_id.as_str()),
+        ("client_secret", config.client_secret.as_str()),
+        ("code", code),
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", redirect_uri),
+    ]);
+    let token: Value = client
+        .post("https://oauth2.googleapis.com/token")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "token_exchange_failed".to_string())?
+        .json()
+        .await
+        .map_err(|_| "token_response_invalid".to_string())?;
+    let access_token = token
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "token_exchange_failed".to_string())?;
+    let profile: Value = client
+        .get("https://openidconnect.googleapis.com/v1/userinfo")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|_| "userinfo_failed".to_string())?
+        .json()
+        .await
+        .map_err(|_| "userinfo_invalid".to_string())?;
+    oauth_user_from_google(profile)
+}
+
+async fn exchange_github_code(
+    config: &OAuthProviderConfig,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<OAuthUser, String> {
+    let client = reqwest::Client::new();
+    let body = form_body(&[
+        ("client_id", config.client_id.as_str()),
+        ("client_secret", config.client_secret.as_str()),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+    ]);
+    let token: Value = client
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "token_exchange_failed".to_string())?
+        .json()
+        .await
+        .map_err(|_| "token_response_invalid".to_string())?;
+    let access_token = token
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "token_exchange_failed".to_string())?;
+    let profile: Value = client
+        .get("https://api.github.com/user")
+        .header("User-Agent", "Lux Auth")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|_| "userinfo_failed".to_string())?
+        .json()
+        .await
+        .map_err(|_| "userinfo_invalid".to_string())?;
+    let emails: Value = client
+        .get("https://api.github.com/user/emails")
+        .header("User-Agent", "Lux Auth")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|_| "userinfo_failed".to_string())?
+        .json()
+        .await
+        .map_err(|_| "userinfo_invalid".to_string())?;
+    oauth_user_from_github(profile, emails)
+}
+
+fn oauth_user_from_google(profile: Value) -> Result<OAuthUser, String> {
+    let provider_id = profile
+        .get("sub")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing_provider_user_id".to_string())?;
+    let email = profile
+        .get("email")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing_email".to_string())?;
+    Ok(OAuthUser {
+        provider: "google".to_string(),
+        provider_id: provider_id.to_string(),
+        email: email.to_string(),
+        email_verified: profile
+            .get("email_verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        user_metadata: json!({
+            "name": profile.get("name").cloned().unwrap_or(Value::Null),
+            "avatar_url": profile.get("picture").cloned().unwrap_or(Value::Null),
+        }),
+        identity_data: profile,
+    })
+}
+
+fn oauth_user_from_github(profile: Value, emails: Value) -> Result<OAuthUser, String> {
+    let provider_id = profile
+        .get("id")
+        .map(|value| match value {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        })
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing_provider_user_id".to_string())?;
+    let primary_email = emails.as_array().and_then(|items| {
+        items
+            .iter()
+            .find(|item| {
+                item.get("primary")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .and_then(|item| item.get("email").and_then(Value::as_str))
+    });
+    let email = profile
+        .get("email")
+        .and_then(Value::as_str)
+        .filter(|email| !email.is_empty())
+        .or(primary_email)
+        .ok_or_else(|| "missing_email".to_string())?;
+    let email_verified = emails
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("email").and_then(Value::as_str) == Some(email))
+        })
+        .and_then(|item| item.get("verified").and_then(Value::as_bool))
+        .unwrap_or(true);
+    Ok(OAuthUser {
+        provider: "github".to_string(),
+        provider_id,
+        email: email.to_string(),
+        email_verified,
+        user_metadata: json!({
+            "name": profile.get("name").cloned().unwrap_or(Value::Null),
+            "user_name": profile.get("login").cloned().unwrap_or(Value::Null),
+            "avatar_url": profile.get("avatar_url").cloned().unwrap_or(Value::Null),
+        }),
+        identity_data: json!({
+            "profile": profile,
+            "emails": emails,
+        }),
+    })
+}
+
+fn oauth_success_url(redirect_to: &str, session: &Value) -> String {
+    let mut fragment = Vec::new();
+    for key in ["access_token", "refresh_token", "token_type", "expires_in"] {
+        if let Some(value) = session.get(key) {
+            let value = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            fragment.push(format!("{}={}", url_encode(key), url_encode(&value)));
+        }
+    }
+    append_fragment(redirect_to, &fragment.join("&"))
+}
+
+fn oauth_error_url(redirect_to: &str, message: &str) -> String {
+    append_fragment(redirect_to, &format!("error={}", url_encode(message)))
+}
+
+fn redirect_oauth_error(params: &[(String, String)], message: &str) -> AuthHttpResponse {
+    let redirect_to = get_param(params, "redirect_to").unwrap_or("/");
+    AuthHttpResponse::redirect(oauth_error_url(
+        &sanitize_header_value(redirect_to),
+        message,
+    ))
+}
+
+fn append_fragment(url: &str, fragment: &str) -> String {
+    let separator = if url.contains('#') { "&" } else { "#" };
+    format!("{url}{separator}{fragment}")
+}
+
+fn form_body(items: &[(&str, &str)]) -> String {
+    items
+        .iter()
+        .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn sanitize_header_value(value: &str) -> String {
+    value.replace(['\r', '\n'], "")
+}
+
 fn user_map_json(row: &HashMap<String, String>) -> Value {
     json!({
         "id": row.get("id").cloned().unwrap_or_default(),
@@ -1201,6 +2365,58 @@ fn user_map_json(row: &HashMap<String, String>) -> Value {
         "user_metadata": parse_json_string(row.get("raw_user_meta_data")),
         "app_metadata": parse_json_string(row.get("raw_app_meta_data")),
     })
+}
+
+fn oauth_provider_id(provider: &str, provider_user_id: &str) -> String {
+    format!("{provider}:{provider_user_id}")
+}
+
+fn oauth_identity_data(
+    provider: &str,
+    provider_user_id: &str,
+    email: &str,
+    identity_data: Value,
+) -> String {
+    let mut payload = match identity_data {
+        Value::Object(map) => Value::Object(map),
+        _ => json!({}),
+    };
+    if let Value::Object(map) = &mut payload {
+        map.insert("provider".to_string(), Value::String(provider.to_string()));
+        map.insert(
+            "provider_id".to_string(),
+            Value::String(provider_user_id.to_string()),
+        );
+        map.insert("email".to_string(), Value::String(email.to_string()));
+    }
+    payload.to_string()
+}
+
+fn app_metadata_with_provider(existing: Option<&str>, provider: &str) -> String {
+    let mut value = existing
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(map) = value.as_object_mut() else {
+        return json!({"provider":provider,"providers":[provider]}).to_string();
+    };
+
+    map.insert("provider".to_string(), Value::String(provider.to_string()));
+    let mut providers = map
+        .get("providers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    if !providers.iter().any(|item| item == provider) {
+        providers.push(provider.to_string());
+    }
+    map.insert(
+        "providers".to_string(),
+        Value::Array(providers.into_iter().map(Value::String).collect()),
+    );
+    value.to_string()
 }
 
 fn find_row_by_field(
@@ -1235,19 +2451,69 @@ fn find_row_by_field(
     }
 }
 
+fn find_rows_by_field(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field: &str,
+    value: &str,
+    now: Instant,
+) -> Result<Vec<HashMap<String, String>>, String> {
+    let plan = SelectPlan {
+        table: table.to_string(),
+        alias: None,
+        projections: Vec::new(),
+        aggregates: Vec::new(),
+        joins: Vec::new(),
+        conditions: vec![WhereClause {
+            field: field.to_string(),
+            op: CmpOp::Eq,
+            value: value.to_string(),
+        }],
+        order_by: None,
+        limit: Some(1000),
+        offset: None,
+    };
+    match tables::table_select(store, cache, &plan, now)? {
+        SelectResult::Rows(rows) => Ok(rows
+            .into_iter()
+            .map(|row| row.into_iter().collect::<HashMap<_, _>>())
+            .collect()),
+        SelectResult::Aggregate(_) => Ok(Vec::new()),
+    }
+}
+
 fn hash_password(password: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|e| e.to_string())
+    let password = password.to_string();
+    run_password_work(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn verify_password(password: &str, hash: &str) -> Result<bool, String> {
-    let parsed = PasswordHash::new(hash).map_err(|e| e.to_string())?;
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok())
+    let password = password.to_string();
+    let hash = hash.to_string();
+    run_password_work(move || {
+        let parsed = PasswordHash::new(&hash).map_err(|e| e.to_string())?;
+        Ok(Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok())
+    })
+}
+
+fn run_password_work<T, F>(work: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => block_in_place(work),
+        _ => work(),
+    }
 }
 
 fn hash_secret(secret: &str) -> String {
@@ -1313,6 +2579,13 @@ fn parse_optional_int(value: Option<&String>) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn parse_bool(value: Option<&String>) -> bool {
+    matches!(
+        value.map(|value| value.as_str()),
+        Some("true") | Some("1") | Some("TRUE") | Some("True")
+    )
+}
+
 fn parse_json_string(value: Option<&String>) -> Value {
     value
         .and_then(|value| serde_json::from_str(value).ok())
@@ -1335,6 +2608,22 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
 }
 
 fn ok(value: Value) -> (u16, &'static str, String) {
@@ -1427,7 +2716,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_auth_tables_are_hidden_from_generic_table_reads() {
+    fn reserved_auth_tables_are_readable_from_generic_table_reads() {
         let store = Store::new();
         let cache = Arc::new(RwLock::new(SchemaCache::new()));
         bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
@@ -1442,7 +2731,8 @@ mod tests {
             Instant::now(),
         );
         let response = std::str::from_utf8(&out).unwrap();
-        assert!(response.contains("managed by Lux Auth"), "{response}");
+        assert!(response.starts_with('*'), "{response}");
+        assert!(response.contains("email"), "{response}");
     }
 
     #[test]
@@ -1505,6 +2795,115 @@ mod tests {
         let token_json: Value = serde_json::from_str(&token_body).unwrap();
         assert!(token_json.get("access_token").is_some(), "{token_body}");
         assert!(token_json.get("refresh_token").is_some(), "{token_body}");
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PUT",
+            "/auth/v1/admin/providers/google",
+            r#"{"client_id":"google-client","client_secret":"google-secret","redirect_uri":"http://app.test/auth/callback","enabled":true}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "{body}");
+        let provider: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(provider["provider"]["provider"], "google");
+        assert_eq!(provider["provider"]["has_client_secret"], true);
+        assert!(
+            !body.contains("google-secret"),
+            "admin provider response must not expose client secret: {body}"
+        );
+
+        let response = route_http_response(
+            "GET",
+            "/auth/v1/authorize",
+            "",
+            &[
+                ("provider".to_string(), "google".to_string()),
+                (
+                    "redirect_to".to_string(),
+                    "http://app.test/welcome".to_string(),
+                ),
+            ],
+            &[("host".to_string(), "localhost:17777".to_string())],
+            &store,
+            &cache,
+        )
+        .await;
+        assert_eq!(response.status, 302);
+        let location = response
+            .headers
+            .iter()
+            .find(|(key, _)| key == "Location")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        assert!(location.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        assert!(location.contains("client_id=google-client"), "{location}");
+        assert!(
+            location.contains("redirect_uri=http%3A%2F%2Fapp.test%2Fauth%2Fcallback"),
+            "{location}"
+        );
+        assert!(
+            location.contains("scope=openid%20email%20profile"),
+            "{location}"
+        );
+    }
+
+    #[test]
+    fn oauth_sign_in_links_identity_and_issues_session() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let oauth_user = OAuthUser {
+            provider: "github".to_string(),
+            provider_id: "42".to_string(),
+            email: "octo@example.com".to_string(),
+            email_verified: true,
+            user_metadata: json!({"name":"Octo"}),
+            identity_data: json!({"login":"octo"}),
+        };
+        let (status, _, body) = oauth_sign_in(&oauth_user, &[], &store, &cache);
+        assert_eq!(status, 200, "{body}");
+        let session: Value = serde_json::from_str(&body).unwrap();
+        assert!(session["access_token"].is_string(), "{body}");
+        assert_eq!(session["user"]["email"], "octo@example.com");
+
+        let identity = find_row_by_field(
+            &store,
+            &cache,
+            IDENTITIES_TABLE,
+            "provider_id",
+            "github:42",
+            Instant::now(),
+        )
+        .unwrap()
+        .expect("oauth identity should be stored");
+        assert_eq!(identity.get("provider").map(String::as_str), Some("github"));
     }
 
     #[test]

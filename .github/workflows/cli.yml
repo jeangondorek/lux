@@ -1,9 +1,9 @@
-name: luxctl Release
+name: CLI Release
 
 on:
   push:
     tags:
-      - 'luxctl-v*'
+      - 'cli-v*'
 
 permissions:
   contents: write
@@ -15,13 +15,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            artifact: luxctl-linux-x86_64
+            artifact: lux-cli-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-            artifact: luxctl-linux-arm64
+            artifact: lux-cli-linux-arm64
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: luxctl-macos-arm64
+            artifact: lux-cli-macos-arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -45,7 +45,7 @@ jobs:
 
       - name: Rename binary
         run: |
-          cp cli/target/${{ matrix.target }}/release/luxctl ${{ matrix.artifact }}
+          cp cli/target/${{ matrix.target }}/release/lux ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
@@ -64,7 +64,7 @@ jobs:
 
       - run: |
           cd artifacts
-          for f in luxctl-*; do
+          for f in lux-cli-*; do
             tar czf "${f}.tar.gz" "$f"
           done
 

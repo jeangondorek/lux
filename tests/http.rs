@@ -369,8 +369,8 @@ fn http_auth_signup_login_user_logout_and_admin_routes() {
         None,
         Some("rootsecret"),
     );
-    assert_eq!(status, 403, "auth tables should be hidden: {table_body}");
-    assert!(table_body.contains("managed by Lux Auth"), "{table_body}");
+    assert_eq!(status, 200, "auth tables should be readable: {table_body}");
+    assert!(table_body.contains("http-auth@example.com"), "{table_body}");
 
     let (status, logout_body) = http_request(
         17703,
@@ -669,25 +669,20 @@ fn http_auth_sessions_grants_keys_and_revocation_survive_restart() {
         status, 200,
         "persisted publishable api key and refresh session should work after restart: {body}"
     );
-
-    let (status, body) = http_request(
-        17707,
-        "POST",
-        "/auth/v1/logout",
-        Some("{}"),
-        Some(&access_token),
-    );
-    assert_eq!(status, 200, "logout after restart: {body}");
-
-    common::terminate_child(&mut child);
-
-    let mut child =
-        spawn_lux_with_data_dir(17706, 17707, "rootsecret", &auth_only_env, data_dir.path());
+    let refreshed_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rotated_access_token = refreshed_json["access_token"]
+        .as_str()
+        .expect("refresh should return access token")
+        .to_string();
+    let rotated_refresh_token = refreshed_json["refresh_token"]
+        .as_str()
+        .expect("refresh should return refresh token")
+        .to_string();
 
     let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
     assert_eq!(
-        status, 401,
-        "revoked access token should stay revoked after restart: {body}"
+        status, 200,
+        "refresh should not immediately revoke in-flight access tokens: {body}"
     );
 
     let (status, body) = http_request_with_headers(
@@ -703,10 +698,176 @@ fn http_auth_sessions_grants_keys_and_revocation_survive_restart() {
     );
     assert_eq!(
         status, 401,
+        "old refresh token should be revoked after rotation: {body}"
+    );
+
+    let (status, body) = http_request(
+        17707,
+        "POST",
+        "/auth/v1/logout",
+        Some("{}"),
+        Some(&rotated_access_token),
+    );
+    assert_eq!(status, 200, "logout after restart: {body}");
+
+    common::terminate_child(&mut child);
+
+    let mut child =
+        spawn_lux_with_data_dir(17706, 17707, "rootsecret", &auth_only_env, data_dir.path());
+
+    let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
+    assert_eq!(
+        status, 401,
+        "family logout should revoke pre-refresh access token after restart: {body}"
+    );
+
+    let (status, body) = http_request(
+        17707,
+        "GET",
+        "/auth/v1/user",
+        None,
+        Some(&rotated_access_token),
+    );
+    assert_eq!(
+        status, 401,
+        "family logout should revoke rotated access token after restart: {body}"
+    );
+
+    let (status, body) = http_request_with_headers(
+        17707,
+        "POST",
+        "/auth/v1/token",
+        Some(&format!(
+            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+            rotated_refresh_token
+        )),
+        None,
+        &["apikey: lux_pub_persist"],
+    );
+    assert_eq!(
+        status, 401,
         "revoked refresh session should stay revoked after restart: {body}"
     );
 
     common::terminate_child(&mut child);
+}
+
+#[test]
+fn http_auth_admin_keys_can_be_created_listed_and_revoked() {
+    let _server = start_lux_with_env(
+        17708,
+        17709,
+        "rootsecret",
+        &[
+            ("LUX_AUTH_ENABLED", "true"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_bootstrap"),
+        ],
+    );
+
+    let (status, body) = http_request(
+        17709,
+        "POST",
+        "/auth/v1/admin/keys",
+        Some(r#"{"kind":"publishable","name":"browser client"}"#),
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(status, 200, "create publishable key: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let plain_key = created["plain_key"]
+        .as_str()
+        .expect("created key should return one-time plaintext");
+    assert!(
+        plain_key.starts_with("lux_pub_"),
+        "publishable key should be prefixed: {plain_key}"
+    );
+    let key_id = created["key"]["id"]
+        .as_str()
+        .expect("created key should include id");
+    assert_eq!(created["key"]["name"], "browser client");
+
+    let (status, body) = http_request(
+        17709,
+        "GET",
+        "/auth/v1/admin/keys",
+        None,
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(status, 200, "list keys: {body}");
+    assert!(body.contains("browser client"), "{body}");
+    assert!(
+        !body.contains(plain_key),
+        "list response must not expose plaintext key: {body}"
+    );
+
+    let (status, body) = http_request_with_headers(
+        17709,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"keyed@example.com","password":"password123"}"#),
+        None,
+        &[&format!("apikey: {plain_key}")],
+    );
+    assert_eq!(
+        status, 200,
+        "new publishable key should authorize signup: {body}"
+    );
+
+    let (status, body) = http_request(
+        17709,
+        "DELETE",
+        &format!("/auth/v1/admin/keys/{key_id}"),
+        None,
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(status, 200, "revoke key: {body}");
+
+    let (status, body) = http_request_with_headers(
+        17709,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"revoked-key@example.com","password":"password123"}"#),
+        None,
+        &[&format!("apikey: {plain_key}")],
+    );
+    assert_eq!(
+        status, 401,
+        "revoked publishable key should not authorize signup: {body}"
+    );
+
+    let (status, body) = http_request(
+        17709,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"bootstrap@example.com","password":"password123"}"#),
+        Some("lux_sec_bootstrap"),
+    );
+    assert_eq!(
+        status, 200,
+        "bootstrap secret key should still work because it is persisted: {body}"
+    );
+}
+
+#[test]
+fn http_options_allows_auth_api_key_header() {
+    let _server = start_lux_with_env(17710, 17711, "", &[("LUX_AUTH_ENABLED", "true")]);
+
+    let (status, body) = http_request_with_headers(
+        17711,
+        "OPTIONS",
+        "/auth/v1/signup",
+        None,
+        None,
+        &[
+            "Origin: http://localhost:5173",
+            "Access-Control-Request-Method: POST",
+            "Access-Control-Request-Headers: apikey, content-type",
+        ],
+    );
+    assert_eq!(status, 204, "options should succeed: {body}");
+    assert!(
+        body.is_empty(),
+        "options should have no response body: {body}"
+    );
 }
 
 #[test]

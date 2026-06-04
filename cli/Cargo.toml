@@ -1,16 +1,16 @@
 [package]
-name = "luxctl"
+name = "lux-cli"
 version = "0.4.0"
 edition = "2021"
-description = "CLI for Lux Cloud"
+description = "CLI for Lux"
 license = "MIT"
 repository = "https://github.com/lux-db/lux"
 homepage = "https://luxdb.dev"
 keywords = ["lux", "redis", "cli", "database", "cloud"]
 
 [[bin]]
-name = "luxctl"
-path = "src/main.rs"
+name = "lux"
+path = "src/bin/lux.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }

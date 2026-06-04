@@ -87,7 +87,7 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
 - **Pipeline batching** -- consecutive same-shard commands batched under a single lock
 - **Persistence** -- automatic snapshots, write-ahead log (WAL) with CRC32 checksums, tiered hot/cold storage with automatic eviction to disk
-- **Auth** -- password authentication via `LUX_PASSWORD`
+- **Auth** -- password authentication via `LUX_PASSWORD`, plus optional app auth with users, sessions, OAuth providers, and JWTs
 - **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, PUBLISH, plus KSUB/KUNSUB for realtime key change events
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
@@ -101,7 +101,7 @@ cargo build --release
 
 Lux starts on `0.0.0.0:6379` by default. Connect with any Redis client using `lux://` or `redis://`:
 
-> **Protocol note:** `lux://` is the primary protocol for the Lux SDK and luxctl CLI. When using third-party Redis clients (ioredis, redis-py, go-redis) directly, use `redis://` since they don't recognize `lux://`. Both connect to the same server.
+> **Protocol note:** `lux://` is the primary protocol for the Lux SDK and CLI. When using third-party Redis clients (ioredis, redis-py, go-redis) directly, use `redis://` since they don't recognize `lux://`. Both connect to the same server.
 
 ```bash
 redis-cli
@@ -284,16 +284,20 @@ curl -fsSL https://raw.githubusercontent.com/lux-db/lux/main/cli/install.sh | sh
 ```
 
 ```bash
-luxctl login                              # authenticate with a lux_ token
-luxctl projects                           # list projects
-luxctl create my-app --accept-charges     # create a new project
-luxctl status my-app                      # show status and metrics
-luxctl exec my-app SET hello world        # run a command
-luxctl logs my-app                        # fetch logs
-luxctl restart my-app                     # restart instance
-luxctl connect my-app                     # interactive REPL via cloud
-luxctl connect lux://localhost:6379       # connect to local instance
-luxctl destroy my-app --accept-consequences  # delete project
+lux init                               # scaffold local Lux project files
+lux login                              # authenticate with a lux_ token
+lux link my-app                        # save a default project for this repo
+lux projects                           # list projects
+lux create my-app --accept-charges     # create a new project
+lux status                             # show linked project status and metrics
+lux exec my-app SET hello world        # run a command
+lux logs                               # fetch linked project logs
+lux restart                            # restart linked project
+lux connect my-app                     # interactive REPL via cloud
+lux connect lux://localhost:6379       # connect to local instance
+lux keys list                          # list project API keys
+lux env pull                           # write .env.local for the linked project
+lux destroy my-app --accept-consequences  # delete project
 ```
 
 See [cli/README.md](cli/README.md) for full installation and usage docs.
@@ -305,11 +309,28 @@ bun i @luxdb/sdk
 ```
 
 ```typescript
-import { Lux } from "@luxdb/sdk"
+import { Lux, createBrowserClient } from "@luxdb/sdk"
 
+// App/project client over HTTP. Use a publishable key in browser clients
+// and a secret key on trusted servers.
+const lux = createBrowserClient(
+  "https://api.luxdb.dev/v1/my-project",
+  "lux_pub_..."
+)
+
+const { data: session, error: signInError } = await lux.auth.signInWithPassword({
+  email: "user@example.com",
+  password: "correct horse battery staple",
+})
+
+const { data: users, error } = await lux
+  .table<{ id: number; email: string; age: number }>("users")
+  .select({ where: "age > 25", order: "age DESC", limit: 10 })
+
+if (error) throw error
+
+// Direct RESP client for server-side Redis-compatible access.
 const db = new Lux("lux://localhost:6379")
-
-await db.set("hello", "world")
 
 await db.vset("doc:1", embedding, { metadata: { title: "my doc" } })
 const results = await db.vsearch(queryEmbedding, { k: 5, meta: true })
@@ -326,6 +347,7 @@ const sub = db.ksub(["user:*"], (event) => {
 ```
 
 Extends ioredis with typed methods for vectors, time series, and realtime key subscriptions. All standard Redis commands work as usual.
+Project clients use the Cloud/self-hosted HTTP gateway and return `{ data, error }` results for app code.
 
 ### HTTP REST API
 
@@ -389,6 +411,61 @@ curl -X POST http://localhost:8080/v1/exec \
 
 Auth via `Authorization: Bearer <password>` when `LUX_PASSWORD` is set. CORS enabled by default. 174K ops/sec at 256 concurrent connections with keep-alive.
 
+### App Auth
+
+Lux can also expose a Supabase-style app auth surface. This is optional and is separate from the database password:
+
+- `LUX_PASSWORD` protects direct RESP/admin HTTP access.
+- `LUX_AUTH_ENABLED=true` creates and serves app auth endpoints.
+- `LUX_AUTH_PUBLISHABLE_KEY` is safe for browser/client auth calls.
+- `LUX_AUTH_SECRET_KEY` is for trusted servers and admin auth operations.
+
+```bash
+LUX_HTTP_PORT=8080 \
+LUX_AUTH_ENABLED=true \
+LUX_AUTH_PUBLISHABLE_KEY=lux_pub_local \
+LUX_AUTH_SECRET_KEY=lux_sec_local \
+./target/release/lux
+```
+
+Auth creates reserved tables under the `auth` namespace:
+
+| Table | Purpose |
+|-------|---------|
+| `auth.users` | App users |
+| `auth.identities` | Email/password and OAuth identities linked to users |
+| `auth.sessions` | Refresh-token sessions |
+| `auth.keys` | Project publishable/secret keys |
+| `auth.grants` | Capability grants |
+| `auth.providers` | OAuth provider configuration |
+
+Core auth routes:
+
+```bash
+POST /auth/v1/signup
+POST /auth/v1/token
+GET  /auth/v1/user
+POST /auth/v1/logout
+GET  /auth/v1/authorize?provider=google&redirect_to=http://localhost:5173/callback
+```
+
+OAuth providers are configured through admin routes with a secret key:
+
+```bash
+curl -X PUT http://localhost:8080/auth/v1/admin/providers/google \
+  -H "Authorization: Bearer lux_sec_local" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "client_id": "GOOGLE_CLIENT_ID",
+    "client_secret": "GOOGLE_CLIENT_SECRET",
+    "redirect_uri": "http://localhost:8080/auth/v1/callback/google",
+    "scopes": "openid email profile"
+  }'
+```
+
+Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -405,6 +482,9 @@ Auth via `Authorization: Bearer <password>` when `LUX_PASSWORD` is set. CORS ena
 | `LUX_STORAGE_MODE` | `memory` | Set to `tiered` for hot/cold storage with disk-backed eviction |
 | `LUX_STORAGE_DIR` | `{LUX_DATA_DIR}/storage` | Directory for tiered storage data files |
 | `LUX_RESTRICTED` | (none) | Set to `1` to disable KEYS, FLUSHALL, FLUSHDB |
+| `LUX_AUTH_ENABLED` | `false` | Enable app auth tables and `/auth/v1` routes |
+| `LUX_AUTH_PUBLISHABLE_KEY` | (generated) | Browser-safe app auth key when auth is enabled |
+| `LUX_AUTH_SECRET_KEY` | (generated) | Server/admin app auth key when auth is enabled |
 
 ### Node.js
 
