@@ -13,7 +13,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -26,7 +26,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
@@ -48,7 +48,7 @@ jobs:
 
       - run: echo "${{ steps.build.outputs.digest }}" > /tmp/digest-amd64.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: docker-digest-amd64
           path: /tmp/digest-amd64.txt
@@ -60,7 +60,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
@@ -82,7 +82,7 @@ jobs:
 
       - run: echo "${{ steps.build.outputs.digest }}" > /tmp/digest-arm64.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: docker-digest-arm64
           path: /tmp/digest-arm64.txt
@@ -111,7 +111,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           pattern: docker-digest-*
           path: /tmp/digests
