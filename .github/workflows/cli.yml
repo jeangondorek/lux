@@ -65,6 +65,7 @@ jobs:
       - run: |
           cd artifacts
           for f in lux-cli-*; do
+            chmod +x "$f"
             tar czf "${f}.tar.gz" "$f"
           done
 
