@@ -1,10 +1,13 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
 
@@ -359,8 +362,20 @@ fn escape_config_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn parse_connection_url(url: &str) -> (String, u16, String, String) {
+#[derive(Debug)]
+struct ConnectionTarget {
+    host: String,
+    port: u16,
+    password: String,
+    name: String,
+    tls: bool,
+}
+
+fn parse_connection_url(url: &str) -> ConnectionTarget {
+    let tls = url.starts_with("luxs://") || url.starts_with("rediss://");
     let url = url
+        .trim_start_matches("luxs://")
+        .trim_start_matches("rediss://")
         .trim_start_matches("lux://")
         .trim_start_matches("redis://");
     let (auth, hostport) = if let Some(at) = url.find('@') {
@@ -375,7 +390,13 @@ fn parse_connection_url(url: &str) -> (String, u16, String, String) {
     let host = parts.first().copied().unwrap_or("localhost").to_string();
     let port = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(6379);
     let name = format!("{host}:{port}");
-    (host, port, auth.unwrap_or_default(), name)
+    ConnectionTarget {
+        host,
+        port,
+        password: auth.unwrap_or_default(),
+        name,
+        tls,
+    }
 }
 
 fn linked_project_or(project: Option<&str>) -> Option<String> {
@@ -895,14 +916,20 @@ pub async fn run() {
             password,
         } => {
             let project = project.unwrap_or_default();
-            let (conn_host, conn_port, conn_pass, conn_name) = if is_connection_url(&project) {
+            let target = if is_connection_url(&project) {
                 parse_connection_url(&project)
             } else if host.is_some() || port.is_some() {
                 let h = host.unwrap_or_else(|| "localhost".to_string());
                 let p = port.unwrap_or(6379);
                 let pw = password.unwrap_or_default();
                 let name = format!("{h}:{p}");
-                (h, p, pw, name)
+                ConnectionTarget {
+                    host: h,
+                    port: p,
+                    password: pw,
+                    name,
+                    tls: false,
+                }
             } else if project.is_empty() {
                 eprintln!(
                     "{} Provide a project name, connection URL, or --host/--port flags",
@@ -925,42 +952,26 @@ pub async fn run() {
 
                 let credentials =
                     get_instance_credentials(&client, &api_url, &token, &inst.id).await;
-                let (h, p, pw, _) = parse_connection_url(&credentials.resp);
-                (h, p, pw, inst.name)
+                let mut target = parse_connection_url(&credentials.resp);
+                target.name = inst.name;
+                target
             };
 
-            println!("{} {}:{}", "Connecting to".bold(), conn_host, conn_port);
-
-            let mut stream =
-                TcpStream::connect(format!("{conn_host}:{conn_port}")).unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Connection failed:".red());
-                    std::process::exit(1);
-                });
-
-            if !conn_pass.is_empty() {
-                let auth_cmd = format!(
-                    "*2\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n",
-                    conn_pass.len(),
-                    conn_pass
-                );
-                stream.write_all(auth_cmd.as_bytes()).ok();
-
-                let mut reader_tmp = BufReader::new(stream.try_clone().unwrap());
-                let mut auth_response = String::new();
-                reader_tmp.read_line(&mut auth_response).ok();
-
-                if !auth_response.contains("+OK") {
-                    eprintln!("{}", "Authentication failed.".red());
-                    std::process::exit(1);
-                }
-            }
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            println!(
+                "{} {}:{}",
+                "Connecting to".bold(),
+                target.host,
+                target.port
+            );
+            let mut conn = DirectConn::connect_target(&target).unwrap_or_else(|e| {
+                eprintln!("{} {e}", "Connection failed:".red());
+                std::process::exit(1);
+            });
 
             println!("{} Type commands, Ctrl+C to exit.\n", "Connected.".green());
 
             loop {
-                print!("{} ", format!("{conn_name}>").purple());
+                print!("{} ", format!("{}>", target.name).purple());
                 std::io::stdout().flush().ok();
 
                 let mut input = String::new();
@@ -976,61 +987,9 @@ pub async fn run() {
                     break;
                 }
 
-                let parts: Vec<&str> = input.split_whitespace().collect();
-                let mut resp_cmd = format!("*{}\r\n", parts.len());
-                for part in &parts {
-                    resp_cmd.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
-                }
-
-                stream.write_all(resp_cmd.as_bytes()).ok();
-
-                let mut response = String::new();
-                reader.read_line(&mut response).ok();
-                let response = response.trim();
-
-                if let Some(rest) = response.strip_prefix('+') {
-                    println!("{rest}");
-                } else if let Some(rest) = response.strip_prefix('-') {
-                    println!("{}", rest.red());
-                } else if let Some(rest) = response.strip_prefix(':') {
-                    println!("(integer) {rest}");
-                } else if let Some(rest) = response.strip_prefix('$') {
-                    let len: i64 = rest.parse().unwrap_or(-1);
-                    if len < 0 {
-                        println!("{}", "(nil)".dimmed());
-                    } else {
-                        let mut val = String::new();
-                        reader.read_line(&mut val).ok();
-                        println!("\"{}\"", val.trim());
-                    }
-                } else if let Some(rest) = response.strip_prefix('*') {
-                    let count: i64 = rest.parse().unwrap_or(-1);
-                    if count < 0 {
-                        println!("{}", "(empty array)".dimmed());
-                    } else {
-                        for i in 0..count {
-                            let mut type_line = String::new();
-                            reader.read_line(&mut type_line).ok();
-                            let type_line = type_line.trim().to_string();
-
-                            if let Some(rest) = type_line.strip_prefix('$') {
-                                let len: i64 = rest.parse().unwrap_or(-1);
-                                if len < 0 {
-                                    println!("{}) {}", i + 1, "(nil)".dimmed());
-                                } else {
-                                    let mut val = String::new();
-                                    reader.read_line(&mut val).ok();
-                                    println!("{}) \"{}\"", i + 1, val.trim());
-                                }
-                            } else if let Some(rest) = type_line.strip_prefix(':') {
-                                println!("{}) (integer) {rest}", i + 1);
-                            } else {
-                                println!("{}) {}", i + 1, type_line);
-                            }
-                        }
-                    }
-                } else {
-                    println!("{response}");
+                match conn.exec(input) {
+                    Ok(response) => println!("{response}"),
+                    Err(e) => println!("{}", e.red()),
                 }
             }
         }
@@ -1564,8 +1523,8 @@ async fn exec_cli_command_args(
     }
 
     if is_connection_url(project) {
-        let (h, p, pw, _) = parse_connection_url(project);
-        let mut conn = DirectConn::connect(&h, p, &pw)?;
+        let target = parse_connection_url(project);
+        let mut conn = DirectConn::connect_target(&target)?;
         return conn.exec_args(command);
     }
 
@@ -1575,7 +1534,10 @@ async fn exec_cli_command_args(
 }
 
 fn is_connection_url(value: &str) -> bool {
-    value.starts_with("lux://") || value.starts_with("redis://")
+    value.starts_with("lux://")
+        || value.starts_with("luxs://")
+        || value.starts_with("redis://")
+        || value.starts_with("rediss://")
 }
 
 async fn exec_command_json(
@@ -1827,7 +1789,7 @@ fn resp_encode_strings(args: &[String]) -> Vec<u8> {
     resp_encode(&refs)
 }
 
-fn resp_read_line(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+fn resp_read_line<R: BufRead>(reader: &mut R) -> Result<String, String> {
     let mut line = String::new();
     reader
         .read_line(&mut line)
@@ -1837,14 +1799,11 @@ fn resp_read_line(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
 
 const RESP_MAX_DEPTH: u8 = 8;
 
-fn resp_read_response(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+fn resp_read_response<R: BufRead>(reader: &mut R) -> Result<String, String> {
     resp_read_response_inner(reader, 0)
 }
 
-fn resp_read_response_inner(
-    reader: &mut BufReader<TcpStream>,
-    depth: u8,
-) -> Result<String, String> {
+fn resp_read_response_inner<R: BufRead>(reader: &mut R, depth: u8) -> Result<String, String> {
     if depth > RESP_MAX_DEPTH {
         return Err("RESP nesting too deep".to_string());
     }
@@ -1867,7 +1826,6 @@ fn resp_read_response_inner(
                 return Ok("(nil)".to_string());
             }
             let mut buf = vec![0u8; (len + 2) as usize];
-            use std::io::Read;
             reader
                 .read_exact(&mut buf)
                 .map_err(|e| format!("read error: {e}"))?;
@@ -1891,20 +1849,76 @@ fn resp_read_response_inner(
     }
 }
 
+enum DirectStream {
+    Plain(TcpStream),
+    Tls(StreamOwned<ClientConnection, TcpStream>),
+}
+
+impl Read for DirectStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            DirectStream::Plain(stream) => stream.read(buf),
+            DirectStream::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for DirectStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            DirectStream::Plain(stream) => stream.write(buf),
+            DirectStream::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            DirectStream::Plain(stream) => stream.flush(),
+            DirectStream::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
 struct DirectConn {
-    stream: TcpStream,
-    reader: BufReader<TcpStream>,
+    reader: BufReader<DirectStream>,
 }
 
 impl DirectConn {
     fn connect(host: &str, port: u16, password: &str) -> Result<Self, String> {
+        Self::connect_with_tls(host, port, password, false)
+    }
+
+    fn connect_target(target: &ConnectionTarget) -> Result<Self, String> {
+        Self::connect_with_tls(&target.host, target.port, &target.password, target.tls)
+    }
+
+    fn connect_with_tls(host: &str, port: u16, password: &str, tls: bool) -> Result<Self, String> {
         let stream = TcpStream::connect(format!("{host}:{port}"))
             .map_err(|e| format!("connection failed: {e}"))?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .ok();
-        let reader = BufReader::new(stream.try_clone().unwrap());
-        let mut conn = DirectConn { stream, reader };
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        let stream = if tls {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let root_store = RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            let config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let server_name =
+                ServerName::try_from(host.to_string()).map_err(|_| "invalid TLS host".to_string())?;
+            let connection = ClientConnection::new(Arc::new(config), server_name)
+                .map_err(|e| format!("TLS setup failed: {e}"))?;
+            DirectStream::Tls(StreamOwned::new(connection, stream))
+        } else {
+            DirectStream::Plain(stream)
+        };
+        let reader = BufReader::new(stream);
+        let mut conn = DirectConn { reader };
 
         if !password.is_empty() {
             let result = conn.exec(&format!("AUTH {password}"));
@@ -1920,8 +1934,13 @@ impl DirectConn {
         if parts.is_empty() {
             return Err("empty command".to_string());
         }
-        self.stream
+        self.reader
+            .get_mut()
             .write_all(&resp_encode(&parts))
+            .map_err(|e| format!("write error: {e}"))?;
+        self.reader
+            .get_mut()
+            .flush()
             .map_err(|e| format!("write error: {e}"))?;
         resp_read_response(&mut self.reader)
     }
@@ -1930,8 +1949,13 @@ impl DirectConn {
         if args.is_empty() {
             return Err("empty command".to_string());
         }
-        self.stream
+        self.reader
+            .get_mut()
             .write_all(&resp_encode_strings(args))
+            .map_err(|e| format!("write error: {e}"))?;
+        self.reader
+            .get_mut()
+            .flush()
             .map_err(|e| format!("write error: {e}"))?;
         resp_read_response(&mut self.reader)
     }
@@ -1940,8 +1964,13 @@ impl DirectConn {
     /// (each row is [field, value, field, value, ...]).
     fn exec_table_rows(&mut self, command: &str) -> Result<Vec<Vec<String>>, String> {
         let parts: Vec<&str> = command.split_whitespace().collect();
-        self.stream
+        self.reader
+            .get_mut()
             .write_all(&resp_encode(&parts))
+            .map_err(|e| format!("write error: {e}"))?;
+        self.reader
+            .get_mut()
+            .flush()
             .map_err(|e| format!("write error: {e}"))?;
 
         // Read outer array (rows)
@@ -2060,22 +2089,8 @@ async fn resolve_migrate_target(
 
     // Check if it's a connection URL
     if is_connection_url(project) {
-        let url = project
-            .trim_start_matches("redis://")
-            .trim_start_matches("lux://");
-        let (auth, hostport) = if let Some(at) = url.find('@') {
-            (
-                Some(url[..at].trim_start_matches(':').to_string()),
-                &url[at + 1..],
-            )
-        } else {
-            (None, url)
-        };
-        let parts: Vec<&str> = hostport.split(':').collect();
-        let h = parts[0];
-        let p: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(6379);
-        let pw = auth.unwrap_or_default();
-        match DirectConn::connect(h, p, &pw) {
+        let target = parse_connection_url(project);
+        match DirectConn::connect_target(&target) {
             Ok(conn) => return MigrateTarget::Direct(conn),
             Err(e) => {
                 eprintln!("{} {}", "Error:".red(), e);
@@ -2280,29 +2295,43 @@ mod tests {
 
     #[test]
     fn parses_lux_connection_urls_with_password() {
-        let (host, port, password, name) =
-            parse_connection_url("lux://:secret@db.example.com:10000");
+        let target = parse_connection_url("lux://:secret@db.example.com:10000");
 
-        assert_eq!(host, "db.example.com");
-        assert_eq!(port, 10000);
-        assert_eq!(password, "secret");
-        assert_eq!(name, "db.example.com:10000");
+        assert_eq!(target.host, "db.example.com");
+        assert_eq!(target.port, 10000);
+        assert_eq!(target.password, "secret");
+        assert_eq!(target.name, "db.example.com:10000");
+        assert!(!target.tls);
+    }
+
+    #[test]
+    fn parses_tls_connection_urls() {
+        let target = parse_connection_url("luxs://:secret@db.example.com:6380");
+
+        assert_eq!(target.host, "db.example.com");
+        assert_eq!(target.port, 6380);
+        assert_eq!(target.password, "secret");
+        assert_eq!(target.name, "db.example.com:6380");
+        assert!(target.tls);
     }
 
     #[test]
     fn parses_connection_urls_without_password_or_port() {
-        let (host, port, password, name) = parse_connection_url("redis://localhost");
+        let target = parse_connection_url("redis://localhost");
 
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 6379);
-        assert_eq!(password, "");
-        assert_eq!(name, "localhost:6379");
+        assert_eq!(target.host, "localhost");
+        assert_eq!(target.port, 6379);
+        assert_eq!(target.password, "");
+        assert_eq!(target.name, "localhost:6379");
+        assert!(!target.tls);
     }
 
     #[test]
     fn identifies_direct_connection_urls() {
         assert!(is_connection_url("lux://:secret@localhost:10000"));
+        assert!(is_connection_url("luxs://:secret@localhost:6380"));
         assert!(is_connection_url("redis://localhost"));
+        assert!(is_connection_url("rediss://localhost"));
         assert!(!is_connection_url("cache"));
         assert!(!is_connection_url("localhost:10000"));
     }
