@@ -325,9 +325,28 @@ const { data: session, error: signInError } = await lux.auth.signInWithPassword(
 
 const { data: users, error } = await lux
   .table<{ id: number; email: string; age: number }>("users")
-  .select({ where: "age > 25", order: "age DESC", limit: 10 })
+  .select()
+  .gt("age", 25)
+  .order("age", { ascending: false })
+  .limit(10)
 
 if (error) throw error
+
+const { data: user } = await lux
+  .table<{ id: number; email: string }>("users")
+  .select()
+  .eq("id", 1)
+  .single()
+
+await lux
+  .table("messages")
+  .update({ body: "edited" })
+  .eq("id", 42)
+
+await lux
+  .table("messages")
+  .delete()
+  .eq("id", 42)
 
 // Direct RESP client for server-side Redis-compatible access.
 const db = new Lux("lux://localhost:6379")

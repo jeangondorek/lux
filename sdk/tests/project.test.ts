@@ -106,7 +106,7 @@ describe('Lux project client', () => {
 		expect(seen?.headers.Authorization).toBe('Bearer existing-user-jwt');
 	});
 
-	test('table where clauses normalize compact comparison operators', async () => {
+	test('table filters use supabase-style fluent query builders', async () => {
 		const seen: string[] = [];
 		const fetchImpl = async (input: RequestInfo | URL) => {
 			seen.push(String(input));
@@ -119,12 +119,78 @@ describe('Lux project client', () => {
 			fetch: fetchImpl as typeof fetch,
 		});
 
-		await client.table('messages').select({ where: 'id=1', limit: 10 });
-		await client.table('messages').select({ where: 'created_at>=1780000000' });
+		await client.table('messages').select().eq('id', 1).limit(10);
+		await client.table('messages').select().gte('created_at', 1780000000);
+		await client.table('messages').select().gt('age', 25).order('age', { ascending: false }).range(5, 14);
 
 		expect(seen).toEqual([
 			'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1&limit=10',
 			'http://localhost:3957/v1/project/tables/messages?where=created_at+%3E%3D+1780000000',
+			'http://localhost:3957/v1/project/tables/messages?where=age+%3E+25&order=age+DESC&limit=10&offset=5',
+		]);
+	});
+
+	test('single returns one row through the data/error envelope', async () => {
+		const fetchImpl = async () => {
+			return new Response(JSON.stringify({ result: [{ id: 1, body: 'hello' }] }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await client.table<{ id: number; body: string }>('messages').select().eq('id', 1).single();
+
+		expect(result).toEqual({
+			data: { id: 1, body: 'hello' },
+			error: null,
+		});
+	});
+
+	test('update and delete require fluent filters', async () => {
+		const calls: Array<{ url: string; method?: string; body?: any }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({
+				url: String(input),
+				method: init?.method,
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			});
+			return new Response(JSON.stringify({ result: 1 }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const unsafeDelete = await client.table('messages').delete();
+		const update = await client.table('messages').update({ body: 'edited' }).eq('id', 1);
+		const deletion = await client.table('messages').delete().eq('id', 1);
+
+		expect(unsafeDelete).toEqual({
+			data: null,
+			error: {
+				code: 'MISSING_FILTER',
+				message: 'delete() requires at least one filter',
+				details: undefined,
+			},
+		});
+		expect(update.error).toBeNull();
+		expect(deletion.error).toBeNull();
+		expect(calls).toEqual([
+			{
+				url: 'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1',
+				method: 'PATCH',
+				body: { body: 'edited' },
+			},
+			{
+				url: 'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1',
+				method: 'DELETE',
+				body: undefined,
+			},
 		]);
 	});
 
@@ -233,7 +299,7 @@ describe('Lux project client', () => {
 			owner: session!.user.email,
 			created_at: '2026-06-01T17:37:29.825Z',
 		});
-		const rows = await userClient.table<{ id: number; owner: string; body: string }>('oauth_messages').select({ limit: 10 });
+		const rows = await userClient.table<{ id: number; owner: string; body: string }>('oauth_messages').select().limit(10);
 
 		expect(sessionResult.error).toBeNull();
 		expect(readGrant.error).toBeNull();

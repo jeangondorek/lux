@@ -296,10 +296,38 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 		return this;
 	}
 
+	eq(field: string, value: TableWhereValue): this {
+		return this.where(field, '=', value);
+	}
+
+	neq(field: string, value: TableWhereValue): this {
+		return this.where(field, '!=', value);
+	}
+
+	gt(field: string, value: TableWhereValue): this {
+		return this.where(field, '>', value);
+	}
+
+	gte(field: string, value: TableWhereValue): this {
+		return this.where(field, '>=', value);
+	}
+
+	lt(field: string, value: TableWhereValue): this {
+		return this.where(field, '<', value);
+	}
+
+	lte(field: string, value: TableWhereValue): this {
+		return this.where(field, '<=', value);
+	}
+
 	orderBy(field: string, dir: 'asc' | 'desc' = 'asc'): this {
 		this.orderField = field;
 		this.orderDir = dir.toUpperCase() as 'ASC' | 'DESC';
 		return this;
+	}
+
+	order(field: string, options: { ascending?: boolean } = {}): this {
+		return this.orderBy(field, options.ascending === false ? 'desc' : 'asc');
 	}
 
 	limit(n: number): this {
@@ -402,6 +430,13 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 		}
 	}
 
+	then<TFulfilled = LuxResult<T[] | T>, TRejected = never>(
+		onfulfilled?: ((value: LuxResult<T[] | T>) => TFulfilled | PromiseLike<TFulfilled>) | null,
+		onrejected?: ((reason: unknown) => TRejected | PromiseLike<TRejected>) | null,
+	): Promise<TFulfilled | TRejected> {
+		return this.run().then(onfulfilled, onrejected);
+	}
+
 	async insert(data: Record<string, unknown>): Promise<LuxResult<number>> {
 		try {
 			if (this.schema) {
@@ -418,35 +453,32 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 		}
 	}
 
-	async update(id: number | string, data: Record<string, unknown>): Promise<LuxResult<number>> {
+	async update(id: number | string, data: Record<string, unknown>): Promise<LuxResult<number>>;
+	async update(data: Record<string, unknown>): Promise<LuxResult<number>>;
+	async update(
+		idOrData: number | string | Record<string, unknown>,
+		data?: Record<string, unknown>,
+	): Promise<LuxResult<number>> {
 		try {
-			const args: (string | number)[] = [this.name, 'SET'];
-			for (const [k, v] of Object.entries(data)) {
-				args.push(k, String(v));
+			const hasExplicitId = data !== undefined;
+			const patch = hasExplicitId ? data : idOrData as Record<string, unknown>;
+			if (!hasExplicitId && this.conditions.length === 0) {
+				return err('MISSING_WHERE', 'update requires at least one filter');
 			}
-			args.push('WHERE', 'id', '=', String(id));
-			const result = await this.client.call('TUPDATE', ...args) as string | number;
-			return ok(Number(result) || 0);
-		} catch (error) {
-			return err('TUPDATE_ERROR', `Failed to update '${this.name}'`, toLuxError(error));
-		}
-	}
-
-	async updateWhere(data: Record<string, unknown>): Promise<LuxResult<number>> {
-		if (this.conditions.length === 0) {
-			return err('MISSING_WHERE', 'updateWhere requires at least one where() condition');
-		}
-		try {
 			const args: (string | number)[] = [this.name, 'SET'];
-			for (const [k, v] of Object.entries(data)) {
+			for (const [k, v] of Object.entries(patch)) {
 				args.push(k, String(v));
 			}
 			args.push('WHERE');
-			for (let i = 0; i < this.conditions.length; i++) {
-				const cond = this.conditions[i];
-				args.push(cond.field, cond.op, String(cond.value));
-				if (i < this.conditions.length - 1) {
-					args.push('AND');
+			if (hasExplicitId) {
+				args.push('id', '=', String(idOrData));
+			} else {
+				for (let i = 0; i < this.conditions.length; i++) {
+					const cond = this.conditions[i];
+					args.push(cond.field, cond.op, String(cond.value));
+					if (i < this.conditions.length - 1) {
+						args.push('AND');
+					}
 				}
 			}
 			const result = await this.client.call('TUPDATE', ...args) as string | number;
@@ -458,32 +490,28 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 
 	async delete(...ids: Array<number | string>): Promise<LuxResult<number>> {
 		try {
+			if (ids.length === 0) {
+				if (this.conditions.length === 0) {
+					return err('MISSING_WHERE', 'delete requires at least one filter');
+				}
+				const args: (string | number)[] = ['FROM', this.name, 'WHERE'];
+				for (let i = 0; i < this.conditions.length; i++) {
+					const cond = this.conditions[i];
+					args.push(cond.field, cond.op, String(cond.value));
+					if (i < this.conditions.length - 1) {
+						args.push('AND');
+					}
+				}
+				const result = await this.client.call('TDELETE', ...args) as string | number;
+				return ok(Number(result) || 0);
+			}
+
 			let deleted = 0;
 			for (const id of ids) {
 				const result = await this.client.call('TDELETE', 'FROM', this.name, 'WHERE', 'id', '=', String(id)) as string | number;
 				deleted += Number(result) || 0;
 			}
 			return ok(deleted);
-		} catch (error) {
-			return err('TDELETE_ERROR', `Failed to delete from '${this.name}'`, toLuxError(error));
-		}
-	}
-
-	async deleteWhere(): Promise<LuxResult<number>> {
-		if (this.conditions.length === 0) {
-			return err('MISSING_WHERE', 'deleteWhere requires at least one where() condition');
-		}
-		try {
-			const args: (string | number)[] = ['FROM', this.name, 'WHERE'];
-			for (let i = 0; i < this.conditions.length; i++) {
-				const cond = this.conditions[i];
-				args.push(cond.field, cond.op, String(cond.value));
-				if (i < this.conditions.length - 1) {
-					args.push('AND');
-				}
-			}
-			const result = await this.client.call('TDELETE', ...args) as string | number;
-			return ok(Number(result) || 0);
 		} catch (error) {
 			return err('TDELETE_ERROR', `Failed to delete from '${this.name}'`, toLuxError(error));
 		}
@@ -504,4 +532,3 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 		return new TableSubscription<T>(this.client, this.name, (extra) => this.buildSelectArgs(extra));
 	}
 }
-

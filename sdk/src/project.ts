@@ -27,6 +27,18 @@ export interface LuxVectorSearchOptions {
 }
 
 type QueryValue = string | number | boolean | null;
+type FilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'is';
+
+interface QueryFilter {
+	column: string;
+	operator: FilterOperator;
+	value: QueryValue;
+}
+
+interface QueryOrder {
+	column: string;
+	ascending: boolean;
+}
 
 export class LuxProjectClient {
 	readonly url: string;
@@ -127,33 +139,215 @@ export class LuxProjectClient {
 export class LuxProjectTable<T extends Record<string, unknown>> {
 	constructor(private client: LuxProjectClient, private name: string) {}
 
-	async select(options?: { where?: string; order?: string; limit?: number }): Promise<LuxResult<T[]>> {
-		const params = new URLSearchParams();
-		if (options?.where) params.set('where', normalizeWhere(options.where));
-		if (options?.order) params.set('order', options.order);
-		if (options?.limit != null) params.set('limit', String(options.limit));
-		const query = params.toString();
-		const result = await this.client.request('GET', `/tables/${encodeURIComponent(this.name)}${query ? `?${query}` : ''}`);
-		if (result.error) return result as LuxResult<T[]>;
-		return ok(unwrapRows<T>(result.data));
+	select(columns = '*'): LuxProjectSelectBuilder<T, T[]> {
+		return new LuxProjectSelectBuilder<T, T[]>(this.client, this.name, columns);
 	}
 
-	async insert(row: Partial<T> & Record<string, QueryValue>): Promise<LuxResult<unknown>> {
-		return this.client.request('POST', `/tables/${encodeURIComponent(this.name)}`, row);
+	insert(row: Partial<T> & Record<string, QueryValue>): LuxProjectInsertBuilder<unknown>;
+	insert(rows: Array<Partial<T> & Record<string, QueryValue>>): LuxProjectInsertBuilder<unknown[]>;
+	insert(
+		rowOrRows: (Partial<T> & Record<string, QueryValue>) | Array<Partial<T> & Record<string, QueryValue>>,
+	): LuxProjectInsertBuilder<unknown | unknown[]> {
+		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows);
 	}
 
-	async update(where: string, patch: Partial<T> & Record<string, QueryValue>): Promise<LuxResult<unknown>> {
-		return this.client.request('PATCH', `/tables/${encodeURIComponent(this.name)}?where=${encodeURIComponent(normalizeWhere(where))}`, patch);
+	update(patch: Partial<T> & Record<string, QueryValue>): LuxProjectMutationBuilder<unknown> {
+		return new LuxProjectMutationBuilder(this.client, this.name, 'PATCH', patch);
 	}
 
-	async delete(where: string): Promise<LuxResult<unknown>> {
-		return this.client.request('DELETE', `/tables/${encodeURIComponent(this.name)}?where=${encodeURIComponent(normalizeWhere(where))}`);
+	delete(): LuxProjectMutationBuilder<unknown> {
+		return new LuxProjectMutationBuilder(this.client, this.name, 'DELETE');
 	}
 
 	async count(): Promise<LuxResult<number>> {
 		const result = await this.client.request('GET', `/tables/${encodeURIComponent(this.name)}/count`);
 		if (result.error) return result as LuxResult<number>;
 		return ok(unwrapResult<number>(result.data) ?? 0);
+	}
+}
+
+abstract class LuxProjectThenable<TResult> implements PromiseLike<LuxResult<TResult>> {
+	then<TFulfilled = LuxResult<TResult>, TRejected = never>(
+		onfulfilled?: ((value: LuxResult<TResult>) => TFulfilled | PromiseLike<TFulfilled>) | null,
+		onrejected?: ((reason: unknown) => TRejected | PromiseLike<TRejected>) | null,
+	): Promise<TFulfilled | TRejected> {
+		return this.execute().then(onfulfilled, onrejected);
+	}
+
+	catch<TRejected = never>(
+		onrejected?: ((reason: unknown) => TRejected | PromiseLike<TRejected>) | null,
+	): Promise<LuxResult<TResult> | TRejected> {
+		return this.execute().catch(onrejected);
+	}
+
+	finally(onfinally?: (() => void) | null): Promise<LuxResult<TResult>> {
+		return this.execute().finally(onfinally ?? undefined);
+	}
+
+	abstract execute(): Promise<LuxResult<TResult>>;
+}
+
+abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenable<TResult> {
+	protected filters: QueryFilter[] = [];
+	protected orderBy?: QueryOrder;
+	protected limitCount?: number;
+	protected offsetCount?: number;
+
+	protected constructor(
+		protected client: LuxProjectClient,
+		protected tableName: string,
+	) {
+		super();
+	}
+
+	eq(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'eq', value);
+	}
+
+	neq(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'neq', value);
+	}
+
+	gt(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'gt', value);
+	}
+
+	gte(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'gte', value);
+	}
+
+	lt(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'lt', value);
+	}
+
+	lte(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'lte', value);
+	}
+
+	is(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'is', value);
+	}
+
+	protected addFilter(column: string, operator: FilterOperator, value: QueryValue): TSelf {
+		this.filters.push({ column, operator, value });
+		return this as unknown as TSelf;
+	}
+
+	protected filteredQueryParams(): URLSearchParams {
+		const params = new URLSearchParams();
+		if (this.filters.length) params.set('where', filtersToWhere(this.filters));
+		if (this.orderBy) {
+			params.set('order', `${this.orderBy.column} ${this.orderBy.ascending ? 'ASC' : 'DESC'}`);
+		}
+		if (this.limitCount != null) params.set('limit', String(this.limitCount));
+		if (this.offsetCount != null) params.set('offset', String(this.offsetCount));
+		return params;
+	}
+}
+
+export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectSelectBuilder<T, TResult>> {
+	private expectSingle = false;
+
+	constructor(
+		client: LuxProjectClient,
+		tableName: string,
+		private columns: string,
+	) {
+		super(client, tableName);
+	}
+
+	order(column: string, options: { ascending?: boolean } = {}): this {
+		this.orderBy = { column, ascending: options.ascending ?? true };
+		return this;
+	}
+
+	limit(count: number): this {
+		this.limitCount = count;
+		return this;
+	}
+
+	range(from: number, to: number): this {
+		this.offsetCount = from;
+		this.limitCount = Math.max(0, to - from + 1);
+		return this;
+	}
+
+	single(): LuxProjectSelectBuilder<T, T> {
+		this.expectSingle = true;
+		if (this.limitCount == null) this.limitCount = 1;
+		return this as unknown as LuxProjectSelectBuilder<T, T>;
+	}
+
+	async execute(): Promise<LuxResult<TResult>> {
+		const params = this.filteredQueryParams();
+		if (this.columns && this.columns !== '*') params.set('select', this.columns);
+		const query = params.toString();
+		const result = await this.client.request(
+			'GET',
+			`/tables/${encodeURIComponent(this.tableName)}${query ? `?${query}` : ''}`,
+		);
+		if (result.error) return result as LuxResult<TResult>;
+
+		const rows = unwrapRows<T>(result.data);
+		if (!this.expectSingle) {
+			return ok(rows as TResult);
+		}
+		if (rows.length === 0) {
+			return err('NOT_FOUND', `No rows found in table '${this.tableName}'`);
+		}
+		return ok(rows[0] as unknown as TResult);
+	}
+}
+
+export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult> {
+	constructor(
+		private client: LuxProjectClient,
+		private tableName: string,
+		private rowOrRows: Record<string, QueryValue> | Array<Record<string, QueryValue>>,
+	) {
+		super();
+	}
+
+	async execute(): Promise<LuxResult<TResult>> {
+		if (!Array.isArray(this.rowOrRows)) {
+			return this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, this.rowOrRows) as Promise<LuxResult<TResult>>;
+		}
+
+		const results: unknown[] = [];
+		for (const row of this.rowOrRows) {
+			const result = await this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, row);
+			if (result.error) return result as LuxResult<TResult>;
+			results.push(result.data);
+		}
+		return ok(results as TResult);
+	}
+}
+
+export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectMutationBuilder<TResult>> {
+	constructor(
+		client: LuxProjectClient,
+		tableName: string,
+		private method: 'PATCH' | 'DELETE',
+		private body?: Record<string, QueryValue>,
+	) {
+		super(client, tableName);
+	}
+
+	async execute(): Promise<LuxResult<TResult>> {
+		if (this.filters.length === 0) {
+			return err(
+				'MISSING_FILTER',
+				`${this.method === 'PATCH' ? 'update' : 'delete'}() requires at least one filter`,
+			);
+		}
+
+		const params = this.filteredQueryParams();
+		const query = params.toString();
+		return this.client.request(
+			this.method,
+			`/tables/${encodeURIComponent(this.tableName)}${query ? `?${query}` : ''}`,
+			this.body,
+		) as Promise<LuxResult<TResult>>;
 	}
 }
 
@@ -174,6 +368,36 @@ function unwrapResult<T>(payload: unknown): T | undefined {
 
 function normalizeWhere(where: string): string {
 	return where.trim().replace(/\s*(>=|<=|!=|=|>|<)\s*/g, ' $1 ');
+}
+
+function filtersToWhere(filters: QueryFilter[]): string {
+	return filters.map((filter) => {
+		const op = filterOperatorToWhere(filter.operator);
+		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value)}`);
+	}).join(' AND ');
+}
+
+function filterOperatorToWhere(operator: FilterOperator): string {
+	switch (operator) {
+		case 'eq':
+		case 'is':
+			return '=';
+		case 'neq':
+			return '!=';
+		case 'gt':
+			return '>';
+		case 'gte':
+			return '>=';
+		case 'lt':
+			return '<';
+		case 'lte':
+			return '<=';
+	}
+}
+
+function formatWhereValue(value: QueryValue): string {
+	if (value === null) return '';
+	return String(value);
 }
 
 export function createProjectClient(options: LuxProjectOptions): LuxProjectClient {
