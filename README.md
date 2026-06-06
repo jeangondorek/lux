@@ -5,8 +5,8 @@
 <h1 align="center">Lux</h1>
 
 <p align="center">
-  <strong>A Redis-compatible key-value store. Up to 10x faster.</strong><br/>
-  Multi-threaded. Built-in vector search, time series, realtime key subscriptions, and GEO. BullMQ-compatible. Written in Rust. MIT licensed forever.
+  <strong>An open-source application database engine.</strong><br/>
+  Tables, cache, vectors, realtime, queues, time series, auth, and Redis-compatible commands in one Rust runtime. MIT licensed forever.
 </p>
 
 <p align="center">
@@ -23,19 +23,23 @@
 
 ---
 
+## What is Lux?
+
+Lux is a database engine for modern application state. A real app is not just rows in a primary database: it is users and sessions, cache, live UI state, semantic search, jobs, metrics, queues, durable records, and low-latency commands. Lux puts those primitives in one runtime so they can share the same operational model, connection surface, durability layer, and SDK.
+
+The engine speaks RESP, so existing Redis clients still work. That compatibility is intentional: Lux should be easy to adopt for cache, queues, BullMQ, pub/sub, and command-oriented workloads. But Lux is not only a faster cache. It also includes typed relational tables, native vector search, time series, realtime key subscriptions, streams, snapshots, WAL recovery, tiered storage, and optional app auth.
+
+Use Lux when you want one database process to cover the hot path of your application backend instead of stitching together Redis, Postgres, Pinecone, Kafka-style realtime plumbing, BullMQ, and a metrics store for every new product.
+
 ## Why Lux?
 
-Redis is single-threaded by design. Antirez made that choice in 2009 because it eliminates all locking, race conditions, and concurrency bugs. For most workloads, the bottleneck is network I/O, not CPU, so a single-threaded event loop is fast enough. It was a brilliant simplification.
+Redis is single-threaded by design. That simplicity is part of why it became foundational infrastructure. But it also creates a ceiling: once one core is saturated, the usual answer is to shard at the client or cluster level and accept the operational complexity.
 
-But it has a ceiling. Once you saturate one core, that's it. Redis can't use the other 15 cores on your machine. The official answer is to run multiple Redis instances and shard at the client level (Redis Cluster), which adds significant operational complexity.
+Lux uses a **sharded concurrent architecture** that safely uses all your cores in a single process. Each key maps to one of N shards, each protected by a `parking_lot` RwLock. Reads never block reads. Writes only block the shard they touch. Tokio handles thousands of connections across cores. The result is single-digit microsecond latency at low concurrency and throughput that keeps scaling with cores and pipeline depth.
 
-Lux takes the opposite approach: a **sharded concurrent architecture** that safely uses all your cores in a single process. Each key maps to one of N shards, each protected by a `parking_lot` RwLock. Reads never block reads. Writes only block the single shard they touch. Tokio's async runtime handles thousands of connections across all cores. The result: single-digit microsecond latency at low concurrency (matching Redis), and linear throughput scaling as you add cores and pipeline depth (where Redis flatlines).
+The concurrency model is deliberately conservative. Commands acquire a shard lock, do their work, and release it. There are no cross-shard locks in normal command execution and no lock-ordering games. MULTI/EXEC uses WATCH-based optimistic concurrency with shard versioning, matching what Redis clients rely on.
 
-"Doesn't multi-threading introduce the bugs Redis avoided?" No. Lux's concurrency is at the shard level, not the command level. Each command acquires a single shard lock, does its work, and releases. There are no cross-shard locks, no lock ordering issues, no deadlocks. The only shared mutable state is inside shards, and the RwLock makes that safe. MULTI/EXEC transactions use WATCH-based optimistic concurrency (shard versioning) rather than global locks, matching what Redis clients actually rely on.
-
-Point your existing Redis client at Lux. Most workloads just work.
-
-**Works with every Redis client** -- ioredis, redis-py, go-redis, Jedis, redis-rb, BullMQ. Zero code changes.
+**Compatibility:** ioredis, redis-py, go-redis, Jedis, redis-rb, BullMQ, redis-cli, and other RESP clients can connect directly. Use the Lux SDK and CLI when you want higher-level tables, migrations, Cloud gateway auth, and app-first workflows.
 
 ### Benchmarks
 
@@ -66,12 +70,14 @@ Full results including SET scaling by pipeline depth (up to **5.8x** at pipeline
 
 ## Lux Cloud
 
-Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is managed Lux hosting. Deploy in seconds, connect with any Redis client. Includes BullMQ queue dashboard, agent memory MCP server, persistence, monitoring, and web console.
+Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is the managed product built on the open-source Lux engine. It gives you projects, dashboard, browser/server SDK access, project keys, app auth, OAuth providers, snapshots, logs, metrics, MCP, and direct Redis-compatible access when you need it.
+
+Lux Cloud is the fastest path when you want to build an app backend around Lux without operating the runtime yourself. Self-hosting stays available because the engine is MIT licensed and runs as a normal binary or container.
 
 ## Features
 
 - **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, tables, HyperLogLog, bitops, pub/sub, transactions
-- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid), unique constraints, foreign keys, joins, WHERE/ORDER BY/LIMIT. Structured data without standing up Postgres
+- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid), unique constraints, foreign keys, joins, WHERE/ORDER BY/LIMIT. Structured data without standing up a separate primary database
 - **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
 - **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering. No extensions, no sidecars
@@ -81,13 +87,13 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 - **Lua scripting** -- EVAL, EVALSHA, SCRIPT with redis.call/pcall, cmsgpack, and cjson
 - **Redis Streams** -- XADD, XREAD, XREADGROUP, XACK, consumer groups, blocking reads
 - **Blocking commands** -- BLPOP, BRPOP, BLMOVE, BZPOPMIN, BZPOPMAX
-- **HTTP REST API** -- built-in JSON API on a separate port, 174K ops/sec, Bearer auth, CORS
+- **HTTP REST API** -- built-in JSON API on a separate port for browser, edge, serverless, and MCP-style access
 - **RESP2 protocol** -- compatible with every Redis client
 - **Multi-threaded** -- auto-tuned shards, parking_lot RwLocks, tokio async runtime
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
 - **Pipeline batching** -- consecutive same-shard commands batched under a single lock
 - **Persistence** -- automatic snapshots, write-ahead log (WAL) with CRC32 checksums, tiered hot/cold storage with automatic eviction to disk
-- **Auth** -- password authentication via `LUX_PASSWORD`, plus optional app auth with users, sessions, OAuth providers, and JWTs
+- **Auth** -- password authentication via `LUX_PASSWORD`, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, and auth-owned system tables
 - **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, PUBLISH, plus KSUB/KUNSUB for realtime key change events
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
@@ -280,7 +286,7 @@ Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(fi
 ### CLI
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lux-db/lux/main/cli/install.sh | sh
+curl -fsSL https://luxdb.dev/install.sh | sh
 ```
 
 ```bash

@@ -1,12 +1,12 @@
 # lux
 
-CLI for [Lux](https://luxdb.dev). Manage projects, run commands, stream logs, and connect to instances from the terminal.
+CLI for [Lux](https://luxdb.dev). Manage Lux Cloud projects, run migrations and seeds, execute commands, stream logs, and connect to Lux instances from the terminal.
 
 ## Install
 
 One-line install:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lux-db/lux/main/cli/install.sh | sh
+curl -fsSL https://luxdb.dev/install.sh | sh
 ```
 
 From source (requires Rust):
@@ -51,8 +51,7 @@ lux login                                     # authenticate
 lux logout                                    # clear credentials
 lux link my-app                               # save a default project for this repo
 lux projects                                  # list all projects
-lux create my-app --accept-charges            # create a project (default 512MB)
-lux create my-app -m 128 --accept-charges     # create with specific memory
+lux create my-app --accept-charges            # create a Standard project
 lux status                                    # show linked project status and live metrics
 lux exec my-app SET hello world               # execute a command
 lux exec my-app KEYS '*'                      # wildcards need quotes
@@ -62,7 +61,7 @@ lux restart                                   # restart linked project
 lux destroy my-app --accept-consequences      # permanently delete
 lux connect my-app                            # interactive REPL via Lux Cloud
 lux keys list                                 # list project API keys
-lux keys create --kind secret --name server   # create a project API key
+lux keys create --kind secret --name server   # create an additional project API key
 lux keys revoke <key-id>                      # revoke a project API key
 lux env pull                                  # write linked project env to .env.local
 lux migrate new create_users                  # create a migration file
@@ -159,9 +158,11 @@ LUX_DIRECT_URL=
 
 Use `LUX_URL` with the SDK. `LUX_DIRECT_URL` is the optional RESP/database connection string for direct Redis-compatible access.
 
+The database password is only needed for direct RESP access. Browser and server apps should normally use `LUX_URL` with a publishable or secret project key.
+
 ## Project keys
 
-Manage Cloud gateway keys for browser and server access:
+Manage Cloud gateway keys for browser and server access. Every auth-enabled Cloud project is created with default publishable and secret keys; create additional keys when you need rotation or a separate server/client boundary.
 
 ```bash
 lux keys list
