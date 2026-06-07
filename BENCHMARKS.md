@@ -38,7 +38,7 @@ At pipeline=1 (no batching), Lux and Redis are within noise. The gap grows with 
 | LRANGE_300 | 132K | 129K | **1.0x** |
 | MSET (10 keys) | 197K | 727K | 0.27x |
 
-Lux beats Redis on every single-key command. MSET is slower because it touches multiple shards (requiring multiple locks); Redis has no lock overhead for multi-key operations.
+Lux beats Redis on the measured single-key command set. MSET is slower because it touches multiple shards (requiring multiple locks); Redis has no lock overhead for multi-key operations.
 
 ## Pipeline depth 1 (no batching)
 

@@ -28,7 +28,7 @@
           default = lux;
 
           meta = {
-            description = "A Redis-compatible key-value store. 2-7x faster";
+            description = "An open-source application database engine with Redis-compatible commands";
             homepage = "https://github.com/lux-db/lux";
             license = lib.licenses.mit;
             maintainers = [ ];

@@ -45,9 +45,9 @@ The concurrency model is deliberately conservative. Commands acquire a shard loc
 
 `redis-benchmark`, 50 clients, 1M requests, pipeline=64. Sequential runs (one server at a time) on a 32-core Intel i9-14900K, 128GB RAM, Ubuntu 24.04.
 
-| Command | Lux | Redis 8.4.2 | Lux/Redis |
+| Command | Lux | Redis 8.6.1 | Lux/Redis |
 |---------|-----|-------------|-----------|
-| SET | 10.2M | 3.4M | **3.0x** |
+| SET | 11.2M | 3.3M | **3.4x** |
 | GET | 12.0M | 4.7M | **2.6x** |
 | INCR | 6.3M | 4.0M | **1.6x** |
 | LPUSH | 6.5M | 3.3M | **2.0x** |
@@ -64,9 +64,9 @@ The concurrency model is deliberately conservative. Commands acquire a shard loc
 | GEOSEARCH (500km) | 4.44M | 559K | **8.0x** |
 | GEOSEARCH (5000km) | 200K | 20K | **10.0x** |
 
-Lux beats Redis on every supported command. At pipeline=1, both are network-bound and roughly equal. The gap grows with pipeline depth because Lux batches same-shard commands under a single lock while Redis processes sequentially on one core. GEO commands see the biggest gains because GEOSEARCH parallelizes across shards while Redis scans single-threaded.
+Lux beats Redis on the measured single-key command set at pipeline=64. At pipeline=1, both are network-bound and roughly equal. The gap grows with pipeline depth because Lux batches same-shard commands under a single lock while Redis processes sequentially on one core. Multi-key commands have different tradeoffs and should be benchmarked against your workload.
 
-Full results including SET scaling by pipeline depth (up to **5.8x** at pipeline=512) in [BENCHMARKS.md](BENCHMARKS.md). Reproduce with `./bench.sh`.
+Full results including SET scaling by pipeline depth are in [BENCHMARKS.md](BENCHMARKS.md). Reproduce with `./bench.sh`.
 
 ## Lux Cloud
 
