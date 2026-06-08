@@ -34,6 +34,12 @@ interface TableSimilarityClause {
 	threshold?: number;
 }
 
+interface TableHavingCondition {
+	field: string;
+	op: TableWhereOp;
+	value: TableWhereValue;
+}
+
 interface TableClient {
 	call(command: string, ...args: Array<string | number>): Promise<unknown>;
 	_tselect(args: string[]): Promise<TableRow[]>;
@@ -209,6 +215,8 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 	private offsetCount?: number;
 	private joinClause?: TableJoinClause;
 	private similarityClause?: TableSimilarityClause;
+	private groupFields: string[] = [];
+	private havingConditions: TableHavingCondition[] = [];
 	private selectClause = '*';
 	private expectSingle = false;
 	private schema?: TableSchema<T>;
@@ -256,6 +264,21 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 				const cond = allConditions[i];
 				args.push(cond.field, cond.op, String(cond.value));
 				if (i < allConditions.length - 1) {
+					args.push('AND');
+				}
+			}
+		}
+
+		if (this.groupFields.length) {
+			args.push('GROUP', 'BY', ...this.groupFields);
+		}
+
+		if (this.havingConditions.length) {
+			args.push('HAVING');
+			for (let i = 0; i < this.havingConditions.length; i++) {
+				const cond = this.havingConditions[i];
+				args.push(cond.field, cond.op, String(cond.value));
+				if (i < this.havingConditions.length - 1) {
 					args.push('AND');
 				}
 			}
@@ -356,6 +379,22 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 
 	leftJoin(table: string, alias: string, onLeft: string, onRight: string): this {
 		this.joinClause = { type: 'LEFT', table, alias, onLeft, onRight };
+		return this;
+	}
+
+	group(fields: string | string[]): this {
+		this.groupFields = Array.isArray(fields)
+			? fields
+			: fields.split(',').map((field) => field.trim()).filter(Boolean);
+		return this;
+	}
+
+	groupBy(fields: string | string[]): this {
+		return this.group(fields);
+	}
+
+	having(field: string, op: TableWhereOp, value: TableWhereValue): this {
+		this.havingConditions.push({ field, op, value });
 		return this;
 	}
 

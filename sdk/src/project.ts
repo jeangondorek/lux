@@ -41,6 +41,20 @@ interface QueryOrder {
 	ascending: boolean;
 }
 
+interface QueryJoin {
+	type: 'inner' | 'left';
+	table: string;
+	alias: string;
+	onLeft: string;
+	onRight: string;
+}
+
+interface QueryHaving {
+	column: string;
+	operator: FilterOperator;
+	value: QueryValue;
+}
+
 interface QueryNear {
 	field: string;
 	vector: number[];
@@ -364,6 +378,9 @@ abstract class LuxProjectThenable<TResult> implements PromiseLike<LuxResult<TRes
 abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenable<TResult> {
 	protected filters: QueryFilter[] = [];
 	protected orderBy?: QueryOrder;
+	protected joins: QueryJoin[] = [];
+	protected groupColumns: string[] = [];
+	protected havingFilters: QueryHaving[] = [];
 	protected nearQuery?: QueryNear;
 	protected limitCount?: number;
 	protected offsetCount?: number;
@@ -403,6 +420,28 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 		return this.addFilter(column, 'is', value);
 	}
 
+	join(table: string, alias: string, onLeft: string, onRight: string): TSelf {
+		this.joins.push({ type: 'inner', table, alias, onLeft, onRight });
+		return this as unknown as TSelf;
+	}
+
+	leftJoin(table: string, alias: string, onLeft: string, onRight: string): TSelf {
+		this.joins.push({ type: 'left', table, alias, onLeft, onRight });
+		return this as unknown as TSelf;
+	}
+
+	group(columns: string | string[]): TSelf {
+		this.groupColumns = Array.isArray(columns)
+			? columns
+			: columns.split(',').map((column) => column.trim()).filter(Boolean);
+		return this as unknown as TSelf;
+	}
+
+	having(column: string, operator: FilterOperator, value: QueryValue): TSelf {
+		this.havingFilters.push({ column, operator, value });
+		return this as unknown as TSelf;
+	}
+
 	protected addFilter(column: string, operator: FilterOperator, value: QueryValue): TSelf {
 		this.filters.push({ column, operator, value });
 		return this as unknown as TSelf;
@@ -411,6 +450,12 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 	protected filteredQueryParams(): URLSearchParams {
 		const params = new URLSearchParams();
 		if (this.filters.length) params.set('where', filtersToWhere(this.filters));
+		for (const join of this.joins) {
+			const kind = join.type === 'left' ? ':left' : '';
+			params.append('join', `${join.table}:${join.alias}${kind}:on(${join.onLeft}=${join.onRight})`);
+		}
+		if (this.groupColumns.length) params.set('group', this.groupColumns.join(','));
+		if (this.havingFilters.length) params.set('having', havingToWhere(this.havingFilters));
 		if (this.nearQuery) {
 			params.set('near_field', this.nearQuery.field);
 			params.set('near_vector', `[${this.nearQuery.vector.join(',')}]`);
@@ -693,6 +738,13 @@ function normalizeWhere(where: string): string {
 }
 
 function filtersToWhere(filters: QueryFilter[]): string {
+	return filters.map((filter) => {
+		const op = filterOperatorToWhere(filter.operator);
+		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value)}`);
+	}).join(' AND ');
+}
+
+function havingToWhere(filters: QueryHaving[]): string {
 	return filters.map((filter) => {
 		const op = filterOperatorToWhere(filter.operator);
 		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value)}`);

@@ -353,6 +353,13 @@ const { data: user } = await lux
   .eq("id", 1)
   .single()
 
+const { data: teamCounts } = await lux
+  .table("members")
+  .select("team_id,COUNT(*) AS count")
+  .leftJoin("teams", "t", "team_id", "id")
+  .group("team_id")
+  .having("count", "gt", 1)
+
 await lux
   .table("messages")
   .update({ body: "edited" })

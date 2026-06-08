@@ -123,12 +123,19 @@ describe('Lux project client', () => {
 		await client.table('messages').select().gte('created_at', 1780000000);
 		await client.table('messages').select().gt('age', 25).order('age', { ascending: false }).range(5, 14);
 		await client.table('messages').select('id,body,_similarity').near('embedding', [1, 0], { k: 5, threshold: 0.8 });
+		await client
+			.table('members')
+			.select('team_id,COUNT(*) AS count')
+			.leftJoin('teams', 't', 'team_id', 'id')
+			.group('team_id')
+			.having('count', 'gt', 1);
 
 		expect(seen).toEqual([
 			'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1&limit=10',
 			'http://localhost:3957/v1/project/tables/messages?where=created_at+%3E%3D+1780000000',
 			'http://localhost:3957/v1/project/tables/messages?where=age+%3E+25&order=age+DESC&limit=10&offset=5',
 			'http://localhost:3957/v1/project/tables/messages?near_field=embedding&near_vector=%5B1%2C0%5D&near_k=5&near_threshold=0.8&select=id%2Cbody%2C_similarity',
+			'http://localhost:3957/v1/project/tables/members?join=teams%3At%3Aleft%3Aon%28team_id%3Did%29&group=team_id&having=count+%3E+1&select=team_id%2CCOUNT%28*%29+AS+count',
 		]);
 	});
 

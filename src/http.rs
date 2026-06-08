@@ -1711,6 +1711,30 @@ fn parse_http_near_tokens(params: &[(String, String)]) -> Result<Vec<String>, St
     Ok(tokens)
 }
 
+fn parse_http_group_tokens(group_clause: &str) -> Result<Vec<String>, String> {
+    let tokens: Vec<String> = group_clause
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if tokens.is_empty() {
+        return Err("invalid group parameter".to_string());
+    }
+    Ok(tokens)
+}
+
+fn parse_http_having_tokens(having_clause: &str) -> Result<Vec<String>, String> {
+    let tokens: Vec<String> = having_clause
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect();
+    if tokens.is_empty() {
+        return Err("invalid having parameter".to_string());
+    }
+    Ok(tokens)
+}
+
 fn parse_http_table_query(
     params: &[(String, String)],
     table: &str,
@@ -1761,6 +1785,15 @@ fn parse_http_table_query(
     }
     for (_, join) in params.iter().filter(|(k, _)| k == "join") {
         tokens.extend(parse_http_join_tokens(join)?);
+    }
+    if let Some(group) = get_param(params, "group") {
+        tokens.push("GROUP".to_string());
+        tokens.push("BY".to_string());
+        tokens.extend(parse_http_group_tokens(group)?);
+    }
+    if let Some(having) = get_param(params, "having") {
+        tokens.push("HAVING".to_string());
+        tokens.extend(parse_http_having_tokens(having)?);
     }
     let near_tokens = parse_http_near_tokens(params)?;
     if !near_tokens.is_empty() {
@@ -3085,5 +3118,25 @@ mod tests {
         assert_eq!(near.vector, vec![1.0, 0.0]);
         assert_eq!(near.k, 5);
         assert_eq!(near.threshold, Some(0.8));
+    }
+
+    #[test]
+    fn parse_http_table_query_supports_group_having_and_inner_join() {
+        let params = vec![
+            (
+                "select".to_string(),
+                "team_id,COUNT(*) AS count".to_string(),
+            ),
+            ("join".to_string(), "teams:t:on(team_id=id)".to_string()),
+            ("group".to_string(), "team_id".to_string()),
+            ("having".to_string(), "count > 1".to_string()),
+        ];
+
+        let (_, plan) = parse_http_table_query(&params, "members", None).unwrap();
+
+        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.group_by, vec!["team_id"]);
+        assert_eq!(plan.having.len(), 1);
+        assert_eq!(plan.having[0].field, "count");
     }
 }
