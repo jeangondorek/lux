@@ -354,6 +354,14 @@ await lux
   .delete()
   .eq("id", 42)
 
+const sub = lux
+  .table<{ id: string; channel_id: string; body: string }>("messages")
+  .eq("channel_id", "general")
+  .live()
+  .on("insert", (event) => {
+    console.log(event.new)
+  })
+
 // Direct RESP client for server-side Redis-compatible access.
 const db = new Lux("lux://localhost:6379")
 
@@ -489,7 +497,7 @@ curl -X PUT http://localhost:8080/auth/v1/admin/providers/google \
   }'
 ```
 
-Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers.
+Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers. Browser live subscriptions use the publishable key plus the signed-in user's JWT; direct RESP access still uses the database password.
 
 ### Environment Variables
 

@@ -6,6 +6,7 @@ export interface LuxProjectOptions {
 	url: string;
 	key: string;
 	fetch?: typeof fetch;
+	websocket?: typeof WebSocket;
 	auth?: Omit<LuxAuthOptions, 'httpUrl' | 'apiKey' | 'fetch'>;
 }
 
@@ -40,16 +41,44 @@ interface QueryOrder {
 	ascending: boolean;
 }
 
+export type LuxProjectLiveEventType = 'snapshot' | 'insert' | 'update' | 'delete' | 'error';
+
+export interface LuxProjectLiveEvent<T extends Record<string, unknown> = Record<string, unknown>> {
+	type: LuxProjectLiveEventType;
+	table: string;
+	pk?: string;
+	new: T | null;
+	old: T | null;
+	rows?: T[];
+	changed?: string[];
+	raw?: unknown;
+	error?: { code?: string; message?: string };
+}
+
+type LiveEventHandler<T extends Record<string, unknown>> = (event: LuxProjectLiveEvent<T>) => void;
+
+interface LiveSubscriptionRecord {
+	id: string;
+	spec: Record<string, unknown>;
+	handler: (event: unknown) => void;
+	error: (error: { code?: string; message?: string }) => void;
+}
+
 export class LuxProjectClient {
 	readonly url: string;
 	readonly key: string;
 	readonly auth: LuxAuthClient;
 	private fetchImpl: typeof fetch;
+	private WebSocketImpl?: typeof WebSocket;
+	private liveSocket: WebSocket | null = null;
+	private liveSubscriptions = new Map<string, LiveSubscriptionRecord>();
+	private livePending: string[] = [];
 
 	constructor(options: LuxProjectOptions) {
 		this.url = options.url.replace(/\/+$/, '');
 		this.key = options.key;
 		this.fetchImpl = resolveFetch(options.fetch);
+		this.WebSocketImpl = options.websocket;
 		this.auth = new LuxAuthClient({
 			...options.auth,
 			httpUrl: this.url,
@@ -134,6 +163,108 @@ export class LuxProjectClient {
 			return err('LUX_PROJECT_REQUEST_ERROR', 'Lux request failed', toLuxError(error));
 		}
 	}
+
+	async _subscribeLive(
+		spec: Record<string, unknown>,
+		handler: (event: unknown) => void,
+		error: (error: { code?: string; message?: string }) => void,
+	): Promise<() => void> {
+		const id = `sub_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;
+		const record: LiveSubscriptionRecord = { id, spec, handler, error };
+		this.liveSubscriptions.set(id, record);
+		await this.ensureLiveSocket();
+		this.sendLive({
+			type: 'live.subscribe',
+			id,
+			spec,
+		});
+		return () => {
+			this.liveSubscriptions.delete(id);
+			this.sendLive({ type: 'live.unsubscribe', id });
+			if (this.liveSubscriptions.size === 0) {
+				this.liveSocket?.close();
+				this.liveSocket = null;
+			}
+		};
+	}
+
+	private async ensureLiveSocket(): Promise<void> {
+		const WebSocketImpl = resolveWebSocket(this.WebSocketImpl);
+		this.WebSocketImpl = WebSocketImpl;
+		if (
+			this.liveSocket &&
+			(this.liveSocket.readyState === WebSocketImpl.OPEN ||
+				this.liveSocket.readyState === WebSocketImpl.CONNECTING)
+		) {
+			return;
+		}
+
+		const accessToken = await this.auth.getAccessToken();
+		const url = new URL(`${this.url}/live`);
+		url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+		url.searchParams.set('apikey', this.key);
+		if (accessToken) url.searchParams.set('access_token', accessToken);
+
+		const socket = new WebSocketImpl(url.toString());
+		this.liveSocket = socket;
+
+		socket.onopen = () => {
+			for (const message of this.livePending.splice(0)) socket.send(message);
+		};
+
+		socket.onmessage = (event) => {
+			let message: any;
+			try {
+				message = JSON.parse(String(event.data));
+			} catch {
+				return;
+			}
+
+			const subscription = typeof message.id === 'string' ? this.liveSubscriptions.get(message.id) : null;
+			if (message.type === 'live.event' && subscription) {
+				subscription.handler(message.event);
+				return;
+			}
+			if (message.type === 'live.error') {
+				const target = subscription ? [subscription] : [...this.liveSubscriptions.values()];
+				for (const sub of target) {
+					sub.error(message.error || { code: 'LIVE_ERROR', message: 'Live subscription failed' });
+				}
+			}
+		};
+
+		socket.onerror = () => {
+			for (const subscription of this.liveSubscriptions.values()) {
+				subscription.error({ code: 'LIVE_SOCKET_ERROR', message: 'Live socket failed' });
+			}
+		};
+
+		socket.onclose = () => {
+			if (this.liveSocket === socket) this.liveSocket = null;
+			if (this.liveSubscriptions.size > 0) {
+				for (const subscription of this.liveSubscriptions.values()) {
+					this.livePending.push(JSON.stringify({
+						type: 'live.subscribe',
+						id: subscription.id,
+						spec: subscription.spec,
+					}));
+				}
+				setTimeout(() => {
+					void this.ensureLiveSocket();
+				}, 1000);
+			}
+		};
+	}
+
+	private sendLive(message: Record<string, unknown>): void {
+		const payload = JSON.stringify(message);
+		const WebSocketImpl = this.WebSocketImpl;
+		if (WebSocketImpl && this.liveSocket?.readyState === WebSocketImpl.OPEN) {
+			this.liveSocket.send(payload);
+			return;
+		}
+		this.livePending.push(payload);
+	}
 }
 
 export class LuxProjectTable<T extends Record<string, unknown>> {
@@ -141,6 +272,38 @@ export class LuxProjectTable<T extends Record<string, unknown>> {
 
 	select(columns = '*'): LuxProjectSelectBuilder<T, T[]> {
 		return new LuxProjectSelectBuilder<T, T[]>(this.client, this.name, columns);
+	}
+
+	eq(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().eq(column, value);
+	}
+
+	neq(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().neq(column, value);
+	}
+
+	gt(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().gt(column, value);
+	}
+
+	gte(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().gte(column, value);
+	}
+
+	lt(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().lt(column, value);
+	}
+
+	lte(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().lte(column, value);
+	}
+
+	is(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().is(column, value);
+	}
+
+	live(): LuxProjectLiveSubscription<T> {
+		return this.select().live();
 	}
 
 	insert(row: Partial<T> & Record<string, QueryValue>): LuxProjectInsertBuilder<unknown>;
@@ -297,6 +460,125 @@ export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult>
 		}
 		return ok(rows[0] as unknown as TResult);
 	}
+
+	live(): LuxProjectLiveSubscription<T> {
+		return new LuxProjectLiveSubscription<T>(
+			this.client,
+			this.tableName,
+			this.columns,
+			this.filters,
+			this.orderBy,
+			this.limitCount,
+			this.offsetCount,
+		);
+	}
+}
+
+export class LuxProjectLiveSubscription<T extends Record<string, unknown>> {
+	private handlers: Record<LuxProjectLiveEventType | 'change', Array<LiveEventHandler<T>>> = {
+		snapshot: [],
+		insert: [],
+		update: [],
+		delete: [],
+		error: [],
+		change: [],
+	};
+	private unsubscribeFn: (() => void) | null = null;
+
+	constructor(
+		private client: LuxProjectClient,
+		private table: string,
+		private columns: string,
+		private filters: QueryFilter[],
+		private orderBy?: QueryOrder,
+		private limitCount?: number,
+		private offsetCount?: number,
+	) {
+		void this.start();
+	}
+
+	on(type: LuxProjectLiveEventType | 'change', handler: LiveEventHandler<T>): this {
+		this.handlers[type].push(handler);
+		return this;
+	}
+
+	async unsubscribe(): Promise<void> {
+		this.unsubscribeFn?.();
+		this.unsubscribeFn = null;
+	}
+
+	private async start(): Promise<void> {
+		this.unsubscribeFn = await this.client._subscribeLive(
+			this.spec(),
+			(event) => this.handleEvent(event),
+			(error) => this.emit({
+				type: 'error',
+				table: this.table,
+				new: null,
+				old: null,
+				error,
+			}),
+		);
+	}
+
+	private spec(): Record<string, unknown> {
+		const spec: Record<string, unknown> = {
+			kind: 'table',
+			table: this.table,
+			select: this.columns,
+		};
+		if (this.filters.length) {
+			spec.where = this.filters.map((filter) => ({
+				field: filter.column,
+				op: filterOperatorToWhere(filter.operator),
+				value: filter.value,
+			}));
+		}
+		if (this.orderBy) {
+			spec.orderBy = {
+				field: this.orderBy.column,
+				dir: this.orderBy.ascending ? 'asc' : 'desc',
+			};
+		}
+		if (this.limitCount != null) spec.limit = this.limitCount;
+		if (this.offsetCount != null) spec.offset = this.offsetCount;
+		return spec;
+	}
+
+	private handleEvent(raw: unknown): void {
+		if (!raw || typeof raw !== 'object') return;
+		const event = raw as Record<string, any>;
+		if (event.kind === 'snapshot') {
+			this.emit({
+				type: 'snapshot',
+				table: this.table,
+				new: null,
+				old: null,
+				rows: Array.isArray(event.rows) ? event.rows : [],
+				raw,
+			});
+			return;
+		}
+
+		if (event.kind === 'insert' || event.kind === 'update' || event.kind === 'delete') {
+			this.emit({
+				type: event.kind,
+				table: this.table,
+				pk: event.pk == null ? undefined : String(event.pk),
+				new: event.row ?? null,
+				old: event.previous ?? null,
+				changed: Array.isArray(event.changed) ? event.changed : undefined,
+				raw,
+			});
+		}
+	}
+
+	private emit(event: LuxProjectLiveEvent<T>): void {
+		for (const handler of this.handlers[event.type]) handler(event);
+		if (event.type !== 'snapshot' && event.type !== 'error') {
+			for (const handler of this.handlers.change) handler(event);
+		}
+	}
 }
 
 export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult> {
@@ -415,6 +697,14 @@ function resolveFetch(fetchImpl?: typeof fetch): typeof fetch {
 	}
 	if (typeof globalThis !== 'undefined' && candidate === globalThis.fetch) {
 		return candidate.bind(globalThis) as typeof fetch;
+	}
+	return candidate;
+}
+
+function resolveWebSocket(websocketImpl?: typeof WebSocket): typeof WebSocket {
+	const candidate = websocketImpl ?? globalThis.WebSocket;
+	if (!candidate) {
+		throw new Error('Lux project live subscriptions require a WebSocket implementation');
 	}
 	return candidate;
 }

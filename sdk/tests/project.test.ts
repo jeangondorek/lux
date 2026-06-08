@@ -323,4 +323,117 @@ describe('Lux project client', () => {
 		expect(calls[3].headers.apikey).toBe('lux_pub_test');
 		expect(calls[3].headers.Authorization).toBe('Bearer user-jwt');
 	});
+
+	test('table live subscriptions use the project live websocket', async () => {
+		const sockets: FakeWebSocket[] = [];
+		class FakeWebSocket {
+			static CONNECTING = 0;
+			static OPEN = 1;
+			static CLOSING = 2;
+			static CLOSED = 3;
+			readonly url: string;
+			readyState = FakeWebSocket.CONNECTING;
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			onerror: (() => void) | null = null;
+			onclose: (() => void) | null = null;
+			sent: string[] = [];
+
+			constructor(url: string) {
+				this.url = url;
+				sockets.push(this);
+			}
+
+			send(message: string) {
+				this.sent.push(message);
+			}
+
+			close() {
+				this.readyState = FakeWebSocket.CLOSED;
+				this.onclose?.();
+			}
+
+			open() {
+				this.readyState = FakeWebSocket.OPEN;
+				this.onopen?.();
+			}
+
+			emit(message: unknown) {
+				this.onmessage?.({ data: JSON.stringify(message) });
+			}
+		}
+
+		const client = createClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			websocket: FakeWebSocket as unknown as typeof WebSocket,
+			auth: { persistSession: false, autoRefreshToken: false },
+		});
+		await client.auth.setSession({
+			access_token: 'user-jwt',
+			refresh_token: 'refresh',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_1', email: 'user@example.com' },
+		});
+
+		const events: unknown[] = [];
+		const sub = client
+			.table<{ id: number; channel_id: string; body: string }>('messages')
+			.eq('channel_id', 'room-1')
+			.live()
+			.on('snapshot', (event) => events.push(event))
+			.on('insert', (event) => events.push(event));
+
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(sockets).toHaveLength(1);
+		expect(sockets[0].url).toBe(
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+		);
+
+		sockets[0].open();
+		expect(JSON.parse(sockets[0].sent[0])).toEqual({
+			type: 'live.subscribe',
+			id: expect.any(String),
+			spec: {
+				kind: 'table',
+				table: 'messages',
+				select: '*',
+				where: [{ field: 'channel_id', op: '=', value: 'room-1' }],
+			},
+		});
+
+		const id = JSON.parse(sockets[0].sent[0]).id;
+		sockets[0].emit({
+			type: 'live.event',
+			id,
+			event: { kind: 'snapshot', rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }] },
+		});
+		sockets[0].emit({
+			type: 'live.event',
+			id,
+			event: { kind: 'insert', pk: '2', row: { id: 2, channel_id: 'room-1', body: 'live' }, previous: null },
+		});
+
+		expect(events).toEqual([
+			{
+				type: 'snapshot',
+				table: 'messages',
+				new: null,
+				old: null,
+				rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }],
+				raw: { kind: 'snapshot', rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }] },
+			},
+			{
+				type: 'insert',
+				table: 'messages',
+				pk: '2',
+				new: { id: 2, channel_id: 'room-1', body: 'live' },
+				old: null,
+				changed: undefined,
+				raw: { kind: 'insert', pk: '2', row: { id: 2, channel_id: 'room-1', body: 'live' }, previous: null },
+			},
+		]);
+
+		await sub.unsubscribe();
+		expect(JSON.parse(sockets[0].sent[1])).toEqual({ type: 'live.unsubscribe', id });
+	});
 });

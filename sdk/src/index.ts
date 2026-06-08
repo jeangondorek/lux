@@ -39,6 +39,8 @@ export type { LuxBrowserClientOptions } from './browser';
 export { createServerClient } from './ssr';
 export type { LuxCookieMethods, LuxCookieOptions, LuxServerClientOptions } from './ssr';
 export type {
+	LuxProjectLiveEvent,
+	LuxProjectLiveEventType,
 	LuxProjectOptions,
 	LuxTableColumn,
 	LuxVectorSearchOptions,

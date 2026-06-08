@@ -62,6 +62,31 @@ const { data: deleted, error: deleteError } = await lux
   .eq("id", inserted?.id);
 ```
 
+## Live tables
+
+Browser clients can subscribe to table queries over Lux Live. The SDK opens a WebSocket to the project live endpoint, and Lux core sends a snapshot followed by insert/update/delete events for rows matching the query.
+
+```ts
+const sub = lux
+  .table<{ id: string; channel_id: string; body: string }>("messages")
+  .eq("channel_id", "general")
+  .live()
+  .on("snapshot", (event) => {
+    console.log(event.rows);
+  })
+  .on("insert", (event) => {
+    console.log(event.new);
+  })
+  .on("update", (event) => {
+    console.log(event.old, event.new);
+  })
+  .on("delete", (event) => {
+    console.log(event.old);
+  });
+
+await sub.unsubscribe();
+```
+
 ## OAuth
 
 ```ts
@@ -129,4 +154,5 @@ const value = await lux.get("hello");
 - `lux_pub_...` keys are safe for browser app calls.
 - `lux_sec_...` keys are server-only.
 - User sessions issue JWT access tokens.
+- Browser live subscriptions use the project publishable key plus the signed-in user's JWT.
 - Direct `lux://` or `rediss://` database access uses the database password and is for trusted infrastructure.
