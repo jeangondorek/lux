@@ -1407,6 +1407,9 @@ fn fetch_live_table_rows(
     }
     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
     let plan = crate::tables::parse_select(&refs).map_err(|e| live_error("TSELECT_ERROR", &e))?;
+    if let Some(err) = crate::auth::reserved_plan_access_error(&plan) {
+        return Err(live_error("FORBIDDEN", &err));
+    }
     match crate::tables::table_select(store, cache, &plan, Instant::now())
         .map_err(|e| live_error("TSELECT_ERROR", &e))?
     {
@@ -1610,6 +1613,7 @@ fn changed_json_fields(previous: &Value, next: &Value) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug)]
 struct HttpTableQueryParams {
     has_where: bool,
     where_tokens: Vec<String>,
@@ -1816,6 +1820,9 @@ fn parse_http_table_query(
 
     let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
     let plan = crate::tables::parse_select(&refs)?;
+    if let Some(err) = crate::auth::reserved_plan_access_error(&plan) {
+        return Err(err);
+    }
     Ok((
         HttpTableQueryParams {
             has_where,
@@ -3098,6 +3105,30 @@ mod tests {
         assert_eq!(plan.joins[0].left_col, "user_id");
         assert_eq!(plan.joins[0].right_col, "u.id");
         assert_eq!(plan.limit, Some(25));
+    }
+
+    #[test]
+    fn parse_http_table_query_rejects_reserved_base_table() {
+        let err = parse_http_table_query(&[], "auth.users", None).unwrap_err();
+        assert!(
+            err.contains("Lux Auth"),
+            "expected auth rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_http_table_query_rejects_join_onto_auth_tables() {
+        // A join onto a Lux Auth managed table must be refused so a caller can't
+        // pull auth.users columns (e.g. encrypted_password) through the join.
+        let params = vec![(
+            "join".to_string(),
+            "auth.users:u:on(user_id=id)".to_string(),
+        )];
+        let err = parse_http_table_query(&params, "orders", None).unwrap_err();
+        assert!(
+            err.contains("Lux Auth"),
+            "expected auth rejection, got: {err}"
+        );
     }
 
     #[test]

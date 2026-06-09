@@ -330,7 +330,7 @@ pub fn cmd_tselect(
             return CmdResult::Written;
         }
     };
-    if let Some(err) = crate::auth::reserved_table_access_error(&plan.table) {
+    if let Some(err) = crate::auth::reserved_plan_access_error(&plan) {
         resp::write_error(out, &err);
         return CmdResult::Written;
     }

@@ -116,7 +116,26 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
     }
 }
 
-pub(crate) fn reserved_table_access_error(_table: &str) -> Option<String> {
+pub(crate) fn reserved_table_access_error(table: &str) -> Option<String> {
+    if is_reserved_auth_table(table) {
+        Some(reserved_table_error(table))
+    } else {
+        None
+    }
+}
+
+/// Reject a read whose base table or any joined table is Lux Auth managed.
+/// The base-table guard alone leaves a bypass: `TSELECT ... FROM posts JOIN
+/// auth.users ...` could project `encrypted_password` through the join.
+pub(crate) fn reserved_plan_access_error(plan: &SelectPlan) -> Option<String> {
+    if let Some(err) = reserved_table_access_error(&plan.table) {
+        return Some(err);
+    }
+    for join in &plan.joins {
+        if let Some(err) = reserved_table_access_error(&join.table) {
+            return Some(err);
+        }
+    }
     None
 }
 
@@ -2734,23 +2753,29 @@ mod tests {
     }
 
     #[test]
-    fn reserved_auth_tables_are_readable_from_generic_table_reads() {
+    fn reserved_auth_tables_are_blocked_from_generic_table_reads() {
         let store = Store::new();
         let cache = Arc::new(RwLock::new(SchemaCache::new()));
         bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
 
-        let mut out = bytes::BytesMut::new();
-        crate::cmd::execute(
-            &store,
-            &cache,
-            &crate::pubsub::Broker::new(),
-            &[b"TSCHEMA", b"auth.users"],
-            &mut out,
-            Instant::now(),
-        );
-        let response = std::str::from_utf8(&out).unwrap();
-        assert!(response.starts_with('*'), "{response}");
-        assert!(response.contains("email"), "{response}");
+        let broker = crate::pubsub::Broker::new();
+        // Both schema introspection and row reads of auth.* via the generic
+        // table commands must be refused; clients use /auth/v1 instead.
+        for cmd in [
+            &[b"TSCHEMA".as_ref(), b"auth.users".as_ref()][..],
+            &[
+                b"TSELECT".as_ref(),
+                b"*".as_ref(),
+                b"FROM".as_ref(),
+                b"auth.users".as_ref(),
+            ][..],
+        ] {
+            let mut out = bytes::BytesMut::new();
+            crate::cmd::execute(&store, &cache, &broker, cmd, &mut out, Instant::now());
+            let response = std::str::from_utf8(&out).unwrap();
+            assert!(response.starts_with("-ERR"), "{response}");
+            assert!(response.contains("managed by Lux Auth"), "{response}");
+        }
     }
 
     #[test]

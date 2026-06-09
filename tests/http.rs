@@ -369,8 +369,14 @@ fn http_auth_signup_login_user_logout_and_admin_routes() {
         None,
         Some("rootsecret"),
     );
-    assert_eq!(status, 200, "auth tables should be readable: {table_body}");
-    assert!(table_body.contains("http-auth@example.com"), "{table_body}");
+    assert_eq!(
+        status, 403,
+        "auth tables must not be readable via the table API: {table_body}"
+    );
+    assert!(
+        !table_body.contains("http-auth@example.com"),
+        "auth.users rows must not leak through the table API: {table_body}"
+    );
 
     let (status, logout_body) = http_request(
         17703,
@@ -1369,5 +1375,29 @@ fn http_tables_constraint_errors() {
     assert!(
         resp.contains("0") || resp.contains("result"),
         "delete no match should return 0: {resp}"
+    );
+}
+
+#[test]
+fn http_auth_tables_blocked_from_table_api() {
+    let _server = start_lux(17720, 17721, "secret");
+
+    // Direct read of a Lux Auth managed table is refused even for the operator:
+    // the secret bypasses capability checks but not the reserved-table guard.
+    let (status, body) = http_request(17721, "GET", "/v1/tables/auth.users", None, Some("secret"));
+    assert_eq!(status, 403, "auth.users direct read: {status} {body}");
+    assert!(body.contains("Lux Auth"), "auth.users error body: {body}");
+
+    // The same table is unreachable through the exec escape hatch via TSELECT.
+    let (_status, body) = http_request(
+        17721,
+        "POST",
+        "/v1/exec",
+        Some(r#"{"command":["TSELECT","*","FROM","auth.users"]}"#),
+        Some("secret"),
+    );
+    assert!(
+        body.contains("Lux Auth"),
+        "exec TSELECT auth.users body: {body}"
     );
 }
