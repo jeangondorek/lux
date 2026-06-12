@@ -3,26 +3,41 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
 use std::time::Duration;
 
-fn start_server(port: u16) -> Child {
-    let data_dir = std::env::temp_dir().join(format!(
-        "lux-test-{}-{}-{}",
-        std::process::id(),
-        port,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock should be after epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&data_dir).expect("create unique test data dir");
+fn start_server() -> (u16, Child) {
+    // Allocate a port and bring the server up, retrying on a fresh port if the
+    // bind loses a race to another parallel test binary. alloc_port drops its
+    // listener before lux rebinds the port, so under full-suite concurrency a
+    // sibling can steal it in the gap -- the classic ephemeral-port TOCTOU.
+    for _ in 0..10 {
+        let port = alloc_port();
+        let data_dir = std::env::temp_dir().join(format!(
+            "lux-test-{}-{}-{}",
+            std::process::id(),
+            port,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("create unique test data dir");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_lux"))
-        .env("LUX_PORT", port.to_string())
-        .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_DATA_DIR", data_dir)
-        .spawn()
-        .expect("failed to start lux");
-    wait_for_port(port);
-    child
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lux"))
+            .env("LUX_PORT", port.to_string())
+            .env("LUX_SAVE_INTERVAL", "0")
+            .env("LUX_DATA_DIR", &data_dir)
+            .spawn()
+            .expect("failed to start lux");
+
+        if server_ready(port, &mut child) {
+            return (port, child);
+        }
+
+        // Lost the port race (lux exited on bind) -- clean up and retry.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+    panic!("server did not start after 10 attempts");
 }
 
 fn alloc_port() -> u16 {
@@ -33,14 +48,30 @@ fn alloc_port() -> u16 {
         .port()
 }
 
-fn wait_for_port(port: u16) {
+/// Wait until the server answers PING on `port`, or the child exits (failed to
+/// bind). Confirming PONG proves we reached *our* lux, not whatever process won
+/// the port race.
+fn server_ready(port: u16, child: &mut Child) -> bool {
     for _ in 0..60 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return;
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .ok();
+            if stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
+                let mut buf = [0u8; 16];
+                if let Ok(n) = stream.read(&mut buf) {
+                    if buf[..n].windows(4).any(|w| w == b"PONG") {
+                        return true;
+                    }
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("server did not start on port {port}");
+    false
 }
 
 fn send(stream: &mut TcpStream, args: &[&str]) -> String {
@@ -87,8 +118,7 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> String {
 
 #[test]
 fn tcreate_and_tschema() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -119,8 +149,7 @@ fn tcreate_and_tschema() {
 
 #[test]
 fn tinsert_and_tselect() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -152,8 +181,7 @@ fn tinsert_and_tselect() {
 
 #[test]
 fn tinsert_auto_increment() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -174,8 +202,7 @@ fn tinsert_auto_increment() {
 
 #[test]
 fn unique_constraint_violation() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -194,8 +221,7 @@ fn unique_constraint_violation() {
 
 #[test]
 fn foreign_key_validation() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -231,8 +257,7 @@ fn foreign_key_validation() {
 
 #[test]
 fn tselect_where_equality_and_range() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -269,8 +294,7 @@ fn tselect_where_equality_and_range() {
 
 #[test]
 fn tselect_order_by_and_limit() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -308,8 +332,7 @@ fn tselect_order_by_and_limit() {
 
 #[test]
 fn tselect_with_join() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -366,8 +389,7 @@ fn tselect_with_join() {
 
 #[test]
 fn tselect_near_vector_field() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -462,8 +484,7 @@ fn tselect_near_vector_field() {
 
 #[test]
 fn tupdate_where() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -520,8 +541,7 @@ fn tupdate_where() {
 
 #[test]
 fn tdelete_with_fk_check() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -577,8 +597,7 @@ fn tdelete_with_fk_check() {
 
 #[test]
 fn tdrop_table() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -604,8 +623,7 @@ fn tdrop_table() {
 
 #[test]
 fn tcount_rows() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -626,8 +644,7 @@ fn tcount_rows() {
 
 #[test]
 fn tlist_tables() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -647,8 +664,7 @@ fn tlist_tables() {
 
 #[test]
 fn type_validation() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -672,8 +688,7 @@ fn type_validation() {
 
 #[test]
 fn talter_add_column_backfill() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -718,8 +733,7 @@ fn talter_add_column_backfill() {
 
 #[test]
 fn on_delete_cascade() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -774,8 +788,7 @@ fn on_delete_cascade() {
 
 #[test]
 fn on_delete_set_null() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -831,8 +844,7 @@ fn on_delete_set_null() {
 
 #[test]
 fn talter_drop_column() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -906,8 +918,7 @@ fn talter_drop_column() {
 
 #[test]
 fn talter_cache_consistency() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -999,8 +1010,7 @@ fn talter_cache_consistency() {
 
 #[test]
 fn tupdate_unique_constraint() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -1084,8 +1094,7 @@ fn tupdate_unique_constraint() {
 
 #[test]
 fn tdelete_tupdate_no_matches() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -1118,8 +1127,7 @@ fn tdelete_tupdate_no_matches() {
 
 #[test]
 fn tselect_comparison_operators() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -1178,8 +1186,7 @@ fn tselect_comparison_operators() {
 
 #[test]
 fn tselect_offset_without_limit() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -1213,8 +1220,7 @@ fn tselect_offset_without_limit() {
 
 #[test]
 fn tselect_error_cases() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -1276,8 +1282,7 @@ fn tselect_error_cases() {
 
 #[test]
 fn tselect_aggregates_integration() {
-    let port = alloc_port();
-    let mut child = start_server(port);
+    let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
