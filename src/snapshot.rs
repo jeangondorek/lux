@@ -99,6 +99,39 @@ pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
     Ok(snapshot_path(store))
 }
 
+/// Lay a restored snapshot down on disk: write `dump` as lux.dat and remove the
+/// per-shard WAL + tiered data dirs so a restart reloads purely from the dump,
+/// with no stale WAL replaying post-snapshot writes over it. The caller restarts
+/// the process so the standard startup load reconstructs state from the dump.
+/// Used by `POST /v1/restore`.
+pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
+    if dump.len() < 4 || (&dump[..4] != HEADER && &dump[..4] != HEADER_V1) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "restore payload is not a lux snapshot",
+        ));
+    }
+
+    let path = snapshot_path(store);
+    if let Some(parent) = Path::new(&path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = format!("{path}.restore.{}.tmp", std::process::id());
+    {
+        let file = fs::File::create(&tmp)?;
+        let mut w = BufWriter::new(file);
+        w.write_all(dump)?;
+        w.into_inner().map_err(io::Error::other)?.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+
+    // Drop the tiered storage tree (per-shard WAL + cold data) so startup loads
+    // only lux.dat, with no WAL replaying post-snapshot writes over the restore.
+    let storage_dir = store.config().storage.dir.clone();
+    let _ = fs::remove_dir_all(Path::new(&storage_dir));
+    Ok(())
+}
+
 fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::Result<()> {
     w.write_all(HEADER)?;
     for entry in entries {

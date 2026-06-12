@@ -272,6 +272,36 @@ async fn handle_request(
     // Fast path: table GET queries stream JSON directly without building
     // the full response string in memory first.
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    // Full-instance restore. The raw request body is a lux.dat dump; read it
+    // straight from the buffer to avoid the lossy String conversion. Operator-
+    // only. On success the process exits so the container restart reloads from
+    // the restored dump via the standard startup path.
+    if method == "POST" && matches!(segments.as_slice(), ["v1", "restore"] | ["restore"]) {
+        let password_set = !store.config().password.is_empty();
+        if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
+            let body = r#"{"error":"restore requires operator credentials"}"#;
+            return send_json(socket, 403, "Forbidden", body).await;
+        }
+        let end = (header_end + content_length).min(data.len());
+        let dump = &data[header_end..end];
+        match crate::snapshot::restore_to_disk(store, dump) {
+            Ok(()) => {
+                let _ = send_json(socket, 200, "OK", r#"{"restored":true}"#).await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                std::process::exit(0);
+            }
+            Err(e) => {
+                let body = format!(
+                    r#"{{"error":"restore failed: {}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json(socket, 500, "Internal Server Error", &body).await;
+            }
+        }
+    }
+
     if method == "GET" {
         match segments.as_slice() {
             ["v1", "snapshot"] | ["snapshot"] => {

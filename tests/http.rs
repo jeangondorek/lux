@@ -252,6 +252,30 @@ fn http_snapshot_streams_consistent_dump_for_operator() {
 }
 
 #[test]
+fn http_restore_requires_operator_and_validates_payload() {
+    let _server = start_lux(17752, 17753, "operator-secret");
+
+    // Unauthenticated callers can't restore over another instance's data.
+    let (status, _) = http_request(17753, "POST", "/v1/restore", Some("garbage"), None);
+    assert_eq!(status, 401, "restore must require auth");
+
+    // Operator with a non-snapshot body is rejected before anything is touched
+    // (and crucially before the success path, which exits the process).
+    let (status, body) = http_request(
+        17753,
+        "POST",
+        "/v1/restore",
+        Some("not-a-lux-dump"),
+        Some("operator-secret"),
+    );
+    assert_eq!(status, 500, "invalid payload rejected: {body}");
+    assert!(
+        body.contains("not a lux snapshot"),
+        "payload validation message: {body}"
+    );
+}
+
+#[test]
 fn http_auth_required() {
     let _server = start_lux(17602, 17603, "secret");
 
