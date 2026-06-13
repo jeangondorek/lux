@@ -1397,6 +1397,22 @@ pub fn execute(
         return server::cmd_auth(args, store, out, now);
     }
 
+    // Reserve the internal table-storage namespace ("_t:") from direct command
+    // access. Table + Lux Auth data lives under `_t:<table>:...` keys; the table
+    // API and internal ops reach them through the store directly, never through
+    // command dispatch, so rejecting `_t:` args here closes the raw-KV bypass of
+    // the reserved-table guard without touching tables/auth. (KEYS/SCAN take a
+    // pattern and are filtered in their handlers instead.) Tradeoff: user values
+    // cannot start with the 3-char reserved prefix `_t:`.
+    if !cmd_eq(cmd, b"KEYS") && !cmd_eq(cmd, b"SCAN") {
+        for arg in &args[1..] {
+            if arg.starts_with(b"_t:") {
+                resp::write_error(out, "ERR '_t:' is a reserved internal namespace");
+                return CmdResult::Written;
+            }
+        }
+    }
+
     if (cmd_eq(cmd, b"KEYS")
         || cmd_eq(cmd, b"FLUSHALL")
         || cmd_eq(cmd, b"FLUSHDB")

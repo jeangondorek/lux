@@ -148,6 +148,74 @@ fn tcreate_and_tschema() {
 }
 
 #[test]
+fn internal_table_namespace_is_protected_from_raw_kv() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Create a table + row -> populates internal `_t:acct:*` keys.
+    assert_eq!(send(&mut s, &["TCREATE", "acct", "name STR"]), "+OK");
+    let r = send(&mut s, &["TINSERT", "acct", "name", "alice"]);
+    assert!(!r.starts_with('-'), "tinsert should succeed: {}", r);
+
+    // Enumeration must not leak the internal namespace.
+    let keys = send(&mut s, &["KEYS", "*"]);
+    assert!(!keys.contains("_t:"), "KEYS leaked internal keys: {}", keys);
+    let keys = send(&mut s, &["KEYS", "_t:*"]);
+    assert!(!keys.contains("_t:"), "KEYS _t:* leaked: {}", keys);
+
+    // Raw KV read/write/delete of `_t:` keys is rejected (the bypass we closed).
+    for cmd in [
+        vec!["GET", "_t:acct:seq"],
+        vec!["HGETALL", "_t:acct:schema"],
+        vec!["HSET", "_t:acct:row:x", "f", "v"],
+        vec!["DEL", "_t:acct:seq"],
+    ] {
+        let r = send(&mut s, &cmd);
+        assert!(
+            r.contains("reserved internal namespace"),
+            "{:?} should be rejected, got: {}",
+            cmd,
+            r
+        );
+    }
+
+    // The table API still works (it reaches `_t:` via the store, not commands).
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "acct"]);
+    assert!(
+        r.contains("alice"),
+        "table API should still read the row: {}",
+        r
+    );
+
+    // Pipelined attack: a forbidden read + a normal write in one send. The fast
+    // batch path used to slip `_t:` reads through; the first must be rejected,
+    // the second must still run, and order must be preserved.
+    let mut p = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    p.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    p.write_all(
+        b"*2\r\n$3\r\nGET\r\n$11\r\n_t:acct:seq\r\n*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$1\r\nv\r\n",
+    )
+    .unwrap();
+    let mut pr = BufReader::new(p.try_clone().unwrap());
+    let r1 = read_response(&mut pr);
+    let r2 = read_response(&mut pr);
+    assert!(
+        r1.starts_with('-') && r1.contains("reserved"),
+        "pipelined _t: read should be rejected: {}",
+        r1
+    );
+    assert!(
+        r2.contains("OK"),
+        "pipelined normal write should run: {}",
+        r2
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
 fn tinsert_and_tselect() {
     let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();

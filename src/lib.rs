@@ -3401,6 +3401,20 @@ impl CommandExecutor {
             return None;
         }
 
+        // Reserve the internal table-storage namespace ("_t:") from direct command
+        // access. This is the universal entry for both the read fast-path below
+        // and the slow path (cmd::execute), so the guard must live here -- the
+        // cmd::execute guard alone misses fast-path reads like GET. KEYS/SCAN take
+        // a pattern and are filtered in their handlers instead.
+        if !args[0].eq_ignore_ascii_case(b"KEYS") && !args[0].eq_ignore_ascii_case(b"SCAN") {
+            for arg in &args[1..] {
+                if arg.starts_with(b"_t:") {
+                    resp::write_error(write_buf, "ERR '_t:' is a reserved internal namespace");
+                    return None;
+                }
+            }
+        }
+
         if handle_tx_cmd(
             args,
             &mut session.in_multi,
@@ -3494,6 +3508,16 @@ impl CommandExecutor {
             if cmd::is_pipeline_special_command(cmd) {
                 has_special = true;
                 break;
+            }
+            // Force commands touching the reserved "_t:" namespace onto the slow
+            // path, where cmd::execute's guard rejects them. The fast batch path
+            // below bypasses that guard. KEYS/SCAN take a pattern and are handled
+            // (filtered) on the slow path.
+            if !cmd.eq_ignore_ascii_case(b"KEYS")
+                && !cmd.eq_ignore_ascii_case(b"SCAN")
+                && args[1..].iter().any(|a| a.starts_with(b"_t:"))
+            {
+                all_single_key_rw = false;
             }
             let access = cmd::pipeline_access_for_args(args);
             flags.push(access);
