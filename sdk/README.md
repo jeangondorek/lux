@@ -100,25 +100,38 @@ const { data: deleted, error: deleteError } = await lux
 
 Browser clients can subscribe to table queries over Lux Live. The SDK opens a WebSocket to the project live endpoint, and Lux core sends a snapshot followed by insert/update/delete events for rows matching the query.
 
+`.live()` resolves once the server confirms the subscription, returning the same
+`{ data, error }` shape as the rest of the SDK (here named `{ live, error }`). If
+the query isn't permitted by a read grant, `error` is populated and `live` is
+`null`. The subscription is async-iterable: the buffered snapshot arrives first,
+then live changes.
+
 ```ts
-const sub = lux
+const { live, error } = await lux
   .table<{ id: string; channel_id: string; body: string }>("messages")
   .eq("channel_id", "general")
-  .live()
-  .on("snapshot", (event) => {
-    console.log(event.rows);
-  })
-  .on("insert", (event) => {
-    console.log(event.new);
-  })
-  .on("update", (event) => {
-    console.log(event.old, event.new);
-  })
-  .on("delete", (event) => {
-    console.log(event.old);
-  });
+  .live();
 
-await sub.unsubscribe();
+if (error) throw error;
+
+for await (const event of live) {
+  if (event.type === "snapshot") console.log(event.rows);
+  else console.log(event.type, event.new ?? event.old);
+}
+```
+
+You can also attach callbacks instead of iterating:
+
+```ts
+const { live, error } = await lux.table("messages").eq("channel_id", "general").live();
+if (error) throw error;
+
+live
+  .on("insert", (event) => console.log(event.new))
+  .on("update", (event) => console.log(event.old, event.new))
+  .on("delete", (event) => console.log(event.old));
+
+await live.unsubscribe();
 ```
 
 ## OAuth

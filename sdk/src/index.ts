@@ -44,11 +44,13 @@ export {
 	createProjectClient,
 	LuxProjectClient,
 };
+export { LuxProjectLiveSubscription } from './project';
 export { createBrowserClient } from './browser';
 export type { LuxBrowserClientOptions } from './browser';
 export { createServerClient } from './ssr';
 export type { LuxCookieMethods, LuxCookieOptions, LuxServerClientOptions } from './ssr';
 export type {
+	LuxLiveResult,
 	LuxProjectLiveEvent,
 	LuxProjectLiveEventType,
 	LuxProjectOptions,

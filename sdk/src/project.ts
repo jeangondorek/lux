@@ -1,5 +1,5 @@
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
-import type { LuxResult, LuxTypedRow } from './types';
+import type { LuxError, LuxResult, LuxTypedRow } from './types';
 import { err, ok, toLuxError } from './utils';
 
 export interface LuxProjectOptions {
@@ -91,6 +91,16 @@ export interface LuxProjectLiveEvent<T extends object = Record<string, unknown>>
 }
 
 type LiveEventHandler<T extends object> = (event: LuxProjectLiveEvent<T>) => void;
+
+/**
+ * Result of opening a live subscription, in the same `{ data, error }` spirit as
+ * the rest of the SDK: `live` is the established subscription (or `null` if the
+ * server rejected it), `error` carries the rejection (e.g. a grant `FORBIDDEN`).
+ */
+export interface LuxLiveResult<T extends object> {
+	live: LuxProjectLiveSubscription<T> | null;
+	error: LuxError | null;
+}
 
 interface LiveSubscriptionRecord {
 	id: string;
@@ -341,8 +351,8 @@ export class LuxProjectTable<T extends object> {
 		return this.select().is(column, value);
 	}
 
-	live(): LuxProjectLiveSubscription<T> {
-		return this.select<T>().live() as LuxProjectLiveSubscription<T>;
+	live(): Promise<LuxLiveResult<T>> {
+		return this.select<T>().live() as Promise<LuxLiveResult<T>>;
 	}
 
 	insert(row: ProjectRowInput<T>): LuxProjectInsertBuilder<unknown>;
@@ -574,8 +584,8 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 		return ok(rows[0] as unknown as TResult);
 	}
 
-	live(): LuxProjectLiveSubscription<LuxTypedRow<TResult>> {
-		return new LuxProjectLiveSubscription<LuxTypedRow<TResult>>(
+	async live(): Promise<LuxLiveResult<LuxTypedRow<TResult>>> {
+		const live = new LuxProjectLiveSubscription<LuxTypedRow<TResult>>(
 			this.client,
 			this.tableName,
 			this.columns,
@@ -585,6 +595,12 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 			this.limitCount,
 			this.offsetCount,
 		);
+		const error = await live.start();
+		if (error) {
+			await live.unsubscribe();
+			return { live: null, error };
+		}
+		return { live, error: null };
 	}
 }
 
@@ -598,6 +614,11 @@ export class LuxProjectLiveSubscription<T extends object> {
 		change: [],
 	};
 	private unsubscribeFn: (() => void) | null = null;
+	// Async-iterator plumbing: events buffer in `queue` until a `for await`
+	// consumer pulls them; pending `next()` calls park in `waiters`.
+	private queue: LuxProjectLiveEvent<T>[] = [];
+	private waiters: Array<(r: IteratorResult<LuxProjectLiveEvent<T>>) => void> = [];
+	private closed = false;
 
 	constructor(
 		private client: LuxProjectClient,
@@ -608,9 +629,7 @@ export class LuxProjectLiveSubscription<T extends object> {
 		private orderBy?: QueryOrder,
 		private limitCount?: number,
 		private offsetCount?: number,
-	) {
-		void this.start();
-	}
+	) {}
 
 	on(type: LuxProjectLiveEventType | 'change', handler: LiveEventHandler<T>): this {
 		this.handlers[type].push(handler);
@@ -620,20 +639,80 @@ export class LuxProjectLiveSubscription<T extends object> {
 	async unsubscribe(): Promise<void> {
 		this.unsubscribeFn?.();
 		this.unsubscribeFn = null;
+		this.close();
 	}
 
-	private async start(): Promise<void> {
+	/**
+	 * Open the subscription and wait for the server to confirm it. Resolves
+	 * `null` once the initial snapshot arrives, or a `LuxError` if the
+	 * subscription is rejected (e.g. a grant `FORBIDDEN`) or the socket fails.
+	 * Subsequent errors after a successful start surface via `on('error')` and
+	 * end the async iterator.
+	 */
+	async start(): Promise<LuxError | null> {
+		let settled = false;
+		let settle!: (error: LuxError | null) => void;
+		const ready = new Promise<LuxError | null>((resolve) => {
+			settle = (error) => {
+				if (settled) return;
+				settled = true;
+				resolve(error);
+			};
+		});
+
+		// Safety net: a server that never answers shouldn't hang the caller.
+		const timeout = setTimeout(() => {
+			settle({ code: 'LIVE_TIMEOUT', message: 'Timed out establishing live subscription' });
+		}, 15000);
+
 		this.unsubscribeFn = await this.client._subscribeLive(
 			this.spec(),
-			(event) => this.handleEvent(event),
-			(error) => this.emit({
-				type: 'error',
-				table: this.table,
-				new: null,
-				old: null,
-				error,
-			}),
+			(event) => {
+				const kind = (event as { kind?: string })?.kind;
+				this.handleEvent(event);
+				if (kind === 'snapshot') settle(null);
+			},
+			(error) => {
+				const luxError: LuxError = {
+					code: error.code ?? 'LIVE_ERROR',
+					message: error.message ?? 'Live subscription failed',
+				};
+				if (settled) {
+					// Post-start failure: notify handlers and end the stream.
+					this.emit({ type: 'error', table: this.table, new: null, old: null, error });
+					this.close();
+				} else {
+					settle(luxError);
+				}
+			},
 		);
+
+		const result = await ready;
+		clearTimeout(timeout);
+		return result;
+	}
+
+	[Symbol.asyncIterator](): AsyncIterator<LuxProjectLiveEvent<T>> {
+		return {
+			next: (): Promise<IteratorResult<LuxProjectLiveEvent<T>>> => {
+				const buffered = this.queue.shift();
+				if (buffered) return Promise.resolve({ value: buffered, done: false });
+				if (this.closed) return Promise.resolve({ value: undefined as never, done: true });
+				return new Promise((resolve) => this.waiters.push(resolve));
+			},
+			return: (): Promise<IteratorResult<LuxProjectLiveEvent<T>>> => {
+				void this.unsubscribe();
+				return Promise.resolve({ value: undefined as never, done: true });
+			},
+		};
+	}
+
+	private close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		for (const waiter of this.waiters.splice(0)) {
+			waiter({ value: undefined as never, done: true });
+		}
 	}
 
 	private spec(): Record<string, unknown> {
@@ -701,6 +780,15 @@ export class LuxProjectLiveSubscription<T extends object> {
 		if (event.type !== 'snapshot' && event.type !== 'error') {
 			for (const handler of this.handlers.change) handler(event);
 		}
+		// Feed `for await` consumers the data events (errors end the stream via close()).
+		if (event.type !== 'error') this.pushIterator(event);
+	}
+
+	private pushIterator(event: LuxProjectLiveEvent<T>): void {
+		if (this.closed) return;
+		const waiter = this.waiters.shift();
+		if (waiter) waiter({ value: event, done: false });
+		else this.queue.push(event);
 	}
 }
 

@@ -384,14 +384,13 @@ describe('Lux project client', () => {
 			user: { id: 'usr_1', email: 'user@example.com' },
 		});
 
-		const events: unknown[] = [];
-		const sub = client
+		// `.live()` is async: it resolves once the server confirms the
+		// subscription (initial snapshot). Drive the socket before awaiting.
+		const livePromise = client
 			.table<{ id: number; channel_id: string; body: string }>('messages')
 			.eq('channel_id', 'room-1')
 			.near('embedding', [1, 0], { k: 3, threshold: 0.75 })
-			.live()
-			.on('snapshot', (event) => events.push(event))
-			.on('insert', (event) => events.push(event));
+			.live();
 
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sockets).toHaveLength(1);
@@ -418,21 +417,32 @@ describe('Lux project client', () => {
 			id,
 			event: { kind: 'snapshot', rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }] },
 		});
+
+		const { live, error } = await livePromise;
+		expect(error).toBeNull();
+		expect(live).not.toBeNull();
+
+		// The buffered snapshot is the first iterated event.
+		const iterator = live![Symbol.asyncIterator]();
+		const first = await iterator.next();
+		expect(first.value).toEqual({
+			type: 'snapshot',
+			table: 'messages',
+			new: null,
+			old: null,
+			rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }],
+			raw: { kind: 'snapshot', rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }] },
+		});
+
+		// Live changes after start reach both `.on()` and the iterator.
+		const inserts: unknown[] = [];
+		live!.on('insert', (event) => inserts.push(event));
 		sockets[0].emit({
 			type: 'live.event',
 			id,
 			event: { kind: 'insert', pk: '2', row: { id: 2, channel_id: 'room-1', body: 'live' }, previous: null },
 		});
-
-		expect(events).toEqual([
-			{
-				type: 'snapshot',
-				table: 'messages',
-				new: null,
-				old: null,
-				rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }],
-				raw: { kind: 'snapshot', rows: [{ id: 1, channel_id: 'room-1', body: 'hello' }] },
-			},
+		expect(inserts).toEqual([
 			{
 				type: 'insert',
 				table: 'messages',
@@ -444,7 +454,67 @@ describe('Lux project client', () => {
 			},
 		]);
 
-		await sub.unsubscribe();
+		await live!.unsubscribe();
 		expect(JSON.parse(sockets[0].sent[1])).toEqual({ type: 'live.unsubscribe', id });
+	});
+
+	test('live() surfaces a rejected subscription as { error }', async () => {
+		const sockets: any[] = [];
+		class FakeWebSocket {
+			static OPEN = 1;
+			static CONNECTING = 0;
+			readyState = FakeWebSocket.CONNECTING;
+			sent: string[] = [];
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			onerror: (() => void) | null = null;
+			onclose: (() => void) | null = null;
+			constructor(public url: string) {
+				sockets.push(this);
+			}
+			send(data: string) {
+				this.sent.push(data);
+			}
+			close() {
+				this.readyState = 3;
+			}
+			open() {
+				this.readyState = FakeWebSocket.OPEN;
+				this.onopen?.();
+			}
+			emit(message: unknown) {
+				this.onmessage?.({ data: JSON.stringify(message) });
+			}
+		}
+
+		const client = createClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			websocket: FakeWebSocket as unknown as typeof WebSocket,
+			auth: { persistSession: false, autoRefreshToken: false },
+		});
+		await client.auth.setSession({
+			access_token: 'user-jwt',
+			refresh_token: 'refresh',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_1', email: 'user@example.com' },
+		});
+
+		const livePromise = client.table('messages').live();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		sockets[0].open();
+		const id = JSON.parse(sockets[0].sent[0]).id;
+		// Server rejects the subscription (e.g. the read grant isn't satisfied).
+		sockets[0].emit({
+			type: 'live.error',
+			id,
+			error: { code: 'FORBIDDEN', message: 'query not permitted by read grant on \'messages\'' },
+		});
+
+		const { live, error } = await livePromise;
+		expect(live).toBeNull();
+		expect(error).toEqual({
+			code: 'FORBIDDEN',
+			message: "query not permitted by read grant on 'messages'",
+		});
 	});
 });
