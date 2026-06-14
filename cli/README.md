@@ -105,6 +105,11 @@ lux migrate run                               # local instance
 lux migrate run my-app                        # cloud project
 lux migrate run lux://:pass@myhost:6379       # connection string
 lux migrate run --host 10.0.0.5 --port 6379   # specific host
+
+# Pull migrations recorded on the target into the local directory
+# (e.g. ones authored in the Lux Cloud dashboard)
+lux migrate pull my-app                       # cloud project
+lux migrate pull --host 10.0.0.5 --port 6379  # specific host
 ```
 
 Migration files contain Lux commands (one per line). Lines starting with `#` or `--` are comments. Commands can be written as shell-like strings:
@@ -120,7 +125,10 @@ For commands with complex quoted values, use JSON argv arrays:
 ["TINSERT", "posts", "id", "post_1", "body", "hello world"]
 ```
 
-Applied migrations are tracked in a `__migrations` table on your project.
+Applied migrations are tracked in a `__migrations` table on your project, which
+also stores each migration's source so `lux migrate pull` can recreate the files
+on another machine. Pull never overwrites a local file that differs from the
+recorded version; it warns and keeps your copy.
 
 ## Seeds
 

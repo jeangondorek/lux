@@ -3,7 +3,7 @@ use colored::Colorize;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -140,6 +140,20 @@ enum MigrateAction {
         password: Option<String>,
     },
     Run {
+        #[arg(help = "Project name, ID, or connection URL")]
+        project: Option<String>,
+        #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
+        dir: PathBuf,
+        #[arg(short = 'H', long, help = "Host for direct connection")]
+        host: Option<String>,
+        #[arg(short, long, help = "Port for direct connection")]
+        port: Option<u16>,
+        #[arg(short = 'a', long, help = "Password for direct connection")]
+        password: Option<String>,
+    },
+    /// Fetch migrations recorded on the target into the local migration
+    /// directory (e.g. ones authored in the Lux Cloud dashboard).
+    Pull {
         #[arg(help = "Project name, ID, or connection URL")]
         project: Option<String>,
         #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
@@ -1091,12 +1105,7 @@ pub async fn run() {
                 target
             };
 
-            println!(
-                "{} {}:{}",
-                "Connecting to".bold(),
-                target.host,
-                target.port
-            );
+            println!("{} {}:{}", "Connecting to".bold(), target.host, target.port);
             let mut conn = DirectConn::connect_target(&target).unwrap_or_else(|e| {
                 eprintln!("{} {e}", "Connection failed:".red());
                 std::process::exit(1);
@@ -1500,6 +1509,11 @@ pub async fn run() {
                         checksum,
                         "applied_at".to_string(),
                         chrono::Utc::now().timestamp().to_string(),
+                        // Store the source so `lux migrate pull` can recreate the
+                        // file on another machine. Passed as a single argv element,
+                        // so embedded spaces/newlines are preserved verbatim.
+                        "body".to_string(),
+                        content.to_string(),
                     ];
                     if let Err(e) = target.exec_args(&record_cmd).await {
                         println!(" {}", "FAILED".red());
@@ -1514,6 +1528,77 @@ pub async fn run() {
                     "{} Applied {} migration(s).",
                     "Done.".green(),
                     pending.len()
+                );
+            }
+
+            MigrateAction::Pull {
+                project,
+                dir,
+                host,
+                port,
+                password,
+            } => {
+                let mut target = resolve_migrate_target(
+                    project.as_deref(),
+                    host.as_deref(),
+                    port,
+                    password.as_deref(),
+                    &api_url_override,
+                )
+                .await;
+
+                let remote = get_remote_migrations(&mut target).await;
+                if remote.is_empty() {
+                    println!("{}", "No migrations recorded on the target.".dimmed());
+                    return;
+                }
+
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    eprintln!("{} Failed to create migration dir: {}", "Error:".red(), e);
+                    std::process::exit(1);
+                }
+                let local: HashMap<String, String> =
+                    get_local_migrations(&dir).into_iter().collect();
+
+                let mut pulled = 0usize;
+                let mut skipped = 0usize;
+                for (filename, checksum, body) in &remote {
+                    if let Some(local_content) = local.get(filename) {
+                        // Already present locally. Only flag genuine divergence.
+                        if simple_hash(local_content) != *checksum {
+                            println!(
+                                "  {} {} (local differs from target; keeping local)",
+                                "skip".yellow(),
+                                filename
+                            );
+                            skipped += 1;
+                        }
+                        continue;
+                    }
+                    if body.is_empty() {
+                        // Applied before bodies were stored: nothing to recreate.
+                        println!(
+                            "  {} {} (no stored source on target)",
+                            "skip".yellow(),
+                            filename
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    let path = dir.join(filename);
+                    if let Err(e) = std::fs::write(&path, body) {
+                        eprintln!("  {} {}: {}", "FAILED".red(), filename, e);
+                        std::process::exit(1);
+                    }
+                    println!("  {} {}", "pull".green(), filename);
+                    pulled += 1;
+                }
+
+                println!(
+                    "{} {} pulled, {} skipped.",
+                    "Done.".green(),
+                    pulled,
+                    skipped
                 );
             }
         },
@@ -2043,8 +2128,8 @@ impl DirectConn {
             let config = ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
-            let server_name =
-                ServerName::try_from(host.to_string()).map_err(|_| "invalid TLS host".to_string())?;
+            let server_name = ServerName::try_from(host.to_string())
+                .map_err(|_| "invalid TLS host".to_string())?;
             let connection = ClientConnection::new(Arc::new(config), server_name)
                 .map_err(|e| format!("TLS setup failed: {e}"))?;
             DirectStream::Tls(Box::new(StreamOwned::new(connection, stream)))
@@ -2250,7 +2335,7 @@ async fn ensure_migrations_table(target: &mut MigrateTarget) {
     let needs_create = target.exec("TSCHEMA __migrations").await.is_err();
     if needs_create {
         if let Err(e) = target
-            .exec("TCREATE __migrations filename TEXT, checksum TEXT, applied_at INT")
+            .exec("TCREATE __migrations filename TEXT, checksum TEXT, applied_at INT, body TEXT")
             .await
         {
             eprintln!(
@@ -2260,6 +2345,11 @@ async fn ensure_migrations_table(target: &mut MigrateTarget) {
             );
             std::process::exit(1);
         }
+    } else {
+        // Older instances have a __migrations table without `body` (added so
+        // `lux migrate pull` can recreate migration files). Adding it is
+        // idempotent: ignore the "already exists" error.
+        let _ = target.exec("TALTER __migrations ADD body TEXT").await;
     }
 }
 
@@ -2319,6 +2409,77 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> HashSet<String> {
         }
     }
     applied
+}
+
+/// Read every migration recorded on the target as (filename, checksum, body).
+/// `body` is empty for rows applied before the source was stored. Used by
+/// `lux migrate pull` to recreate dashboard-authored migrations locally.
+async fn get_remote_migrations(target: &mut MigrateTarget) -> Vec<(String, String, String)> {
+    // Each row is a flat ["field", value, "field", value, ...] list.
+    fn extract(row: &[String]) -> (String, String, String) {
+        let mut filename = String::new();
+        let mut checksum = String::new();
+        let mut body = String::new();
+        let mut i = 0;
+        while i + 1 < row.len() {
+            match row[i].as_str() {
+                "filename" => filename = row[i + 1].clone(),
+                "checksum" => checksum = row[i + 1].clone(),
+                "body" => body = row[i + 1].clone(),
+                _ => {}
+            }
+            i += 2;
+        }
+        (filename, checksum, body)
+    }
+
+    let mut out = Vec::new();
+    match target {
+        MigrateTarget::Direct(conn) => {
+            if let Ok(rows) = conn
+                .exec_table_rows("TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000")
+            {
+                for row in &rows {
+                    let r = extract(row);
+                    if !r.0.is_empty() {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        MigrateTarget::Cloud {
+            client,
+            api_url,
+            token,
+            instance_id,
+        } => {
+            if let Ok(body) = exec_command_json(
+                client,
+                api_url,
+                token,
+                instance_id,
+                "TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000",
+            )
+            .await
+            {
+                if let Some(rows) = body.as_array() {
+                    for row in rows {
+                        if let Some(fields) = row.as_array() {
+                            let flat: Vec<String> = fields
+                                .iter()
+                                .map(|v| v.as_str().map(str::to_string).unwrap_or_default())
+                                .collect();
+                            let r = extract(&flat);
+                            if !r.0.is_empty() {
+                                out.push(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn get_local_migrations(dir: &PathBuf) -> Vec<(String, String)> {
@@ -2532,6 +2693,31 @@ mod tests {
         let err = parse_migration_commands("[\"PING\"").unwrap_err();
 
         assert!(err.contains("valid JSON argv array"));
+    }
+
+    #[test]
+    fn grant_statement_tokenizes_to_engine_argv() {
+        // A GRANT line in a .lux migration must produce exactly the argv the
+        // engine's parse_grant expects (comma stays attached to the scope, and
+        // auth.uid() survives as one token).
+        let commands =
+            parse_migration_commands("GRANT read, write ON messages WHERE user_id = auth.uid()")
+                .expect("grant should parse");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0],
+            vec![
+                "GRANT",
+                "read,",
+                "write",
+                "ON",
+                "messages",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()"
+            ]
+        );
     }
 
     #[test]
