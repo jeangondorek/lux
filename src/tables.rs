@@ -1301,6 +1301,50 @@ pub fn table_create(
     Ok(())
 }
 
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Generate a UUIDv7 (RFC 9562): a 48-bit big-endian millisecond timestamp in
+/// the leading bytes, the version/variant nibbles, the rest random. Being
+/// time-ordered it sorts chronologically and keeps index locality, which is why
+/// it is the modern default for primary keys.
+fn generate_uuid_v7() -> String {
+    use rand_core::RngCore;
+    let ms = current_epoch_ms();
+    let mut b = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut b);
+    b[0] = (ms >> 40) as u8;
+    b[1] = (ms >> 32) as u8;
+    b[2] = (ms >> 24) as u8;
+    b[3] = (ms >> 16) as u8;
+    b[4] = (ms >> 8) as u8;
+    b[5] = ms as u8;
+    b[6] = (b[6] & 0x0f) | 0x70; // version 7
+    b[8] = (b[8] & 0x3f) | 0x80; // variant (RFC 4122)
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
+/// Resolve a column `DEFAULT` token to a concrete value at insert time.
+/// `uuid()` / `gen_random_uuid()` -> a fresh UUIDv7; `now()` -> epoch ms;
+/// anything else is a literal (surrounding quotes stripped).
+fn resolve_default(token: &str) -> String {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "uuid()" | "gen_random_uuid()" => generate_uuid_v7(),
+        "now()" => current_epoch_ms().to_string(),
+        _ => token
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string(),
+    }
+}
+
 pub fn table_insert(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -1318,6 +1362,22 @@ pub fn table_insert(
         provided.insert(k, v);
     }
 
+    // Materialize column DEFAULTs for any non-PK field not explicitly provided.
+    // Generated values (uuid()/now()) must outlive `provided`, so own them here
+    // and borrow into the map. The PK is auto-generated separately below.
+    let generated_defaults: Vec<(String, String)> = schema
+        .iter()
+        .filter(|f| !f.primary_key && !provided.contains_key(f.name.as_str()))
+        .filter_map(|f| {
+            f.default_value
+                .as_ref()
+                .map(|d| (f.name.clone(), resolve_default(d)))
+        })
+        .collect();
+    for (name, val) in &generated_defaults {
+        provided.insert(name.as_str(), val.as_str());
+    }
+
     // Determine the PK column (if any) and its value
     let pk_field = schema.iter().find(|f| f.primary_key);
 
@@ -1327,9 +1387,15 @@ pub fn table_insert(
 
         // NOT NULL check
         if !field.nullable && value.is_none() {
-            // PK with no value is only ok if it's auto-generated (INT pk auto-increments)
-            // For all other NOT NULL fields, the value must be provided
-            if !(field.primary_key && field.field_type == FieldType::Int) {
+            // A PK with no value is fine when it can be auto-generated: INT
+            // (auto-increment), UUID (auto-uuidv7), or any PK carrying a
+            // DEFAULT. Every other NOT NULL field must be provided (defaults
+            // were already materialized into `provided` above).
+            let pk_autogen = field.primary_key
+                && (field.field_type == FieldType::Int
+                    || field.field_type == FieldType::Uuid
+                    || field.default_value.is_some());
+            if !pk_autogen {
                 return Err(format!(
                     "ERR column '{}' is NOT NULL but no value was provided",
                     field.name
@@ -1418,6 +1484,14 @@ pub fn table_insert(
                 // Auto-increment INT PK
                 next_id(store, table, now).to_string()
             }
+            None if pk.field_type == FieldType::Uuid => {
+                // Auto-generate a UUIDv7 PK (Supabase-style id default).
+                generate_uuid_v7()
+            }
+            None if pk.default_value.is_some() => {
+                // Honor an explicit DEFAULT on the PK (e.g. uuid()/now()).
+                resolve_default(pk.default_value.as_deref().unwrap_or(""))
+            }
             None => {
                 return Err(format!(
                     "ERR primary key column '{}' must be provided",
@@ -1447,8 +1521,9 @@ pub fn table_insert(
             let encoded = field.field_type.encode_value(value)?;
             pairs_owned.push((field.name.clone(), encoded));
         } else if field.primary_key {
-            // Explicit PK that was auto-generated (INT pk) - store its value
-            let encoded = FieldType::Int.encode_value(&pk_str)?;
+            // Explicit PK that was auto-generated (INT auto-increment or UUIDv7).
+            // Encode with the PK column's own type, not a hardcoded INT.
+            let encoded = field.field_type.encode_value(&pk_str)?;
             pairs_owned.push((field.name.clone(), encoded));
         }
     }
@@ -5935,6 +6010,174 @@ mod tests {
         let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
         let slugs: Vec<&str> = rows.iter().map(|r| cell(r, "slug")).collect();
         assert_eq!(slugs, vec!["apple", "cherry", "mango"]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Column DEFAULTs (literal / uuid() / now()) applied on insert, and
+    // auto-generated UUIDv7 primary keys.
+    // -------------------------------------------------------------------------
+
+    fn is_uuid_v7(s: &str) -> bool {
+        // canonical 8-4-4-4-12 hex with version nibble 7 and RFC4122 variant
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 5
+            && parts
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+            && [8, 4, 4, 4, 12] == parts.iter().map(|p| p.len()).collect::<Vec<_>>()[..]
+            && parts[2].starts_with('7')
+            && matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b'))
+    }
+
+    #[test]
+    fn literal_default_applied_on_insert() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "t",
+            &["id INT PRIMARY KEY,", "status STR DEFAULT active,", "n INT"],
+            now,
+        )
+        .unwrap();
+        // Provide only `n`; `status` should fall back to its literal default.
+        table_insert(&store, &cache, "t", &[("n", "5")], now).unwrap();
+        let rows = rows_of(
+            table_select(
+                &store,
+                &cache,
+                &parse_select(&["*", "FROM", "t"]).unwrap(),
+                now,
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "status"), "active");
+        assert_eq!(cell(&rows[0], "n"), "5");
+    }
+
+    #[test]
+    fn explicit_value_overrides_default() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "t",
+            &["id INT PRIMARY KEY,", "status STR DEFAULT active"],
+            now,
+        )
+        .unwrap();
+        table_insert(&store, &cache, "t", &[("status", "shipped")], now).unwrap();
+        let rows = rows_of(
+            table_select(
+                &store,
+                &cache,
+                &parse_select(&["*", "FROM", "t"]).unwrap(),
+                now,
+            )
+            .unwrap(),
+        );
+        assert_eq!(cell(&rows[0], "status"), "shipped");
+    }
+
+    #[test]
+    fn auto_uuidv7_primary_key_and_now_default() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "ev",
+            &["id UUID PRIMARY KEY,", "created_at TIMESTAMP DEFAULT now()"],
+            now,
+        )
+        .unwrap();
+        // No fields supplied at all: id and created_at are both generated.
+        table_insert(&store, &cache, "ev", &[], now).unwrap();
+        let rows = rows_of(
+            table_select(
+                &store,
+                &cache,
+                &parse_select(&["*", "FROM", "ev"]).unwrap(),
+                now,
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(
+            is_uuid_v7(cell(&rows[0], "id")),
+            "id was {}",
+            cell(&rows[0], "id")
+        );
+        // now() resolves to epoch-ms digits.
+        let ts = cell(&rows[0], "created_at");
+        assert!(
+            ts.chars().all(|c| c.is_ascii_digit()) && !ts.is_empty(),
+            "ts was {ts}"
+        );
+    }
+
+    #[test]
+    fn explicit_default_uuid_on_non_pk_column() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "t",
+            &["id INT PRIMARY KEY,", "token UUID DEFAULT uuid()"],
+            now,
+        )
+        .unwrap();
+        table_insert(&store, &cache, "t", &[], now).unwrap();
+        let rows = rows_of(
+            table_select(
+                &store,
+                &cache,
+                &parse_select(&["*", "FROM", "t"]).unwrap(),
+                now,
+            )
+            .unwrap(),
+        );
+        assert!(is_uuid_v7(cell(&rows[0], "token")));
+    }
+
+    #[test]
+    fn not_null_without_default_still_errors() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "t",
+            &["id INT PRIMARY KEY,", "name STR NOT NULL"],
+            now,
+        )
+        .unwrap();
+        assert!(table_insert(&store, &cache, "t", &[], now).is_err());
+    }
+
+    #[test]
+    fn generated_uuid_v7_embeds_current_timestamp() {
+        // The leading 48 bits are the generation time in ms, which is what makes
+        // v7 chronologically sortable across milliseconds.
+        let u = generate_uuid_v7();
+        assert!(is_uuid_v7(&u));
+        let hex: String = u
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(12)
+            .collect();
+        let ts = u64::from_str_radix(&hex, 16).unwrap();
+        let now_ms = current_epoch_ms();
+        assert!(ts <= now_ms && now_ms - ts < 5_000, "ts={ts} now={now_ms}");
     }
 
     // -------------------------------------------------------------------------

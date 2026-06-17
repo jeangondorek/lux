@@ -42,7 +42,9 @@ pub fn cmd_tinsert(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
+    // Allow `TINSERT table` with no field pairs: a row whose columns are all
+    // auto-generated (uuid PK, DEFAULT now(), etc.) is fully valid.
+    if args.len() < 2 || !(args.len() - 2).is_multiple_of(2) {
         resp::write_error(out, "ERR wrong number of arguments for 'tinsert' command");
         return CmdResult::Written;
     }

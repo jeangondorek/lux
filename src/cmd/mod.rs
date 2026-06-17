@@ -941,7 +941,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: b"TINSERT",
-        min_arity: 4,
+        min_arity: 2,
     },
     CommandSpec {
         name: b"TUPDATE",
