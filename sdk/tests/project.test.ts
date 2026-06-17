@@ -264,6 +264,28 @@ describe('Lux project client', () => {
 		expect(res.data).toEqual([{ id: 1, body: 'a' }, { id: 2, body: 'b' }]);
 	});
 
+	test('upsert posts with an on_conflict param and returns the row', async () => {
+		const urls: string[] = [];
+		const fetchImpl = async (input: RequestInfo | URL) => {
+			urls.push(String(input));
+			return new Response(JSON.stringify({ result: { id: 1, email: 'a@x.com', name: 'Bob' } }), {
+				status: 200,
+			});
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const res = await client
+			.table('users')
+			.upsert({ email: 'a@x.com', name: 'Bob' }, { onConflict: 'email' });
+		expect(urls).toEqual(['http://localhost:3957/v1/project/tables/users?on_conflict=email']);
+		expect(res.data).toEqual({ id: 1, email: 'a@x.com', name: 'Bob' });
+	});
+
 	test('project request errors return data/error envelopes', async () => {
 		const fetchImpl = async () => {
 			return new Response(JSON.stringify({ error: 'Secret key required' }), { status: 403 });

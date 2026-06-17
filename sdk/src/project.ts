@@ -365,6 +365,24 @@ export class LuxProjectTable<T extends object> {
 		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows);
 	}
 
+	upsert(
+		row: ProjectRowInput<T>,
+		options?: { onConflict?: string },
+	): LuxProjectInsertBuilder<unknown>;
+	upsert(
+		rows: Array<ProjectRowInput<T>>,
+		options?: { onConflict?: string },
+	): LuxProjectInsertBuilder<unknown[]>;
+	upsert(
+		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
+		options?: { onConflict?: string },
+	): LuxProjectInsertBuilder<unknown | unknown[]> {
+		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows, {
+			upsert: true,
+			onConflict: options?.onConflict,
+		});
+	}
+
 	update(patch: ProjectRowInput<T>): LuxProjectMutationBuilder<unknown> {
 		return new LuxProjectMutationBuilder(this.client, this.name, 'PATCH', patch);
 	}
@@ -809,19 +827,23 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 		private client: LuxProjectClient,
 		private tableName: string,
 		private rowOrRows: Record<string, QueryValue> | Array<Record<string, QueryValue>>,
+		private upsertOptions?: { upsert: boolean; onConflict?: string },
 	) {
 		super();
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
 		// One request for both shapes: an array body inserts all rows server-side
-		// in a single round-trip. The server returns the inserted row(s)
-		// ({result: row} for a single insert, {result: [rows]} for an array).
-		const res = await this.client.request(
-			'POST',
-			`/tables/${encodeURIComponent(this.tableName)}`,
-			this.rowOrRows,
-		);
+		// in a single round-trip. The server returns the affected row(s)
+		// ({result: row} for a single row, {result: [rows]} for an array).
+		let path = `/tables/${encodeURIComponent(this.tableName)}`;
+		if (this.upsertOptions?.upsert) {
+			const params = new URLSearchParams();
+			if (this.upsertOptions.onConflict) params.set('on_conflict', this.upsertOptions.onConflict);
+			else params.set('upsert', 'true');
+			path += `?${params.toString()}`;
+		}
+		const res = await this.client.request('POST', path, this.rowOrRows);
 		if (res.error) return res as LuxResult<TResult>;
 		return ok(unwrapResult<TResult>(res.data) as TResult);
 	}
