@@ -814,15 +814,19 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
+		// The server returns the inserted row(s) ({result: row} for a single
+		// insert, {result: [rows]} for an array); unwrap to the row(s).
 		if (!Array.isArray(this.rowOrRows)) {
-			return this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, this.rowOrRows) as Promise<LuxResult<TResult>>;
+			const res = await this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, this.rowOrRows);
+			if (res.error) return res as LuxResult<TResult>;
+			return ok(unwrapResult<TResult>(res.data) as TResult);
 		}
 
 		const results: unknown[] = [];
 		for (const row of this.rowOrRows) {
-			const result = await this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, row);
-			if (result.error) return result as LuxResult<TResult>;
-			results.push(result.data);
+			const res = await this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, row);
+			if (res.error) return res as LuxResult<TResult>;
+			results.push(unwrapResult(res.data));
 		}
 		return ok(results as TResult);
 	}
@@ -848,11 +852,14 @@ export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<
 
 		const params = this.filteredQueryParams();
 		const query = params.toString();
-		return this.client.request(
+		// Update/delete return the affected rows ({result: [rows]}); unwrap them.
+		const res = await this.client.request(
 			this.method,
 			`/tables/${encodeURIComponent(this.tableName)}${query ? `?${query}` : ''}`,
 			this.body,
-		) as Promise<LuxResult<TResult>>;
+		);
+		if (res.error) return res as LuxResult<TResult>;
+		return ok(unwrapResult<TResult>(res.data) as TResult);
 	}
 }
 

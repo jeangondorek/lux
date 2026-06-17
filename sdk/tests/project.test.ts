@@ -209,6 +209,35 @@ describe('Lux project client', () => {
 		]);
 	});
 
+	test('insert returns the inserted row; update/delete return affected rows', async () => {
+		const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST') {
+				return new Response(
+					JSON.stringify({ result: { id: '019ed-uuid', body: 'hi', created_at: 1781720000000 } }),
+					{ status: 200 },
+				);
+			}
+			return new Response(JSON.stringify({ result: [{ id: '019ed-uuid', body: 'edited' }] }), {
+				status: 200,
+			});
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const inserted = await client.table('messages').insert({ body: 'hi' });
+		expect(inserted).toEqual({
+			data: { id: '019ed-uuid', body: 'hi', created_at: 1781720000000 },
+			error: null,
+		});
+
+		const updated = await client.table('messages').update({ body: 'edited' }).eq('id', '019ed-uuid');
+		expect(updated).toEqual({ data: [{ id: '019ed-uuid', body: 'edited' }], error: null });
+	});
+
 	test('project request errors return data/error envelopes', async () => {
 		const fetchImpl = async () => {
 			return new Response(JSON.stringify({ error: 'Secret key required' }), { status: 403 });
