@@ -234,19 +234,6 @@ pub fn resolve(
     Ok(out)
 }
 
-/// True if the client's `query` conditions satisfy (imply) the resolved `grant`
-/// conditions: every grant condition must appear in the query as an identical
-/// constraint, so the query requests only grant-permitted rows. Conservative by
-/// design - a query that is logically a subset but doesn't literally carry the
-/// grant condition is rejected, which is safe and predictable.
-pub fn query_satisfies(grant: &[ResolvedCond], query: &[ResolvedCond]) -> bool {
-    grant.iter().all(|g| {
-        query
-            .iter()
-            .any(|q| q.column == g.column && q.op == g.op && q.value == g.value)
-    })
-}
-
 /// Compare a concrete value against `op target`, numeric when both parse.
 fn cmp(actual: &str, op: &str, target: &str) -> bool {
     if let (Ok(a), Ok(t)) = (actual.parse::<f64>(), target.parse::<f64>()) {
@@ -351,52 +338,41 @@ mod tests {
         assert!(resolve(&g.predicate, "123abc", |_| None).is_err());
     }
 
-    // ---- query-satisfies-grant: the security crux ----
+    // ---- WITH CHECK (row_satisfies): the write-side security crux ----
 
     #[test]
-    fn query_matching_grant_is_allowed() {
+    fn row_inside_grant_is_allowed() {
         let grant = vec![rc("user_id", "=", "123abc")];
-        assert!(query_satisfies(&grant, &[rc("user_id", "=", "123abc")]));
-        // query is stricter (extra filter) - still satisfies
-        assert!(query_satisfies(
-            &grant,
-            &[rc("user_id", "=", "123abc"), rc("status", "=", "active")]
-        ));
+        let row = |c: &str| (c == "user_id").then(|| "123abc".to_string());
+        assert!(row_satisfies(&grant, row));
     }
 
     #[test]
-    fn unscoped_query_is_denied() {
+    fn row_outside_grant_is_denied() {
         let grant = vec![rc("user_id", "=", "123abc")];
-        // no filter at all -> asks for everything -> denied
-        assert!(!query_satisfies(&grant, &[]));
+        let row = |c: &str| (c == "user_id").then(|| "someone_else".to_string());
+        assert!(!row_satisfies(&grant, row));
+        // a missing column can't satisfy a grant condition
+        assert!(!row_satisfies(&grant, |_| None));
     }
 
     #[test]
-    fn wrong_user_is_denied() {
-        let grant = vec![rc("user_id", "=", "123abc")];
-        assert!(!query_satisfies(
-            &grant,
-            &[rc("user_id", "=", "someone_else")]
-        ));
-        // different operator doesn't satisfy an equality grant
-        assert!(!query_satisfies(&grant, &[rc("user_id", "!=", "123abc")]));
-    }
-
-    #[test]
-    fn multi_condition_grant_requires_all() {
+    fn row_must_satisfy_every_condition() {
         let grant = vec![rc("user_id", "=", "123abc"), rc("org", "=", "acme")];
-        assert!(!query_satisfies(&grant, &[rc("user_id", "=", "123abc")]));
-        assert!(query_satisfies(
-            &grant,
-            &[rc("org", "=", "acme"), rc("user_id", "=", "123abc")]
-        ));
+        let only_user = |c: &str| (c == "user_id").then(|| "123abc".to_string());
+        assert!(!row_satisfies(&grant, only_user));
+        let both = |c: &str| match c {
+            "user_id" => Some("123abc".to_string()),
+            "org" => Some("acme".to_string()),
+            _ => None,
+        };
+        assert!(row_satisfies(&grant, both));
     }
 
     #[test]
-    fn unconditional_grant_allows_any_query() {
-        // GRANT read ON public_posts  (no WHERE) -> any query ok
-        assert!(query_satisfies(&[], &[]));
-        assert!(query_satisfies(&[], &[rc("anything", "=", "x")]));
+    fn unconditional_grant_admits_any_row() {
+        // GRANT write ON public_posts (no WHERE) -> any row passes WITH CHECK.
+        assert!(row_satisfies(&[], |_| None));
     }
 
     #[test]

@@ -316,12 +316,12 @@ async fn handle_request(
                 return stream_snapshot(socket, store).await;
             }
             ["v1", "tables", table] => {
-                let where_clause = get_param(&params, "where").unwrap_or("");
-                if let Err((status, status_text, body)) =
-                    enforce_table_read(store, cache, &auth_context, table, where_clause)
-                {
-                    return send_json(socket, status, status_text, &body).await;
-                }
+                let filter = match enforce_table_read(store, cache, &auth_context, table) {
+                    Ok(f) => f,
+                    Err((status, status_text, body)) => {
+                        return send_json(socket, status, status_text, &body).await;
+                    }
+                };
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
                     return send_json(socket, 403, "Forbidden", &body).await;
@@ -331,13 +331,21 @@ async fn handle_request(
                     .find(|(k, _)| k.eq_ignore_ascii_case("prefer"))
                     .map(|(_, v)| v.as_str())
                     .unwrap_or("");
-                return stream_table_query(socket, table, &params, prefer, store, cache, max_rows)
+                // Inject the grant filter (RLS USING) into the query's WHERE.
+                let where_clause = get_param(&params, "where").unwrap_or("");
+                let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
+                let scoped = params_with_where(&params, &combined);
+                return stream_table_query(socket, table, &scoped, prefer, store, cache, max_rows)
                     .await;
             }
             ["v1", "tables", table, "count"] => {
-                if let Err((status, status_text, body)) =
-                    enforce_table_read(store, cache, &auth_context, table, "")
-                {
+                let filter = match enforce_table_read(store, cache, &auth_context, table) {
+                    Ok(f) => f,
+                    Err((status, status_text, body)) => {
+                        return send_json(socket, status, status_text, &body).await;
+                    }
+                };
+                if let Err((status, status_text, body)) = deny_if_row_scoped(&filter) {
                     return send_json(socket, status, status_text, &body).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -352,8 +360,10 @@ async fn handle_request(
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, "schema"] => {
+                // Schema is table-shape metadata, not rows: a read grant of any
+                // scope is sufficient (gate only, no row filter).
                 if let Err((status, status_text, body)) =
-                    enforce_table_read(store, cache, &auth_context, table, "")
+                    enforce_table_read(store, cache, &auth_context, table)
                 {
                     return send_json(socket, status, status_text, &body).await;
                 }
@@ -375,9 +385,15 @@ async fn handle_request(
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, id] if *id != "count" && *id != "schema" => {
-                if let Err((status, status_text, body)) =
-                    enforce_table_read(store, cache, &auth_context, table, "")
-                {
+                let filter = match enforce_table_read(store, cache, &auth_context, table) {
+                    Ok(f) => f,
+                    Err((status, status_text, body)) => {
+                        return send_json(socket, status, status_text, &body).await;
+                    }
+                };
+                // Fetch-by-id can't yet apply a row filter; deny row-scoped
+                // callers here and steer them to the filtered query route.
+                if let Err((status, status_text, body)) = deny_if_row_scoped(&filter) {
                     return send_json(socket, status, status_text, &body).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -760,44 +776,36 @@ fn live_auth_principal(auth: &HttpAuthContext) -> Option<crate::auth::AuthPrinci
 }
 
 /// Enforce a READ grant on a table query. When end-user auth is off, the
-/// operator/service-key model applies and everything is allowed. Otherwise a
-/// token user's query conditions must satisfy a `read` grant on the table.
+/// operator/service-key model applies and everything is allowed (`Ok(None)`).
+/// A token user with a `read` grant gets `Ok(Some(filter))` — a WHERE fragment
+/// the caller ANDs onto the query so only their permitted rows are returned
+/// (RLS `USING`). No grant -> 403 (deny-by-default).
 fn enforce_table_read(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     auth: &HttpAuthContext,
     table: &str,
-    where_clause: &str,
-) -> Result<(), (u16, &'static str, String)> {
+) -> Result<Option<String>, (u16, &'static str, String)> {
     if !store.config().auth.enabled {
-        return Ok(());
+        return Ok(None);
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
+        HttpAuthContext::Operator => Ok(None),
         HttpAuthContext::Anonymous => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
         )),
         HttpAuthContext::User(principal) => {
-            let conds: Vec<crate::grants::ResolvedCond> =
-                crate::tables::where_param_conditions(where_clause)
-                    .into_iter()
-                    .map(|(c, o, v)| crate::grants::ResolvedCond {
-                        column: c,
-                        op: o,
-                        value: v,
-                    })
-                    .collect();
-            crate::auth::check_read(store, cache, principal, table, &conds, Instant::now()).map_err(
-                |e| {
+            crate::auth::read_filter(store, cache, principal, table, Instant::now())
+                .map(Some)
+                .map_err(|e| {
                     (
                         403,
                         "Forbidden",
                         format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                     )
-                },
-            )
+                })
         }
     }
 }
@@ -842,36 +850,29 @@ fn enforce_table_insert(
     }
 }
 
-/// Enforce a write grant on an UPDATE/DELETE: the WHERE clause must satisfy the
-/// table's write grant so only in-scope rows can be targeted.
+/// Enforce a write grant on an UPDATE/DELETE. Returns `Ok(Some(filter))` for a
+/// token user with a write grant — a WHERE fragment the caller ANDs onto the
+/// statement so only in-scope rows are touched (RLS `USING`). Operator / auth-
+/// off -> `Ok(None)`; no grant -> 403.
 fn enforce_table_write_where(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     auth: &HttpAuthContext,
     table: &str,
-    where_clause: &str,
-) -> Result<(), (u16, &'static str, String)> {
+) -> Result<Option<String>, (u16, &'static str, String)> {
     if !store.config().auth.enabled {
-        return Ok(());
+        return Ok(None);
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
+        HttpAuthContext::Operator => Ok(None),
         HttpAuthContext::Anonymous => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
         )),
         HttpAuthContext::User(principal) => {
-            let conds: Vec<crate::grants::ResolvedCond> =
-                crate::tables::where_param_conditions(where_clause)
-                    .into_iter()
-                    .map(|(c, o, v)| crate::grants::ResolvedCond {
-                        column: c,
-                        op: o,
-                        value: v,
-                    })
-                    .collect();
-            crate::auth::check_write_where(store, cache, principal, table, &conds, Instant::now())
+            crate::auth::write_filter(store, cache, principal, table, Instant::now())
+                .map(Some)
                 .map_err(|e| {
                     (
                         403,
@@ -880,6 +881,47 @@ fn enforce_table_write_where(
                     )
                 })
         }
+    }
+}
+
+/// AND a grant filter onto a user-supplied WHERE clause. Either side may be
+/// empty. Both are flat AND-chains of `col op value`, so plain concatenation is
+/// safe (no OR-precedence concerns).
+fn combine_where(user: &str, grant: &str) -> String {
+    match (user.trim().is_empty(), grant.trim().is_empty()) {
+        (true, _) => grant.trim().to_string(),
+        (_, true) => user.trim().to_string(),
+        _ => format!("{} AND {}", user.trim(), grant.trim()),
+    }
+}
+
+/// Clone `params` with the `where` value replaced by `where_value` (used to
+/// inject a grant filter before a read handler parses the query).
+fn params_with_where(params: &[(String, String)], where_value: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = params
+        .iter()
+        .filter(|(k, _)| k != "where")
+        .cloned()
+        .collect();
+    if !where_value.is_empty() {
+        out.push(("where".to_string(), where_value.to_string()));
+    }
+    out
+}
+
+/// A row-scoped grant filter can't yet be applied to `/count` or `/tables/:id`
+/// (those don't take a WHERE), so a token user with a row-scoped grant is denied
+/// there rather than leaking unfiltered data. Operator / unconditional grant
+/// (empty filter) is allowed. (Follow-up: filter these too.)
+fn deny_if_row_scoped(filter: &Option<String>) -> Result<(), (u16, &'static str, String)> {
+    match filter {
+        Some(f) if !f.trim().is_empty() => Err((
+            403,
+            "Forbidden",
+            r#"{"error":"row-scoped grant: use a filtered query instead of count/by-id"}"#
+                .to_string(),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1229,29 +1271,30 @@ async fn build_live_subscription(
         ));
     }
     if kind == "table" || spec.get("table").is_some() {
-        let table_spec = parse_live_table_spec(spec)?;
+        let mut table_spec = parse_live_table_spec(spec)?;
         if let Some(err) = crate::auth::reserved_table_access_error(&table_spec.table) {
             return Err(live_error("FORBIDDEN", &err));
         }
-        // Enforce the READ grant: the subscription's query must satisfy it. The
-        // grant predicate is the security ceiling; an under-scoped `.live()` is
-        // rejected at subscribe time (operator / no-auth bypasses).
+        // Enforce the READ grant as RLS USING: resolve the grant filter and AND
+        // its conditions into the subscription's own WHERE. Because both the
+        // initial snapshot and every streamed diff re-run `fetch_live_table_rows`
+        // off this spec, the caller only ever sees rows the grant covers. No
+        // read grant -> deny (operator / no-auth bypasses).
         if store.config().auth.enabled {
             if let Some(p) = principal {
-                let conds: Vec<crate::grants::ResolvedCond> = table_spec
-                    .where_conditions
-                    .iter()
-                    .filter(|(_, op, _)| {
-                        matches!(op.as_str(), "=" | "!=" | ">" | "<" | ">=" | "<=")
-                    })
-                    .map(|(field, op, val)| crate::grants::ResolvedCond {
-                        column: field.clone(),
-                        op: op.clone(),
-                        value: live_value_to_token(val),
-                    })
-                    .collect();
-                crate::auth::check_read(store, cache, p, &table_spec.table, &conds, Instant::now())
-                    .map_err(|e| live_error("FORBIDDEN", &e))?;
+                let grant_conds = crate::auth::read_filter_conds(
+                    store,
+                    cache,
+                    p,
+                    &table_spec.table,
+                    Instant::now(),
+                )
+                .map_err(|e| live_error("FORBIDDEN", &e))?;
+                for c in grant_conds {
+                    table_spec
+                        .where_conditions
+                        .push((c.column, c.op, Value::String(c.value)));
+                }
             }
         }
         let receivers = vec![
@@ -2219,14 +2262,17 @@ fn route_request_with_auth(
         ("GET", ["tables"]) => ok(exec_json(store, broker, cache, script_engine, &["TLIST"])),
         ("POST", ["tables"]) => route_table_create(body, store, broker, cache, script_engine),
         ("GET", ["tables", table]) => {
+            let filter = match enforce_table_read(store, cache, auth, table) {
+                Ok(f) => f,
+                Err(resp) => return resp,
+            };
             let where_clause = get_param(params, "where").unwrap_or("");
-            if let Err(resp) = enforce_table_read(store, cache, auth, table, where_clause) {
-                return resp;
-            }
-            route_table_query(table, params, store, broker, cache)
+            let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
+            let scoped = params_with_where(params, &combined);
+            route_table_query(table, &scoped, store, broker, cache)
         }
         ("GET", ["tables", table, "schema"]) => {
-            if let Err(resp) = enforce_table_read(store, cache, auth, table, "") {
+            if let Err(resp) = enforce_table_read(store, cache, auth, table) {
                 return resp;
             }
             if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -2253,7 +2299,11 @@ fn route_request_with_auth(
             }
         }
         ("GET", ["tables", table, "count"]) => {
-            if let Err(resp) = enforce_table_read(store, cache, auth, table, "") {
+            let filter = match enforce_table_read(store, cache, auth, table) {
+                Ok(f) => f,
+                Err(resp) => return resp,
+            };
+            if let Err(resp) = deny_if_row_scoped(&filter) {
                 return resp;
             }
             if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -2726,11 +2776,13 @@ fn route_table_update(
         }
     };
 
-    if let Err((status, status_text, body)) =
-        enforce_table_write_where(store, cache, auth, table, where_clause)
-    {
-        return (status, status_text, body);
-    }
+    let filter = match enforce_table_write_where(store, cache, auth, table) {
+        Ok(f) => f,
+        Err((status, status_text, body)) => return (status, status_text, body),
+    };
+    // RLS USING: AND the grant filter onto the caller's WHERE so an UPDATE only
+    // touches rows the grant covers (narrowing, never widening).
+    let effective_where = combine_where(where_clause, filter.as_deref().unwrap_or(""));
 
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -2772,7 +2824,7 @@ fn route_table_update(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let where_tokens = match parse_http_where_tokens(where_clause) {
+    let where_tokens = match parse_http_where_tokens(&effective_where) {
         Ok(tokens) => tokens,
         Err(e) => {
             return (
@@ -2843,13 +2895,15 @@ fn route_table_delete(
             ),
         };
 
-    if let Err((status, status_text, body)) =
-        enforce_table_write_where(store, cache, auth, table, where_clause)
-    {
-        return (status, status_text, body);
-    }
+    let filter = match enforce_table_write_where(store, cache, auth, table) {
+        Ok(f) => f,
+        Err((status, status_text, body)) => return (status, status_text, body),
+    };
+    // RLS USING: AND the grant filter onto the caller's WHERE so a DELETE only
+    // removes rows the grant covers (narrowing, never widening).
+    let effective_where = combine_where(where_clause, filter.as_deref().unwrap_or(""));
 
-    let where_tokens = match parse_http_where_tokens(where_clause) {
+    let where_tokens = match parse_http_where_tokens(&effective_where) {
         Ok(tokens) => tokens,
         Err(e) => {
             return (
@@ -3586,5 +3640,283 @@ mod tests {
         assert_eq!(plan.group_by, vec!["team_id"]);
         assert_eq!(plan.having.len(), 1);
         assert_eq!(plan.having[0].field, "count");
+    }
+
+    // ── RLS auto-filter (USING) helpers ──
+
+    #[test]
+    fn combine_where_ands_both_sides() {
+        assert_eq!(combine_where("", ""), "");
+        assert_eq!(combine_where("a = 1", ""), "a = 1");
+        assert_eq!(combine_where("", "user_id = u1"), "user_id = u1");
+        assert_eq!(
+            combine_where("status = active", "user_id = u1"),
+            "status = active AND user_id = u1"
+        );
+        // Whitespace-only sides are treated as empty.
+        assert_eq!(combine_where("   ", "user_id = u1"), "user_id = u1");
+    }
+
+    #[test]
+    fn params_with_where_replaces_existing_where() {
+        let params = vec![
+            ("select".to_string(), "*".to_string()),
+            ("where".to_string(), "old = 1".to_string()),
+        ];
+        let out = params_with_where(&params, "user_id = u1");
+        // The old `where` is dropped, the new one appended, other params kept.
+        assert_eq!(get_param(&out, "select"), Some("*"));
+        assert_eq!(get_param(&out, "where"), Some("user_id = u1"));
+        assert_eq!(out.iter().filter(|(k, _)| k == "where").count(), 1);
+    }
+
+    #[test]
+    fn params_with_where_omits_empty_filter() {
+        let params = vec![("where".to_string(), "old = 1".to_string())];
+        let out = params_with_where(&params, "");
+        assert_eq!(get_param(&out, "where"), None);
+    }
+
+    #[test]
+    fn deny_if_row_scoped_blocks_only_nonempty_filters() {
+        // Operator / unconditional grant -> allowed.
+        assert!(deny_if_row_scoped(&None).is_ok());
+        assert!(deny_if_row_scoped(&Some(String::new())).is_ok());
+        assert!(deny_if_row_scoped(&Some("   ".to_string())).is_ok());
+        // Row-scoped grant -> 403 (can't filter count/by-id yet).
+        let denied = deny_if_row_scoped(&Some("user_id = u1".to_string()));
+        assert_eq!(denied.unwrap_err().0, 403);
+    }
+
+    // ── RLS auto-filter end-to-end through the table routes ──
+
+    fn rls_fixture() -> (
+        Arc<Store>,
+        Broker,
+        SharedSchemaCache,
+        Arc<lua::ScriptEngine>,
+    ) {
+        let config = Arc::new(crate::ServerConfig {
+            auth: crate::AuthConfig {
+                enabled: true,
+                ..crate::AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let script_engine = Arc::new(lua::ScriptEngine::new());
+        let now = Instant::now();
+
+        // messages(id int pk, user_id str, body str); rows for two users.
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "messages",
+            &[
+                "id", "INT", "PRIMARY", "KEY,", "user_id", "STR,", "body", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        for (id, uid, body) in [
+            ("1", "alice", "a1"),
+            ("2", "alice", "a2"),
+            ("3", "bob", "b1"),
+        ] {
+            crate::tables::table_insert(
+                &store,
+                &cache,
+                "messages",
+                &[("id", id), ("user_id", uid), ("body", body)],
+                now,
+            )
+            .unwrap();
+        }
+        (store, broker, cache, script_engine)
+    }
+
+    fn user_ctx(uid: &str) -> HttpAuthContext {
+        HttpAuthContext::User(crate::auth::AuthPrincipal {
+            user_id: uid.to_string(),
+            email: format!("{uid}@x.dev"),
+            session_id: "sess".to_string(),
+            role: "authenticated".to_string(),
+        })
+    }
+
+    fn put_read_write_grant(store: &Store, cache: &SharedSchemaCache) {
+        let now = Instant::now();
+        let g = crate::grants::parse_grant(&[
+            "read,",
+            "write",
+            "ON",
+            "messages",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+        ])
+        .unwrap();
+        crate::auth::put_grant(store, cache, &g, now).unwrap();
+    }
+
+    #[test]
+    fn rls_read_returns_only_callers_rows() {
+        let (store, broker, cache, _se) = rls_fixture();
+        put_read_write_grant(&store, &cache);
+        let alice = user_ctx("alice");
+
+        // Bare select -> auto-filtered to alice's rows only.
+        let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
+        let combined = combine_where("", filter.as_deref().unwrap_or(""));
+        let scoped = params_with_where(&[], &combined);
+        let (status, _, body) = route_table_query("messages", &scoped, &store, &broker, &cache);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"a1\"") && body.contains("\"a2\""), "{body}");
+        assert!(!body.contains("\"b1\""), "bob's row leaked: {body}");
+    }
+
+    #[test]
+    fn rls_read_intersects_caller_where_with_grant() {
+        let (store, broker, cache, _se) = rls_fixture();
+        put_read_write_grant(&store, &cache);
+        let alice = user_ctx("alice");
+
+        // Caller asks for body = a1; grant narrows to alice. Both must hold.
+        let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
+        let combined = combine_where("body = a1", filter.as_deref().unwrap_or(""));
+        let scoped = params_with_where(&[], &combined);
+        let (status, _, body) = route_table_query("messages", &scoped, &store, &broker, &cache);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"a1\""), "{body}");
+        assert!(
+            !body.contains("\"a2\"") && !body.contains("\"b1\""),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn rls_no_grant_denies_read() {
+        let (store, broker, cache, _se) = rls_fixture();
+        // No grant put -> deny-by-default.
+        let alice = user_ctx("alice");
+        let err = enforce_table_read(&store, &cache, &alice, "messages").unwrap_err();
+        assert_eq!(err.0, 403);
+        // Operator bypasses entirely (no filter, full table).
+        let filter =
+            enforce_table_read(&store, &cache, &HttpAuthContext::Operator, "messages").unwrap();
+        assert!(filter.is_none());
+        let (status, _, body) = route_table_query("messages", &[], &store, &broker, &cache);
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("\"b1\""),
+            "operator should see all rows: {body}"
+        );
+    }
+
+    #[test]
+    fn rls_update_touches_only_callers_rows() {
+        let (store, broker, cache, se) = rls_fixture();
+        put_read_write_grant(&store, &cache);
+        let bob = user_ctx("bob");
+
+        // Bob tries to update message id=1 (alice's). Grant filter AND id=1 -> 0 rows.
+        let params = vec![("where".to_string(), "id = 1".to_string())];
+        let (status, _, body) = route_table_update(
+            "messages",
+            &params,
+            r#"{"body":"hacked"}"#,
+            &store,
+            &broker,
+            &cache,
+            &se,
+            &bob,
+        );
+        assert_eq!(status, 200, "{body}");
+        // No rows returned (id=1 is not bob's), and alice's row is intact.
+        assert!(!body.contains("hacked"), "bob updated alice's row: {body}");
+        let now = Instant::now();
+        let row = crate::tables::table_get(&store, &cache, "messages", 1, now).unwrap();
+        let body_val = row
+            .iter()
+            .find(|(k, _)| k == "body")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(body_val, Some("a1"));
+
+        // Bob updating his own row (id=3) succeeds.
+        let params = vec![("where".to_string(), "id = 3".to_string())];
+        let (status, _, body) = route_table_update(
+            "messages",
+            &params,
+            r#"{"body":"bobupdated"}"#,
+            &store,
+            &broker,
+            &cache,
+            &se,
+            &bob,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("bobupdated"), "{body}");
+    }
+
+    #[test]
+    fn rls_delete_touches_only_callers_rows() {
+        let (store, broker, cache, se) = rls_fixture();
+        put_read_write_grant(&store, &cache);
+        let bob = user_ctx("bob");
+
+        // Bob tries to delete alice's row id=1 -> filtered out, alice's row survives.
+        let params = vec![("where".to_string(), "id = 1".to_string())];
+        let (status, _, body) =
+            route_table_delete("messages", &params, &store, &broker, &cache, &se, &bob);
+        assert_eq!(status, 200, "{body}");
+        let now = Instant::now();
+        assert!(
+            crate::tables::table_get(&store, &cache, "messages", 1, now).is_ok(),
+            "alice's row was deleted by bob"
+        );
+
+        // Bob deletes his own row id=3 -> gone.
+        let params = vec![("where".to_string(), "id = 3".to_string())];
+        let (status, _, _) =
+            route_table_delete("messages", &params, &store, &broker, &cache, &se, &bob);
+        assert_eq!(status, 200);
+        assert!(crate::tables::table_get(&store, &cache, "messages", 3, now).is_err());
+    }
+
+    #[test]
+    fn rls_insert_with_check_blocks_foreign_owner() {
+        let (store, _broker, cache, _se) = rls_fixture();
+        put_read_write_grant(&store, &cache);
+        let bob = user_ctx("bob");
+
+        // WITH CHECK: bob can insert a row he owns...
+        let mut own = serde_json::Map::new();
+        own.insert("id".to_string(), serde_json::json!("4"));
+        own.insert("user_id".to_string(), serde_json::json!("bob"));
+        assert!(enforce_table_insert(&store, &cache, &bob, "messages", &own).is_ok());
+        // ...but not a row owned by alice.
+        let mut foreign = serde_json::Map::new();
+        foreign.insert("id".to_string(), serde_json::json!("5"));
+        foreign.insert("user_id".to_string(), serde_json::json!("alice"));
+        let err = enforce_table_insert(&store, &cache, &bob, "messages", &foreign).unwrap_err();
+        assert_eq!(err.0, 403);
+    }
+
+    #[test]
+    fn rls_count_and_by_id_deny_row_scoped_token_user() {
+        let (store, _broker, cache, _se) = rls_fixture();
+        put_read_write_grant(&store, &cache);
+        let alice = user_ctx("alice");
+        // Row-scoped read grant -> count / by-id are denied (stopgap) until they
+        // can apply the filter; operator still passes.
+        let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
+        assert_eq!(deny_if_row_scoped(&filter).unwrap_err().0, 403);
+        let op_filter =
+            enforce_table_read(&store, &cache, &HttpAuthContext::Operator, "messages").unwrap();
+        assert!(deny_if_row_scoped(&op_filter).is_ok());
     }
 }

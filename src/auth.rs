@@ -2423,25 +2423,52 @@ fn resolve_for_principal(
     })
 }
 
-/// Enforce a READ grant: the query's conditions must satisfy the grant.
-pub(crate) fn check_read(
+/// Render resolved grant conditions as a WHERE fragment (`col op val AND ...`).
+/// An unconditional grant (no conditions) renders to an empty string.
+fn render_grant_filter(conds: &[crate::grants::ResolvedCond]) -> String {
+    conds
+        .iter()
+        .map(|c| format!("{} {} {}", c.column, c.op, c.value))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// Resolve the READ grant for `principal` into a WHERE filter fragment that
+/// scopes a query to the rows the grant allows (RLS `USING` semantics). The
+/// caller ANDs this onto the query's own WHERE, so a token user only ever sees
+/// their permitted rows. `Err` when no read grant exists (deny-by-default); an
+/// unconditional grant yields an empty string (no extra filter).
+pub(crate) fn read_filter(
     store: &Store,
     cache: &SharedSchemaCache,
     principal: &AuthPrincipal,
     table: &str,
-    query_conditions: &[crate::grants::ResolvedCond],
     now: Instant,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Read, now)?
     else {
         return Err(format!("no read access to '{table}'"));
     };
     let resolved = resolve_for_principal(&pred, principal)?;
-    if crate::grants::query_satisfies(&resolved, query_conditions) {
-        Ok(())
-    } else {
-        Err(format!("query not permitted by read grant on '{table}'"))
-    }
+    Ok(render_grant_filter(&resolved))
+}
+
+/// Like `read_filter`, but returns the resolved conditions as structured tuples
+/// (column, op, value) instead of a rendered string. Used by the `.live()` path,
+/// which merges them into the subscription's own `where_conditions` so both the
+/// initial snapshot and streamed events are scoped to the grant.
+pub(crate) fn read_filter_conds(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    now: Instant,
+) -> Result<Vec<crate::grants::ResolvedCond>, String> {
+    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Read, now)?
+    else {
+        return Err(format!("no read access to '{table}'"));
+    };
+    resolve_for_principal(&pred, principal)
 }
 
 /// Enforce a WRITE grant on a new/updated row (WITH CHECK).
@@ -2465,25 +2492,24 @@ pub(crate) fn check_write_row(
     }
 }
 
-/// Enforce a WRITE grant on an UPDATE/DELETE WHERE (only target rows in scope).
-pub(crate) fn check_write_where(
+/// Resolve the WRITE grant for `principal` into a WHERE filter fragment that
+/// scopes an UPDATE/DELETE to the rows the grant allows (RLS `USING`). The
+/// caller ANDs this onto the statement's WHERE so only in-scope rows are
+/// touched. `Err` when no write grant exists (deny-by-default). (INSERT/UPSERT
+/// use `check_write_row` for WITH CHECK on the new row.)
+pub(crate) fn write_filter(
     store: &Store,
     cache: &SharedSchemaCache,
     principal: &AuthPrincipal,
     table: &str,
-    where_conditions: &[crate::grants::ResolvedCond],
     now: Instant,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Write, now)?
     else {
         return Err(format!("no write access to '{table}'"));
     };
     let resolved = resolve_for_principal(&pred, principal)?;
-    if crate::grants::query_satisfies(&resolved, where_conditions) {
-        Ok(())
-    } else {
-        Err(format!("query not permitted by write grant on '{table}'"))
-    }
+    Ok(render_grant_filter(&resolved))
 }
 
 fn find_rows_by_field(
@@ -2733,48 +2759,16 @@ mod tests {
         put_grant(&store, &cache, &grant, now).unwrap();
 
         let p = principal("123abc");
-        // Query scoped to own rows -> allowed.
-        assert!(check_read(
-            &store,
-            &cache,
-            &p,
-            "messages",
-            &[cond("user_id", "=", "123abc")],
-            now
-        )
-        .is_ok());
-        // Extra filter on top -> still allowed (stricter).
-        assert!(check_read(
-            &store,
-            &cache,
-            &p,
-            "messages",
-            &[cond("user_id", "=", "123abc"), cond("room", "=", "abc")],
-            now
-        )
-        .is_ok());
-        // Unscoped query -> denied.
-        assert!(check_read(&store, &cache, &p, "messages", &[], now).is_err());
-        // Asking for another user's rows -> denied.
-        assert!(check_read(
-            &store,
-            &cache,
-            &p,
-            "messages",
-            &[cond("user_id", "=", "evil")],
-            now
-        )
-        .is_err());
-        // No grant on another table -> deny-by-default.
-        assert!(check_read(
-            &store,
-            &cache,
-            &p,
-            "secrets",
-            &[cond("user_id", "=", "123abc")],
-            now
-        )
-        .is_err());
+        // Read grant resolves to a filter scoping the query to the caller's
+        // own rows (RLS USING) -- the caller's uid is substituted for auth.uid().
+        let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
+        assert_eq!(filter, "user_id = 123abc");
+        // A different principal gets a filter scoped to *their* uid, never others'.
+        let other = principal("999zzz");
+        let other_filter = read_filter(&store, &cache, &other, "messages", now).unwrap();
+        assert_eq!(other_filter, "user_id = 999zzz");
+        // No grant on another table -> deny-by-default (Err, not an open filter).
+        assert!(read_filter(&store, &cache, &p, "secrets", now).is_err());
     }
 
     #[test]
@@ -2808,17 +2802,12 @@ mod tests {
             _ => None,
         };
         assert!(check_write_row(&store, &cache, &p, "messages", other, now).is_err());
-        // Delete scoped to own rows -> allowed; unscoped -> denied.
-        assert!(check_write_where(
-            &store,
-            &cache,
-            &p,
-            "messages",
-            &[cond("user_id", "=", "123abc")],
-            now
-        )
-        .is_ok());
-        assert!(check_write_where(&store, &cache, &p, "messages", &[], now).is_err());
+        // UPDATE/DELETE: the write grant resolves to a filter that scopes the
+        // statement to the caller's own rows (RLS USING).
+        let filter = write_filter(&store, &cache, &p, "messages", now).unwrap();
+        assert_eq!(filter, "user_id = 123abc");
+        // No write grant on another table -> deny-by-default (Err).
+        assert!(write_filter(&store, &cache, &p, "other", now).is_err());
     }
 
     #[test]
@@ -2838,26 +2827,145 @@ mod tests {
         .unwrap();
         put_grant(&store, &cache, &grant, now).unwrap();
         let p = principal("123abc");
-        assert!(check_read(
-            &store,
-            &cache,
-            &p,
-            "messages",
-            &[cond("user_id", "=", "123abc")],
-            now
-        )
-        .is_ok());
+        assert!(read_filter(&store, &cache, &p, "messages", now).is_ok());
         delete_grant(&store, &cache, "messages", crate::grants::Scope::Read, now).unwrap();
         // After revoke -> deny-by-default.
-        assert!(check_read(
+        assert!(read_filter(&store, &cache, &p, "messages", now).is_err());
+    }
+
+    // ── RLS auto-filter (USING) coverage ──
+
+    fn grant(store: &Store, cache: &SharedSchemaCache, args: &[&str], now: Instant) {
+        let g = crate::grants::parse_grant(args).unwrap();
+        put_grant(store, cache, &g, now).unwrap();
+    }
+
+    #[test]
+    fn read_filter_conds_returns_structured_conditions() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
             &store,
             &cache,
-            &p,
-            "messages",
-            &[cond("user_id", "=", "123abc")],
-            now
-        )
-        .is_err());
+            &[
+                "read",
+                "ON",
+                "messages",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()",
+            ],
+            now,
+        );
+        let p = principal("abc123");
+        let conds = read_filter_conds(&store, &cache, &p, "messages", now).unwrap();
+        assert_eq!(conds, vec![cond("user_id", "=", "abc123")]);
+    }
+
+    #[test]
+    fn unconditional_grant_yields_empty_filter() {
+        // GRANT read ON public_posts (no WHERE) -> everyone with the grant reads
+        // all rows; the filter is empty (no narrowing), but access is NOT denied.
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(&store, &cache, &["read", "ON", "public_posts"], now);
+        let p = principal("anyone");
+        let filter = read_filter(&store, &cache, &p, "public_posts", now).unwrap();
+        assert_eq!(filter, "");
+        assert!(read_filter_conds(&store, &cache, &p, "public_posts", now)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn multi_condition_grant_renders_and_chain() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
+            &store,
+            &cache,
+            &[
+                "read",
+                "ON",
+                "messages",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()",
+                "AND",
+                "room",
+                "=",
+                "general",
+            ],
+            now,
+        );
+        let p = principal("u1");
+        let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
+        assert_eq!(filter, "user_id = u1 AND room = general");
+    }
+
+    #[test]
+    fn grant_resolves_non_uid_claims() {
+        // auth.role / auth.email operands resolve from the principal's claims.
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
+            &store,
+            &cache,
+            &["read", "ON", "audit", "WHERE", "owner", "=", "auth.email"],
+            now,
+        );
+        let p = principal("u1");
+        let filter = read_filter(&store, &cache, &p, "audit", now).unwrap();
+        assert_eq!(filter, "owner = u@x.dev");
+    }
+
+    #[test]
+    fn read_and_write_grants_are_independent_scopes() {
+        // A read grant does not imply a write filter and vice versa: each scope
+        // is loaded separately, so a read-only table denies write_filter.
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
+            &store,
+            &cache,
+            &["read", "ON", "feed", "WHERE", "user_id", "=", "auth.uid()"],
+            now,
+        );
+        let p = principal("u1");
+        assert_eq!(
+            read_filter(&store, &cache, &p, "feed", now).unwrap(),
+            "user_id = u1"
+        );
+        // No write grant -> writes denied even though reads are allowed.
+        assert!(write_filter(&store, &cache, &p, "feed", now).is_err());
+        assert!(check_write_row(&store, &cache, &p, "feed", |_| None, now).is_err());
+    }
+
+    #[test]
+    fn comparison_operators_round_trip_into_filter() {
+        // Non-equality operators (>, >=, etc.) survive into the rendered filter
+        // so range grants (e.g. "created_at > X") scope correctly.
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
+            &store,
+            &cache,
+            &["read", "ON", "events", "WHERE", "priority", ">=", "5"],
+            now,
+        );
+        let p = principal("u1");
+        assert_eq!(
+            read_filter(&store, &cache, &p, "events", now).unwrap(),
+            "priority >= 5"
+        );
     }
 
     #[test]
