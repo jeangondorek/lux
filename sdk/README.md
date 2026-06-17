@@ -80,17 +80,32 @@ const { data: matches } = await lux
   .near("embedding", queryEmbedding, { k: 10, threshold: 0.8 });
 ```
 
+Writes return the affected row(s), including server-generated columns (`id`,
+UUIDv7 primary keys, `DEFAULT now()` timestamps):
+
 ```ts
+// insert -> the inserted row
 const { data: inserted, error: insertError } = await lux
   .table("messages")
   .insert({ body: "hello", channel: "general" });
 
-const { data: updated, error: updateError } = await lux
+// bulk insert in a single request -> array of rows
+const { data: many } = await lux
+  .table("messages")
+  .insert([{ body: "a" }, { body: "b" }]);
+
+// upsert: insert, or update the row that conflicts on `onConflict` (default: PK)
+const { data: user } = await lux
+  .table("users")
+  .upsert({ email: "a@x.com", name: "Bob" }, { onConflict: "email" });
+
+// update / delete -> the affected rows
+const { data: updated } = await lux
   .table("messages")
   .update({ body: "edited" })
   .eq("id", inserted?.id);
 
-const { data: deleted, error: deleteError } = await lux
+const { data: deleted } = await lux
   .table("messages")
   .delete()
   .eq("id", inserted?.id);
@@ -115,6 +130,10 @@ await lux.table("events").select().eq("metadata.plan.tier", "pro");
 // IS VALID is existence, not truthiness: 0 / false / "" all count as valid.
 await lux.table("events").select().isValid("metadata.count");
 await lux.table("events").select().isNotValid("metadata.deleted_at");
+
+// IS NULL / IS NOT NULL on a regular column (NULL == the column is absent)
+await lux.table("tasks").select().isNull("deleted_at");
+await lux.table("tasks").select().isNotNull("archived_at");
 
 // Array membership, and a declared JSON-path index for range queries at scale.
 await lux.table("events").select().contains("tags", "urgent");
