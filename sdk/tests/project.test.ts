@@ -157,15 +157,17 @@ describe('Lux project client', () => {
 			fetch: fetchImpl as typeof fetch,
 		});
 
-		await client.table('cities').select().eq('name', 'New York');
-		await client.table('posts').select().eq('title', 'a OR b').gt('rank', 5);
-		await client.table('people').select().eq('name', "O'Brien");
-		await client.table('nums').select().eq('id', 42); // numbers stay bare
+		await client.table('cities').select().eq('name', 'New York'); // space -> quoted
+		await client.table('posts').select().eq('title', 'a OR b').gt('rank', 5); // space -> quoted
+		await client.table('people').select().eq('name', "O'Brien"); // no space -> bare (back-compat)
+		await client.table('users').select().eq('email', 'a@b.com'); // no space -> bare
+		await client.table('nums').select().eq('id', 42); // number -> bare
 
 		expect(seen).toEqual([
 			"name = 'New York'",
 			"title = 'a OR b' AND rank > 5",
-			"name = 'O\\'Brien'",
+			"name = O'Brien",
+			'email = a@b.com',
 			'id = 42',
 		]);
 	});

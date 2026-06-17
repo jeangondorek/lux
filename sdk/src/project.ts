@@ -956,10 +956,13 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 function formatWhereValue(value: QueryValue): string {
 	if (value === null) return '';
 	if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-	// Single-quote string values (escaping \ and ') so values containing spaces,
-	// SQL keywords, quotes, or newlines survive the engine's WHERE tokenizer
-	// instead of being split into bogus extra tokens.
-	const escaped = String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+	const str = String(value);
+	// Only quote values that would otherwise be split by the engine's WHERE
+	// tokenizer (whitespace), or that start with a quote (which the tokenizer
+	// would treat as an opening quote). Everything else stays bare, so simple
+	// values keep working against engines that predate quoted-WHERE support.
+	if (!/\s/.test(str) && !str.startsWith("'")) return str;
+	const escaped = str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 	return `'${escaped}'`;
 }
 
