@@ -1379,6 +1379,23 @@ pub fn table_insert_returning(
     Ok(row)
 }
 
+/// Insert multiple rows, returning the inserted rows. Not atomic: if a row
+/// fails, the rows inserted before it remain (Lux has no multi-row transaction).
+pub fn table_insert_many_returning(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    rows: &[Vec<(String, String)>],
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fv: Vec<(&str, &str)> = row.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        out.push(table_insert_returning(store, cache, table, &fv, now)?);
+    }
+    Ok(out)
+}
+
 /// Core insert: returns the primary-key string of the new row.
 fn table_insert_pk(
     store: &Store,
@@ -6422,6 +6439,31 @@ mod tests {
         assert_eq!(cell(&rows[0], "title"), "beta");
         // The row is gone afterward.
         assert_eq!(table_count(&store, &cache, "tasks", now).unwrap(), 2);
+    }
+
+    #[test]
+    fn insert_many_returning_inserts_all_rows() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "c",
+            &["id INT PRIMARY KEY,", "body STR"],
+            now,
+        )
+        .unwrap();
+        let rows = vec![
+            vec![("body".to_string(), "a".to_string())],
+            vec![("body".to_string(), "b".to_string())],
+            vec![("body".to_string(), "c".to_string())],
+        ];
+        let out = table_insert_many_returning(&store, &cache, "c", &rows, now).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(cell(&out[0], "body"), "a");
+        assert_eq!(cell(&out[2], "body"), "c");
+        assert_eq!(table_count(&store, &cache, "c", now).unwrap(), 3);
     }
 
     // -------------------------------------------------------------------------

@@ -2569,6 +2569,22 @@ fn route_table_query(
     }
 }
 
+/// Flatten a JSON object into the (column, value) string pairs TINSERT expects.
+fn json_obj_to_pairs(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    obj.iter()
+        .map(|(k, v)| {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => String::new(),
+                _ => v.to_string(),
+            };
+            (k.clone(), val)
+        })
+        .collect()
+}
+
 fn route_table_insert(
     table: &str,
     body: &str,
@@ -2587,43 +2603,54 @@ fn route_table_insert(
             )
         }
     };
+    let now = Instant::now();
 
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => {
-            return (
+    // Array body: bulk insert, returning the inserted rows as an array.
+    if let Some(arr) = parsed.as_array() {
+        let mut rows_in: Vec<Vec<(String, String)>> = Vec::with_capacity(arr.len());
+        for item in arr {
+            let Some(obj) = item.as_object() else {
+                return (
+                    400,
+                    "Bad Request",
+                    r#"{"error":"expected json object in array"}"#.to_string(),
+                );
+            };
+            if let Err(resp) = enforce_table_insert(store, cache, auth, table, obj) {
+                return resp;
+            }
+            rows_in.push(json_obj_to_pairs(obj));
+        }
+        return match crate::tables::table_insert_many_returning(store, cache, table, &rows_in, now)
+        {
+            Ok(rows) => {
+                broker.enqueue_key_event(table.as_bytes(), b"TINSERT");
+                ok(rows_to_json_array(&rows))
+            }
+            Err(e) => (
                 400,
                 "Bad Request",
-                r#"{"error":"expected json object"}"#.to_string(),
-            )
-        }
-    };
-
-    if let Err((status, status_text, body)) = enforce_table_insert(store, cache, auth, table, obj) {
-        return (status, status_text, body);
+                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+            ),
+        };
     }
 
-    // Build field-value pairs directly - avoids RESP encode/decode round-trip through exec_simple
-    let val_strings: Vec<(String, String)> = obj
-        .iter()
-        .map(|(k, v)| {
-            let val = match v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                serde_json::Value::Null => String::new(),
-                _ => v.to_string(),
-            };
-            (k.clone(), val)
-        })
-        .collect();
-
-    let field_values: Vec<(&str, &str)> = val_strings
+    let Some(obj) = parsed.as_object() else {
+        return (
+            400,
+            "Bad Request",
+            r#"{"error":"expected json object"}"#.to_string(),
+        );
+    };
+    if let Err(resp) = enforce_table_insert(store, cache, auth, table, obj) {
+        return resp;
+    }
+    let pairs = json_obj_to_pairs(obj);
+    let field_values: Vec<(&str, &str)> = pairs
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let now = Instant::now();
     match crate::tables::table_insert_returning(store, cache, table, &field_values, now) {
         Ok(row) => {
             broker.enqueue_key_event(table.as_bytes(), b"TINSERT");
