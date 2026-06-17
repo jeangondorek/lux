@@ -2218,8 +2218,17 @@ fn route_request_with_auth(
         // ── Table routes (PostgREST-style) ──
         ("GET", ["tables"]) => ok(exec_json(store, broker, cache, script_engine, &["TLIST"])),
         ("POST", ["tables"]) => route_table_create(body, store, broker, cache, script_engine),
-        ("GET", ["tables", table]) => route_table_query(table, params, store, broker, cache),
+        ("GET", ["tables", table]) => {
+            let where_clause = get_param(params, "where").unwrap_or("");
+            if let Err(resp) = enforce_table_read(store, cache, auth, table, where_clause) {
+                return resp;
+            }
+            route_table_query(table, params, store, broker, cache)
+        }
         ("GET", ["tables", table, "schema"]) => {
+            if let Err(resp) = enforce_table_read(store, cache, auth, table, "") {
+                return resp;
+            }
             if let Some(err) = crate::auth::reserved_table_access_error(table) {
                 return (
                     403,
@@ -2244,6 +2253,9 @@ fn route_request_with_auth(
             }
         }
         ("GET", ["tables", table, "count"]) => {
+            if let Err(resp) = enforce_table_read(store, cache, auth, table, "") {
+                return resp;
+            }
             if let Some(err) = crate::auth::reserved_table_access_error(table) {
                 return (
                     403,

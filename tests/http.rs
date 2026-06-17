@@ -458,6 +458,24 @@ fn http_auth_token_users_denied_data_apis() {
         );
     }
 
+    // Table reads must be grant-enforced identically on the legacy `/tables`
+    // path and the `/v1/tables` path. Create a table as operator, then confirm
+    // anonymous (401) and an ungranted token user (403) are denied on BOTH.
+    let (status, _) = http_request(
+        17705,
+        "POST",
+        "/v1/tables",
+        Some(r#"{"name":"t_parity","columns":["id INT","body STR"]}"#),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "operator create table");
+    for path in ["/tables/t_parity", "/v1/tables/t_parity"] {
+        let (anon, b1) = http_request(17705, "GET", path, None, None);
+        assert_eq!(anon, 401, "anonymous read {path} should be 401: {b1}");
+        let (tok, b2) = http_request(17705, "GET", path, None, Some(access_token));
+        assert_eq!(tok, 403, "ungranted token read {path} should be 403: {b2}");
+    }
+
     // The operator credential bypasses and reaches the data routes.
     let (status, body) = http_request(
         17705,
