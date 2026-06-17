@@ -944,6 +944,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 2,
     },
     CommandSpec {
+        name: b"TUPSERT",
+        min_arity: 2,
+    },
+    CommandSpec {
         name: b"TUPDATE",
         min_arity: 7,
     },
@@ -1950,6 +1954,9 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"TINSERT") {
                 return tables::cmd_tinsert(args, store, cache, out, now);
+            }
+            if cmd_eq(cmd, b"TUPSERT") {
+                return tables::cmd_tupsert(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TUPDATE") {
                 return tables::cmd_tupdate(args, store, cache, out, now);

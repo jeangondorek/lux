@@ -2261,7 +2261,9 @@ fn route_request_with_auth(
                 ),
             }
         }
-        ("POST", ["tables", table]) => route_table_insert(table, body, store, broker, cache, auth),
+        ("POST", ["tables", table]) => {
+            route_table_insert(table, params, body, store, broker, cache, auth)
+        }
         // Bulk update via PATCH (requires where parameter for safety)
         ("PATCH", ["tables", table]) => route_table_update(
             table,
@@ -2587,6 +2589,7 @@ fn json_obj_to_pairs(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<(S
 
 fn route_table_insert(
     table: &str,
+    params: &[(String, String)],
     body: &str,
     store: &Arc<Store>,
     broker: &Broker,
@@ -2604,8 +2607,25 @@ fn route_table_insert(
         }
     };
     let now = Instant::now();
+    // `?on_conflict=col` (or `?upsert=true`) turns this into an upsert keyed on
+    // that column (default: the primary key).
+    let conflict = get_param(params, "on_conflict");
+    let is_upsert = conflict.is_some() || get_param(params, "upsert") == Some("true");
 
-    // Array body: bulk insert, returning the inserted rows as an array.
+    let write_one = |obj: &serde_json::Map<String, serde_json::Value>| {
+        let pairs = json_obj_to_pairs(obj);
+        let fv: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        if is_upsert {
+            crate::tables::table_upsert_returning(store, cache, table, &fv, conflict, now)
+        } else {
+            crate::tables::table_insert_returning(store, cache, table, &fv, now)
+        }
+    };
+
+    // Array body: bulk insert/upsert, returning the affected rows as an array.
     if let Some(arr) = parsed.as_array() {
         let mut rows_in: Vec<Vec<(String, String)>> = Vec::with_capacity(arr.len());
         for item in arr {
@@ -2621,8 +2641,21 @@ fn route_table_insert(
             }
             rows_in.push(json_obj_to_pairs(obj));
         }
-        return match crate::tables::table_insert_many_returning(store, cache, table, &rows_in, now)
-        {
+        let result = if is_upsert {
+            rows_in
+                .iter()
+                .map(|pairs| {
+                    let fv: Vec<(&str, &str)> = pairs
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    crate::tables::table_upsert_returning(store, cache, table, &fv, conflict, now)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        } else {
+            crate::tables::table_insert_many_returning(store, cache, table, &rows_in, now)
+        };
+        return match result {
             Ok(rows) => {
                 broker.enqueue_key_event(table.as_bytes(), b"TINSERT");
                 ok(rows_to_json_array(&rows))
@@ -2645,13 +2678,7 @@ fn route_table_insert(
     if let Err(resp) = enforce_table_insert(store, cache, auth, table, obj) {
         return resp;
     }
-    let pairs = json_obj_to_pairs(obj);
-    let field_values: Vec<(&str, &str)> = pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
-    match crate::tables::table_insert_returning(store, cache, table, &field_values, now) {
+    match write_one(obj) {
         Ok(row) => {
             broker.enqueue_key_event(table.as_bytes(), b"TINSERT");
             ok(row_to_json_object(&row))

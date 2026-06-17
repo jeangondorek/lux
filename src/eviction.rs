@@ -270,6 +270,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"TSMADD")
         || eq(cmd, b"TCREATE")
         || eq(cmd, b"TINSERT")
+        || eq(cmd, b"TUPSERT")
         || eq(cmd, b"TUPDATE")
         || eq(cmd, b"TDELETE")
         || eq(cmd, b"TDROP")

@@ -1396,6 +1396,71 @@ pub fn table_insert_many_returning(
     Ok(out)
 }
 
+/// Insert a row, or update the conflicting row if one already exists on the
+/// conflict column. `conflict_col` defaults to the primary key (implicit `id`
+/// when there is no declared PK). Returns the resulting row. The conflict
+/// column must carry the value to match on; without it this is a plain insert.
+pub fn table_upsert_returning(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    conflict_col: Option<&str>,
+    now: Instant,
+) -> Result<Vec<(String, String)>, String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let pk_name = schema
+        .iter()
+        .find(|f| f.primary_key)
+        .map(|f| f.name.as_str());
+    let conflict = conflict_col.or(pk_name).unwrap_or("id");
+
+    let Some(cval) = field_values
+        .iter()
+        .find(|(k, _)| *k == conflict)
+        .map(|(_, v)| *v)
+    else {
+        // No value to conflict on -> behaves as a plain insert.
+        return table_insert_returning(store, cache, table, field_values, now);
+    };
+
+    let conflict_is_pk = schema.iter().any(|f| f.primary_key && f.name == conflict)
+        || (pk_name.is_none() && conflict == "id");
+    let existing_pk: Option<String> = if conflict_is_pk {
+        let rk = row_key_for_pk(table, cval);
+        (!store
+            .hgetall(rk.as_bytes(), now)
+            .unwrap_or_default()
+            .is_empty())
+        .then(|| cval.to_string())
+    } else {
+        // Match via the column's unique index (only present for UNIQUE columns).
+        let ukey = uniq_key(table, conflict);
+        store
+            .hget(ukey.as_bytes(), cval.as_bytes(), now)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+    };
+
+    match existing_pk {
+        Some(pk) => {
+            // Update the conflicting row with the non-key fields, then return it.
+            let updates: Vec<(&str, &str)> = field_values
+                .iter()
+                .copied()
+                .filter(|(k, _)| *k != conflict)
+                .collect();
+            if !updates.is_empty() {
+                table_update_by_pk_str(store, cache, table, &pk, &updates, now)?;
+            }
+            let mut row = get_row(store, table, &schema, &pk, now)
+                .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
+            row.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(row)
+        }
+        None => table_insert_returning(store, cache, table, field_values, now),
+    }
+}
+
 /// Core insert: returns the primary-key string of the new row.
 fn table_insert_pk(
     store: &Store,
@@ -6439,6 +6504,60 @@ mod tests {
         assert_eq!(cell(&rows[0], "title"), "beta");
         // The row is gone afterward.
         assert_eq!(table_count(&store, &cache, "tasks", now).unwrap(), 2);
+    }
+
+    #[test]
+    fn upsert_inserts_then_updates_on_conflict() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "u",
+            &["id INT PRIMARY KEY,", "email STR UNIQUE,", "name STR"],
+            now,
+        )
+        .unwrap();
+
+        // First call inserts (conflict defaults to the PK).
+        let row = table_upsert_returning(
+            &store,
+            &cache,
+            "u",
+            &[("id", "1"), ("email", "a@x.com"), ("name", "Alice")],
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "name"), "Alice");
+
+        // Same id conflicts -> updates, no new row.
+        let row = table_upsert_returning(
+            &store,
+            &cache,
+            "u",
+            &[("id", "1"), ("name", "Alicia")],
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "name"), "Alicia");
+        assert_eq!(table_count(&store, &cache, "u", now).unwrap(), 1);
+
+        // Conflict on a UNIQUE column updates the matching row too.
+        let row = table_upsert_returning(
+            &store,
+            &cache,
+            "u",
+            &[("email", "a@x.com"), ("name", "Bob")],
+            Some("email"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "name"), "Bob");
+        assert_eq!(cell(&row, "id"), "1");
+        assert_eq!(table_count(&store, &cache, "u", now).unwrap(), 1);
     }
 
     #[test]

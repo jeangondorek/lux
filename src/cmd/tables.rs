@@ -35,6 +35,21 @@ fn split_returning<'a>(args: &'a [&'a [u8]]) -> (&'a [&'a [u8]], Option<Vec<Stri
     (&args[..idx], Some(cols))
 }
 
+/// Split a trailing `ON CONFLICT <col>` off a command, returning the remaining
+/// args and the conflict column (if present).
+fn split_on_conflict<'a>(args: &'a [&'a [u8]]) -> (&'a [&'a [u8]], Option<String>) {
+    for i in 0..args.len() {
+        if i + 1 < args.len()
+            && arg_str(args[i]).eq_ignore_ascii_case("ON")
+            && arg_str(args[i + 1]).eq_ignore_ascii_case("CONFLICT")
+        {
+            let col = args.get(i + 2).map(|a| arg_str(a).to_string());
+            return (&args[..i], col);
+        }
+    }
+    (args, None)
+}
+
 /// Write rows (optionally projected to `projection`) as a RESP array-of-rows,
 /// each row a flat array of field/value pairs, matching TSELECT's shape.
 fn write_rows(out: &mut BytesMut, rows: &[Vec<(String, String)>], projection: &[String]) {
@@ -120,6 +135,47 @@ pub fn cmd_tinsert(
             Ok(id) => resp::write_integer(out, id),
             Err(e) => resp::write_error(out, &e),
         },
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_tupsert(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    // TUPSERT <table> <col> <val> ... [ON CONFLICT <col>] [RETURNING *|cols]
+    let (args, returning) = split_returning(args);
+    let (args, conflict_col) = split_on_conflict(args);
+    if args.len() < 2 || !(args.len() - 2).is_multiple_of(2) {
+        resp::write_error(out, "ERR wrong number of arguments for 'tupsert' command");
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
+    let mut field_values: Vec<(&str, &str)> = Vec::new();
+    let mut i = 2;
+    while i + 1 < args.len() {
+        field_values.push((arg_str(args[i]), arg_str(args[i + 1])));
+        i += 2;
+    }
+    // Upsert always returns the resulting row; RETURNING can project it.
+    let proj = returning.unwrap_or_else(|| vec!["*".to_string()]);
+    match tables::table_upsert_returning(
+        store,
+        cache,
+        table,
+        &field_values,
+        conflict_col.as_deref(),
+        now,
+    ) {
+        Ok(row) => write_rows(out, &[row], &proj),
+        Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written
 }
