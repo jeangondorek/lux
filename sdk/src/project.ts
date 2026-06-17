@@ -814,21 +814,16 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
-		// The server returns the inserted row(s) ({result: row} for a single
-		// insert, {result: [rows]} for an array); unwrap to the row(s).
-		if (!Array.isArray(this.rowOrRows)) {
-			const res = await this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, this.rowOrRows);
-			if (res.error) return res as LuxResult<TResult>;
-			return ok(unwrapResult<TResult>(res.data) as TResult);
-		}
-
-		const results: unknown[] = [];
-		for (const row of this.rowOrRows) {
-			const res = await this.client.request('POST', `/tables/${encodeURIComponent(this.tableName)}`, row);
-			if (res.error) return res as LuxResult<TResult>;
-			results.push(unwrapResult(res.data));
-		}
-		return ok(results as TResult);
+		// One request for both shapes: an array body inserts all rows server-side
+		// in a single round-trip. The server returns the inserted row(s)
+		// ({result: row} for a single insert, {result: [rows]} for an array).
+		const res = await this.client.request(
+			'POST',
+			`/tables/${encodeURIComponent(this.tableName)}`,
+			this.rowOrRows,
+		);
+		if (res.error) return res as LuxResult<TResult>;
+		return ok(unwrapResult<TResult>(res.data) as TResult);
 	}
 }
 

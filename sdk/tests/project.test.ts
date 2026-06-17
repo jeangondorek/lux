@@ -238,6 +238,32 @@ describe('Lux project client', () => {
 		expect(updated).toEqual({ data: [{ id: '019ed-uuid', body: 'edited' }], error: null });
 	});
 
+	test('multi-row insert sends one request with an array body', async () => {
+		const calls: Array<{ method?: string; body?: unknown }> = [];
+		const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({
+				method: init?.method,
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			});
+			return new Response(
+				JSON.stringify({ result: [{ id: 1, body: 'a' }, { id: 2, body: 'b' }] }),
+				{ status: 200 },
+			);
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const res = await client.table('messages').insert([{ body: 'a' }, { body: 'b' }]);
+		expect(calls.length).toBe(1);
+		expect(calls[0].method).toBe('POST');
+		expect(calls[0].body).toEqual([{ body: 'a' }, { body: 'b' }]);
+		expect(res.data).toEqual([{ id: 1, body: 'a' }, { id: 2, body: 'b' }]);
+	});
+
 	test('project request errors return data/error envelopes', async () => {
 		const fetchImpl = async () => {
 			return new Response(JSON.stringify({ error: 'Secret key required' }), { status: 403 });
