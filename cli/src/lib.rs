@@ -248,16 +248,6 @@ struct Instance {
 }
 
 #[derive(Deserialize)]
-struct InstanceDetail {
-    public_endpoints: Option<PublicEndpoints>,
-}
-
-#[derive(Deserialize)]
-struct PublicEndpoints {
-    http: String,
-}
-
-#[derive(Deserialize)]
 struct Credentials {
     resp: String,
 }
@@ -524,8 +514,6 @@ pub async fn run() {
                     [
                         "LUX_PROJECT_ID=",
                         "LUX_URL=",
-                        "LUX_AUTH_URL=",
-                        "LUX_HTTP_URL=",
                         "LUX_DIRECT_URL=",
                         "LUX_PUBLISHABLE_KEY=",
                         "LUX_SECRET_KEY=",
@@ -1353,19 +1341,12 @@ pub async fn run() {
                 let (client, api_url, token) = get_client(&api_url_override);
                 let project = require_project_arg(project.as_deref());
                 let inst = find_project(&client, &api_url, &token, &project).await;
-                let detail = get_instance_detail(&client, &api_url, &token, &inst.id).await;
                 let credentials =
                     get_instance_credentials(&client, &api_url, &token, &inst.id).await;
                 let auth = get_auth_credentials(&client, &api_url, &token, &inst.id).await;
-                let http_url = detail
-                    .public_endpoints
-                    .as_ref()
-                    .map(|endpoints| endpoints.http.clone())
-                    .unwrap_or_default();
                 let content = build_project_env(
                     &inst.id,
                     &api_url,
-                    &http_url,
                     &credentials.resp,
                     auth.publishable_key.as_deref(),
                     auth.secret_key.as_deref(),
@@ -1791,28 +1772,6 @@ async fn exec_command_json(
     Ok(body)
 }
 
-async fn get_instance_detail(
-    client: &reqwest::Client,
-    api_url: &str,
-    token: &str,
-    instance_id: &str,
-) -> InstanceDetail {
-    let res = client
-        .get(format!("{api_url}/instances/{instance_id}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("{} {e}", "Failed:".red());
-            std::process::exit(1);
-        });
-    let body: ApiResponse<InstanceDetail> = res.json().await.unwrap_or_else(|e| {
-        eprintln!("{} {e}", "Failed to parse response:".red());
-        std::process::exit(1);
-    });
-    unwrap_api(body)
-}
-
 async fn get_instance_credentials(
     client: &reqwest::Client,
     api_url: &str,
@@ -1972,18 +1931,17 @@ fn format_json_value(val: &serde_json::Value) -> String {
 fn build_project_env(
     instance_id: &str,
     api_url: &str,
-    http_url: &str,
     direct_url: &str,
     publishable_key: Option<&str>,
     secret_key: Option<&str>,
 ) -> String {
+    // One primary URL. The SDK derives the auth endpoint ({LUX_URL}/auth/v1) and
+    // everything else from it. LUX_DIRECT_URL is the optional escape hatch for a
+    // direct (operator) connection that bypasses the gateway.
     let project_api_url = format!("{api_url}/v1/{instance_id}");
-    let auth_url = format!("{api_url}/v1/{instance_id}/auth/v1");
     [
         format!("LUX_PROJECT_ID={instance_id}"),
         format!("LUX_URL={project_api_url}"),
-        format!("LUX_AUTH_URL={auth_url}"),
-        format!("LUX_HTTP_URL={http_url}"),
         format!("LUX_DIRECT_URL={direct_url}"),
         format!(
             "LUX_PUBLISHABLE_KEY={}",
@@ -2747,7 +2705,6 @@ mod tests {
         let env = build_project_env(
             "inst_123",
             "https://api.luxdb.dev",
-            "https://inst.luxdb.dev/v1",
             "lux://:pw@host:10000",
             Some("lux_pub_test"),
             Some("lux_sec_test"),
@@ -2755,11 +2712,12 @@ mod tests {
 
         assert!(env.contains("LUX_PROJECT_ID=inst_123"));
         assert!(env.contains("LUX_URL=https://api.luxdb.dev/v1/inst_123"));
-        assert!(env.contains("LUX_AUTH_URL=https://api.luxdb.dev/v1/inst_123/auth/v1"));
-        assert!(env.contains("LUX_HTTP_URL=https://inst.luxdb.dev/v1"));
         assert!(env.contains("LUX_DIRECT_URL=lux://:pw@host:10000"));
         assert!(env.contains("LUX_PUBLISHABLE_KEY=lux_pub_test"));
         assert!(env.contains("LUX_SECRET_KEY=lux_sec_test"));
+        // The redundant derived URLs are no longer emitted.
+        assert!(!env.contains("LUX_AUTH_URL"));
+        assert!(!env.contains("LUX_HTTP_URL"));
     }
 
     #[test]
