@@ -4876,6 +4876,43 @@ mod tests {
     }
 
     #[test]
+    fn count_bool_applies_filter() {
+        // Regression: COUNT(*) WHERE <bool> = x used to ignore the filter and
+        // return the table total, because the bool index scores every row at
+        // 0.0 and the fast path trusted that candidate cardinality.
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "flags",
+            &["id", "INT", "PRIMARY", "KEY,", "ok", "BOOL"],
+            now,
+        )
+        .unwrap();
+        for (id, ok) in [
+            ("1", "true"),
+            ("2", "false"),
+            ("3", "true"),
+            ("4", "false"),
+            ("5", "true"),
+        ] {
+            table_insert(&store, &cache, "flags", &[("id", id), ("ok", ok)], now).unwrap();
+        }
+        let t = parse_select(&["COUNT(*)", "FROM", "flags", "WHERE", "ok", "=", "true"]).unwrap();
+        assert_eq!(agg_count(table_select(&store, &cache, &t, now).unwrap()), 3);
+        let f = parse_select(&["COUNT(*)", "FROM", "flags", "WHERE", "ok", "=", "false"]).unwrap();
+        assert_eq!(agg_count(table_select(&store, &cache, &f, now).unwrap()), 2);
+        // and it agrees with the row-returning path
+        let rows = parse_select(&["*", "FROM", "flags", "WHERE", "ok", "=", "true"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &rows, now).unwrap()),
+            3
+        );
+    }
+
+    #[test]
     fn count_indexed_json_path_matches_unindexed() {
         let store = Arc::new(Store::new());
         let cache = make_cache();

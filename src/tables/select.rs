@@ -1999,14 +1999,14 @@ pub(crate) fn count_is_exact_via_index(
             );
         }
         match schema.iter().find(|f| f.name == bare) {
+            // Bool is intentionally excluded: its sorted index stores every row
+            // at score 0.0 (`"true"`/`"false"` don't parse as f64), so the
+            // candidate set is never narrowed and its cardinality can't be
+            // trusted for a COUNT. Fall through to a row-rechecking count.
             Some(fd) => matches!(
                 (&fd.field_type, &c.op),
                 (
-                    FieldType::Int
-                        | FieldType::Float
-                        | FieldType::Bool
-                        | FieldType::Timestamp
-                        | FieldType::Ref(_),
+                    FieldType::Int | FieldType::Float | FieldType::Timestamp | FieldType::Ref(_),
                     CmpOp::Eq | CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le
                 ) | (FieldType::Str | FieldType::Uuid, CmpOp::Eq)
             ),
