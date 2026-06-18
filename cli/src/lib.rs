@@ -934,6 +934,12 @@ pub async fn run() {
                 "LUX_BIND_HOST=0.0.0.0",
                 "-e",
                 "LUX_DATA_DIR=/data",
+                // Tiered (WAL) storage so local-dev data survives a crash/restart;
+                // memory mode only persists on periodic snapshots.
+                "-e",
+                "LUX_STORAGE_MODE=tiered",
+                "-e",
+                "LUX_STORAGE_DIR=/data/storage",
                 "-e",
                 &issuer,
                 "--restart",
