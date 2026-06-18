@@ -2547,3 +2547,73 @@ pub(crate) fn rows_for_pks(
         })
         .collect()
 }
+
+/// True if `v` is safe to emit as a single bare WHERE token (no whitespace and
+/// no characters that would break `IN ( ... )` tokenization).
+fn is_token_safe(v: &str) -> bool {
+    !v.is_empty()
+        && !v
+            .chars()
+            .any(|c| c.is_whitespace() || c == '(' || c == ')' || c == '\'')
+}
+
+/// Scan `table` for rows matching `conditions` and collect the distinct values
+/// of one `projected` column. Used to resolve a grant subquery to a membership
+/// set. When `projected` is the primary key (not a stored hash field), the row's
+/// pk is used. Capped to avoid unbounded membership sets.
+pub(crate) fn scan_projected_column(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    conditions: &[WhereClause],
+    projected: &str,
+    now: Instant,
+) -> Result<Vec<String>, String> {
+    const MAX_MEMBERSHIP: usize = 100_000;
+    let (schema, pks) = scan_matching_pks(store, cache, table, conditions, now)?;
+
+    // Validate the projected column exists (allow "id" on implicit-PK tables).
+    let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
+    let projected_is_id = has_implicit_pk && projected == "id";
+    let projected_is_pk = schema.iter().any(|f| f.primary_key && f.name == projected);
+    if !projected_is_id && !projected_is_pk && !schema.iter().any(|f| f.name == projected) {
+        return Err(format!(
+            "ERR grant subquery selects unknown column '{projected}' from '{table}'"
+        ));
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for pk in &pks {
+        let value = if projected_is_id || projected_is_pk {
+            // The pk *is* the projected value (it may not be a stored field).
+            Some(pk.clone())
+        } else {
+            get_row(store, table, &schema, pk, now).and_then(|row| {
+                row.into_iter()
+                    .find(|(k, _)| k == projected)
+                    .map(|(_, v)| v)
+            })
+        };
+        if let Some(v) = value {
+            // Fail closed on values that aren't safe as a single WHERE token. The
+            // membership set is enforced both as a re-tokenized `IN ( a b c )`
+            // string (read/write) and as discrete tokens (live); a value with
+            // whitespace or parens/quotes could split and over-match (an RLS
+            // escalation), so such a value is excluded from the set entirely.
+            // Membership keys are ids/slugs in practice, so this never triggers.
+            if !is_token_safe(&v) {
+                continue;
+            }
+            if seen.insert(v.clone()) {
+                if out.len() >= MAX_MEMBERSHIP {
+                    return Err(format!(
+                        "ERR grant subquery on '{table}' matched more than {MAX_MEMBERSHIP} rows"
+                    ));
+                }
+                out.push(v);
+            }
+        }
+    }
+    Ok(out)
+}

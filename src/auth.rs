@@ -2414,7 +2414,7 @@ fn load_grant_predicate(
 fn resolve_for_principal(
     pred: &crate::grants::Predicate,
     principal: &AuthPrincipal,
-) -> Result<Vec<crate::grants::ResolvedCond>, String> {
+) -> Result<Vec<crate::grants::ResolvedCondition>, String> {
     crate::grants::resolve(pred, &principal.user_id, |claim| match claim {
         "role" => Some(principal.role.clone()),
         "email" => Some(principal.email.clone()),
@@ -2423,14 +2423,117 @@ fn resolve_for_principal(
     })
 }
 
-/// Render resolved grant conditions as a WHERE fragment (`col op val AND ...`).
-/// An unconditional grant (no conditions) renders to an empty string.
-fn render_grant_filter(conds: &[crate::grants::ResolvedCond]) -> String {
+/// Convert a subquery's resolved inner conditions into query `WhereClause`s.
+fn inner_conds_to_where(conds: &[crate::grants::ResolvedCond]) -> Result<Vec<WhereClause>, String> {
     conds
         .iter()
-        .map(|c| format!("{} {} {}", c.column, c.op, c.value))
-        .collect::<Vec<_>>()
-        .join(" AND ")
+        .map(|rc| {
+            Ok(WhereClause::single(
+                rc.column.clone(),
+                tables::parse_cmp_op(&rc.op)?,
+                rc.value.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// Execute any subquery conditions (once) against the store, turning resolved
+/// conditions into fully-enforced ones (subqueries become membership sets).
+fn execute_resolved(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    conds: Vec<crate::grants::ResolvedCondition>,
+    now: Instant,
+) -> Result<Vec<crate::grants::EnforcedCondition>, String> {
+    use crate::grants::{EnforcedCondition, ResolvedCondition};
+    let mut out = Vec::with_capacity(conds.len());
+    for c in conds {
+        match c {
+            ResolvedCondition::Cmp(rc) => out.push(EnforcedCondition::Cmp(rc)),
+            ResolvedCondition::InSubqueryResolved {
+                column,
+                negated,
+                inner_table,
+                inner_projected,
+                inner_conds,
+            } => {
+                // Defense in depth: a grant subquery may never read auth tables.
+                if let Some(err) = reserved_table_access_error(&inner_table) {
+                    return Err(err);
+                }
+                let where_clauses = inner_conds_to_where(&inner_conds)?;
+                let values = tables::scan_projected_column(
+                    store,
+                    cache,
+                    &inner_table,
+                    &where_clauses,
+                    &inner_projected,
+                    now,
+                )?;
+                out.push(EnforcedCondition::InSet {
+                    column,
+                    negated,
+                    values,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Render enforced conditions into a WHERE fragment that the query path ANDs
+/// onto the caller's own WHERE (RLS `USING`). `IN`/`NOT IN` sets render as
+/// `col IN ( a b c )` - the engine's WHERE parser already handles these.
+///
+/// Empty-set handling, both expressed *within* the rendered string so the read
+/// and write paths need no special casing:
+/// - empty positive set (`IN ( )` is invalid, and the caller may see no rows):
+///   render an always-false, type-agnostic contradiction `col IS NULL AND col
+///   IS NOT NULL` so the query matches nothing.
+/// - empty negated set (`NOT IN ( )` matches everything): omit it.
+fn render_enforced(conds: &[crate::grants::EnforcedCondition]) -> String {
+    use crate::grants::EnforcedCondition;
+    let mut parts: Vec<String> = Vec::new();
+    for c in conds {
+        match c {
+            EnforcedCondition::Cmp(rc) => {
+                parts.push(format!("{} {} {}", rc.column, rc.op, rc.value))
+            }
+            EnforcedCondition::InSet {
+                column,
+                negated,
+                values,
+            } => {
+                if values.is_empty() {
+                    if !negated {
+                        parts.push(format!("{column} IS NULL AND {column} IS NOT NULL"));
+                    }
+                    // empty NOT IN matches all rows -> nothing to add
+                } else {
+                    let kw = if *negated { "NOT IN" } else { "IN" };
+                    parts.push(format!("{column} {kw} ( {} )", values.join(" ")));
+                }
+            }
+        }
+    }
+    parts.join(" AND ")
+}
+
+/// Resolve + execute the grant for `(table, scope)` into enforced conditions.
+/// `Ok(None)` means no grant exists (deny-by-default).
+fn enforced_conds(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    scope: crate::grants::Scope,
+    now: Instant,
+) -> Result<Option<Vec<crate::grants::EnforcedCondition>>, String> {
+    let Some(pred) = load_grant_predicate(store, cache, table, scope, now)? else {
+        return Ok(None);
+    };
+    let resolved = resolve_for_principal(&pred, principal)?;
+    Ok(Some(execute_resolved(store, cache, resolved, now)?))
 }
 
 /// Resolve the READ grant for `principal` into a WHERE filter fragment that
@@ -2445,12 +2548,18 @@ pub(crate) fn read_filter(
     table: &str,
     now: Instant,
 ) -> Result<String, String> {
-    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Read, now)?
+    let Some(conds) = enforced_conds(
+        store,
+        cache,
+        principal,
+        table,
+        crate::grants::Scope::Read,
+        now,
+    )?
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    let resolved = resolve_for_principal(&pred, principal)?;
-    Ok(render_grant_filter(&resolved))
+    Ok(render_enforced(&conds))
 }
 
 /// Like `read_filter`, but returns the resolved conditions as structured tuples
@@ -2463,12 +2572,19 @@ pub(crate) fn read_filter_conds(
     principal: &AuthPrincipal,
     table: &str,
     now: Instant,
-) -> Result<Vec<crate::grants::ResolvedCond>, String> {
-    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Read, now)?
+) -> Result<Vec<crate::grants::EnforcedCondition>, String> {
+    let Some(conds) = enforced_conds(
+        store,
+        cache,
+        principal,
+        table,
+        crate::grants::Scope::Read,
+        now,
+    )?
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    resolve_for_principal(&pred, principal)
+    Ok(conds)
 }
 
 /// Enforce a WRITE grant on a new/updated row (WITH CHECK).
@@ -2480,12 +2596,18 @@ pub(crate) fn check_write_row(
     row_value: impl Fn(&str) -> Option<String>,
     now: Instant,
 ) -> Result<(), String> {
-    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Write, now)?
+    let Some(conds) = enforced_conds(
+        store,
+        cache,
+        principal,
+        table,
+        crate::grants::Scope::Write,
+        now,
+    )?
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    let resolved = resolve_for_principal(&pred, principal)?;
-    if crate::grants::row_satisfies(&resolved, row_value) {
+    if crate::grants::enforced_row_satisfies(&conds, row_value) {
         Ok(())
     } else {
         Err(format!("row not permitted by write grant on '{table}'"))
@@ -2506,22 +2628,24 @@ pub(crate) fn check_update_set(
     set_fields: &[(&str, &str)],
     now: Instant,
 ) -> Result<(), String> {
-    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Write, now)?
+    let Some(conds) = enforced_conds(
+        store,
+        cache,
+        principal,
+        table,
+        crate::grants::Scope::Write,
+        now,
+    )?
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    let resolved = resolve_for_principal(&pred, principal)?;
-    for cond in &resolved {
-        if let Some((_, new_val)) = set_fields.iter().find(|(c, _)| *c == cond.column) {
-            if !crate::grants::cond_matches(cond, new_val) {
-                return Err(format!(
-                    "update would move a row outside the write grant on '{table}' ({} {} {})",
-                    cond.column, cond.op, cond.value
-                ));
-            }
-        }
+    if crate::grants::enforced_set_satisfies(&conds, set_fields) {
+        Ok(())
+    } else {
+        Err(format!(
+            "update would move a row outside the write grant on '{table}'"
+        ))
     }
-    Ok(())
 }
 
 /// Resolve the WRITE grant for `principal` into a WHERE filter fragment that
@@ -2536,12 +2660,18 @@ pub(crate) fn write_filter(
     table: &str,
     now: Instant,
 ) -> Result<String, String> {
-    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Write, now)?
+    let Some(conds) = enforced_conds(
+        store,
+        cache,
+        principal,
+        table,
+        crate::grants::Scope::Write,
+        now,
+    )?
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    let resolved = resolve_for_principal(&pred, principal)?;
-    Ok(render_grant_filter(&resolved))
+    Ok(render_enforced(&conds))
 }
 
 fn find_rows_by_field(
@@ -2987,7 +3117,12 @@ mod tests {
         );
         let p = principal("abc123");
         let conds = read_filter_conds(&store, &cache, &p, "messages", now).unwrap();
-        assert_eq!(conds, vec![cond("user_id", "=", "abc123")]);
+        assert_eq!(
+            conds,
+            vec![crate::grants::EnforcedCondition::Cmp(cond(
+                "user_id", "=", "abc123"
+            ))]
+        );
     }
 
     #[test]

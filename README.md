@@ -557,11 +557,15 @@ With auth enabled, token (end-user) principals are **denied by default**; operat
 ```bash
 redis-cli GRANT read, write ON messages WHERE user_id = auth.uid()
 redis-cli REVOKE read ON messages
+
+# membership through a junction table: see messages in workspaces you belong to
+redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace_id FROM members WHERE user_id = auth.uid() )
 ```
 
 - Two scopes: `read` (covers SELECT and `.live()`), `write` (INSERT/UPDATE/DELETE; INSERT is checked against the new row, UPDATE/DELETE against the WHERE).
-- A grant is a contract the query is checked **against**, not a filter silently applied. A query (or `.live()` subscription) must itself satisfy the predicate, or it is rejected. An unscoped `.live()` under a row-scoped grant is refused at subscribe time.
-- Predicate values: `auth.uid()` (the caller's id), `auth.<claim>` (e.g. `auth.role`, `auth.email`), or a literal. Operators `= != < > <= >=`.
+- **Auto-filter (USING).** A grant's `WHERE` is applied automatically as an implicit row filter that *narrows* access; it never widens it. A bare SELECT (or `.live()`) returns only the rows the grant allows, and UPDATE/DELETE are scoped the same way; the caller does not restate the predicate. INSERT/UPSERT get a WITH CHECK: the new row must fall inside the grant.
+- Predicate values: `auth.uid()` (the caller's id), `auth.<claim>` (e.g. `auth.role`, `auth.email`), or a literal. Operators `= != < > <= >=`. Combine conditions with `AND`.
+- **Membership subqueries** express relationship access (the canonical multi-tenant pattern `users <-> members <-> workspaces`): `col [NOT] IN ( SELECT col FROM t WHERE <predicate> )`. The subquery is *uncorrelated* (its WHERE references `auth.*`, literals, and its own columns, not the outer row), runs once per request, and is auto-applied as a filter. A user in no workspaces sees nothing; gate child tables (`messages.workspace_id IN (...)`) and create the parent via ownership or a service key (inserting a brand-new workspace whose id isn't yet a membership is correctly denied).
 - Grants are authored as migrations, so they version and travel with schema (`lux migrate run` / `lux migrate pull`).
 
 ### Environment Variables

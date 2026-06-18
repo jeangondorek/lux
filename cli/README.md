@@ -124,6 +124,7 @@ travels with your schema:
 
 ```text
 GRANT read, write ON messages WHERE user_id = auth.uid()
+GRANT read ON messages WHERE workspace_id IN ( SELECT workspace_id FROM members WHERE user_id = auth.uid() )
 ```
 
 For commands with complex quoted values, use JSON argv arrays:

@@ -1001,6 +1001,9 @@ struct LiveTableSpec {
     order_by: Option<(String, String)>,
     limit: Option<usize>,
     offset: Option<usize>,
+    /// Set when a grant's membership set is empty: the subscriber may see no
+    /// rows, so both the snapshot and every streamed diff resolve to nothing.
+    deny_all: bool,
 }
 
 #[derive(Clone)]
@@ -1313,9 +1316,35 @@ async fn build_live_subscription(
                 )
                 .map_err(|e| live_error("FORBIDDEN", &e))?;
                 for c in grant_conds {
-                    table_spec
-                        .where_conditions
-                        .push((c.column, c.op, Value::String(c.value)));
+                    match c {
+                        crate::grants::EnforcedCondition::Cmp(rc) => {
+                            table_spec.where_conditions.push((
+                                rc.column,
+                                rc.op,
+                                Value::String(rc.value),
+                            ));
+                        }
+                        crate::grants::EnforcedCondition::InSet {
+                            column,
+                            negated,
+                            values,
+                        } => {
+                            if values.is_empty() {
+                                // empty positive set -> see nothing; empty NOT IN
+                                // -> matches everything, so just drop it.
+                                if !negated {
+                                    table_spec.deny_all = true;
+                                }
+                            } else {
+                                let op = if negated { "NOT IN" } else { "IN" };
+                                let arr =
+                                    Value::Array(values.into_iter().map(Value::String).collect());
+                                table_spec
+                                    .where_conditions
+                                    .push((column, op.to_string(), arr));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1606,6 +1635,7 @@ fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
         order_by,
         limit,
         offset,
+        deny_all: false,
     })
 }
 
@@ -1637,6 +1667,10 @@ fn fetch_live_table_rows(
     cache: &SharedSchemaCache,
     spec: &LiveTableSpec,
 ) -> Result<Vec<Value>, Value> {
+    // An empty positive membership set: the subscriber sees no rows at all.
+    if spec.deny_all {
+        return Ok(Vec::new());
+    }
     let mut tokens = vec![spec.select.clone(), "FROM".to_string(), spec.table.clone()];
     if !spec.where_conditions.is_empty() {
         tokens.push("WHERE".to_string());
@@ -3920,6 +3954,249 @@ mod tests {
             body.contains("\"b1\""),
             "operator should see all rows: {body}"
         );
+    }
+
+    // ── Membership (subquery) grants: messages gated by junction `members` ──
+
+    fn membership_fixture() -> (Arc<Store>, Broker, SharedSchemaCache) {
+        let config = std::sync::Arc::new(crate::ServerConfig {
+            auth: crate::AuthConfig {
+                enabled: true,
+                ..crate::AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let now = Instant::now();
+
+        // messages(id pk, workspace_id, body)
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "messages",
+            &[
+                "id",
+                "INT",
+                "PRIMARY",
+                "KEY,",
+                "workspace_id",
+                "STR,",
+                "body",
+                "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        for (id, ws, body) in [
+            ("1", "w1", "m1"),
+            ("2", "w2", "m2"),
+            ("3", "w3", "m3"),
+            ("4", "w1", "m4"),
+        ] {
+            crate::tables::table_insert(
+                &store,
+                &cache,
+                "messages",
+                &[("id", id), ("workspace_id", ws), ("body", body)],
+                now,
+            )
+            .unwrap();
+        }
+
+        // members(id pk, user_id, workspace_id): alice in w1+w3, bob in w2.
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "members",
+            &[
+                "id",
+                "INT",
+                "PRIMARY",
+                "KEY,",
+                "user_id",
+                "STR,",
+                "workspace_id",
+                "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        for (id, uid, ws) in [
+            ("1", "alice", "w1"),
+            ("2", "alice", "w3"),
+            ("3", "bob", "w2"),
+        ] {
+            crate::tables::table_insert(
+                &store,
+                &cache,
+                "members",
+                &[("id", id), ("user_id", uid), ("workspace_id", ws)],
+                now,
+            )
+            .unwrap();
+        }
+
+        let g = crate::grants::parse_grant(&[
+            "read,",
+            "write",
+            "ON",
+            "messages",
+            "WHERE",
+            "workspace_id",
+            "IN",
+            "(",
+            "SELECT",
+            "workspace_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+            ")",
+        ])
+        .unwrap();
+        crate::auth::put_grant(&store, &cache, &g, Instant::now()).unwrap();
+        (store, broker, cache)
+    }
+
+    fn read_messages(
+        store: &Arc<Store>,
+        cache: &SharedSchemaCache,
+        broker: &Broker,
+        ctx: &HttpAuthContext,
+    ) -> (u16, String) {
+        let filter = enforce_table_read(store, cache, ctx, "messages").unwrap();
+        let combined = combine_where("", filter.as_deref().unwrap_or(""));
+        let scoped = params_with_where(&[], &combined);
+        let (status, _, body) = route_table_query("messages", &scoped, store, broker, cache);
+        (status, body)
+    }
+
+    #[test]
+    fn membership_read_scopes_to_member_workspaces() {
+        let (store, broker, cache) = membership_fixture();
+        // alice is in w1 + w3 -> sees m1, m4 (w1) and m3 (w3), not m2 (w2).
+        let (status, body) = read_messages(&store, &cache, &broker, &user_ctx("alice"));
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("\"m1\"") && body.contains("\"m4\"") && body.contains("\"m3\""),
+            "alice should see her workspaces' messages: {body}"
+        );
+        assert!(
+            !body.contains("\"m2\""),
+            "w2 message leaked to alice: {body}"
+        );
+        // bob is in w2 only -> sees m2 only.
+        let (status, body) = read_messages(&store, &cache, &broker, &user_ctx("bob"));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"m2\""), "{body}");
+        assert!(
+            !body.contains("\"m1\"") && !body.contains("\"m3\"") && !body.contains("\"m4\""),
+            "other workspaces leaked to bob: {body}"
+        );
+    }
+
+    #[test]
+    fn membership_read_empty_for_non_member() {
+        let (store, broker, cache) = membership_fixture();
+        // carol is in no workspace -> empty membership -> sees nothing (200, no rows).
+        let (status, body) = read_messages(&store, &cache, &broker, &user_ctx("carol"));
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains("\"m1\"")
+                && !body.contains("\"m2\"")
+                && !body.contains("\"m3\"")
+                && !body.contains("\"m4\""),
+            "non-member must see no rows: {body}"
+        );
+    }
+
+    #[test]
+    fn membership_write_check_gates_by_membership() {
+        let (store, _broker, cache) = membership_fixture();
+        let alice = user_ctx("alice");
+        let row = |ws: &str| {
+            let mut m = serde_json::Map::new();
+            m.insert("id".into(), serde_json::Value::from(9));
+            m.insert("workspace_id".into(), serde_json::Value::from(ws));
+            m.insert("body".into(), serde_json::Value::from("x"));
+            m
+        };
+        // alice may insert into a workspace she belongs to (w1), not one she doesn't (w2).
+        assert!(enforce_table_insert(&store, &cache, &alice, "messages", &row("w1")).is_ok());
+        let err = enforce_table_insert(&store, &cache, &alice, "messages", &row("w2")).unwrap_err();
+        assert_eq!(
+            err.0, 403,
+            "insert into non-member workspace must be denied"
+        );
+    }
+
+    #[test]
+    fn membership_live_snapshot_is_scoped_and_deny_all_is_empty() {
+        let (store, _broker, cache) = membership_fixture();
+        // A live spec carrying the resolved membership IN-set (alice: w1, w3).
+        let spec = LiveTableSpec {
+            table: "messages".to_string(),
+            select: "*".to_string(),
+            where_conditions: vec![(
+                "workspace_id".to_string(),
+                "IN".to_string(),
+                Value::Array(vec![Value::from("w1"), Value::from("w3")]),
+            )],
+            near: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            deny_all: false,
+        };
+        let rows = fetch_live_table_rows(&store, &cache, &spec).unwrap();
+        let body = serde_json::to_string(&rows).unwrap();
+        assert!(
+            body.contains("\"m1\"") && body.contains("\"m4\"") && body.contains("\"m3\""),
+            "{body}"
+        );
+        assert!(
+            !body.contains("\"m2\""),
+            "w2 leaked into live snapshot: {body}"
+        );
+
+        // deny_all -> empty snapshot regardless of the table contents.
+        let denied = LiveTableSpec {
+            deny_all: true,
+            where_conditions: Vec::new(),
+            ..spec
+        };
+        let rows = fetch_live_table_rows(&store, &cache, &denied).unwrap();
+        assert!(rows.is_empty(), "deny_all must yield no rows");
+    }
+
+    #[test]
+    fn membership_update_cannot_move_row_out_of_membership() {
+        let (store, _broker, cache) = membership_fixture();
+        let alice = user_ctx("alice");
+        // moving a message's workspace_id to one alice isn't in -> denied.
+        let err = enforce_table_update_check(
+            &store,
+            &cache,
+            &alice,
+            "messages",
+            &[("workspace_id", "w2")],
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+        // staying within her membership (w3) -> allowed.
+        assert!(enforce_table_update_check(
+            &store,
+            &cache,
+            &alice,
+            "messages",
+            &[("workspace_id", "w3")]
+        )
+        .is_ok());
     }
 
     #[test]

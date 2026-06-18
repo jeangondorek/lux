@@ -35,7 +35,7 @@ impl Scope {
     }
 }
 
-/// Right-hand side of a grant condition.
+/// Right-hand side of a simple grant comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
     /// `auth.uid()` - the principal's user id.
@@ -46,12 +46,34 @@ pub enum Operand {
     Literal(String),
 }
 
-/// A single `column <op> <operand>` condition in a grant predicate.
+/// A subquery operand: `( SELECT <projected> FROM <table> [WHERE <inner>] )`.
+///
+/// `inner` is restricted to simple `Cmp` conditions (depth-1 - no nested
+/// subqueries, enforced at parse time) and is *uncorrelated*: it may reference
+/// `auth.*`, literals, and the subquery table's own columns, never the outer
+/// row. At enforcement time the subquery is executed once to a set of values.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Condition {
-    pub column: String,
-    pub op: String,
-    pub operand: Operand,
+pub struct Subquery {
+    pub projected: String,
+    pub table: String,
+    pub inner: Predicate,
+}
+
+/// A single condition in a grant predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    /// `column <op> <operand>`.
+    Cmp {
+        column: String,
+        op: String,
+        operand: Operand,
+    },
+    /// `column [NOT] IN ( SELECT ... )` - membership in a subquery result set.
+    InSubquery {
+        column: String,
+        negated: bool,
+        subquery: Subquery,
+    },
 }
 
 /// A grant predicate: a conjunction (AND) of conditions. Empty = unconditional.
@@ -77,6 +99,36 @@ pub struct ResolvedCond {
     pub value: String,
 }
 
+/// A grant condition with `auth.*` substituted, but subqueries *not yet
+/// executed*. Execution needs store access, so it happens in `auth.rs`; this
+/// keeps the parser/resolver in this module pure and unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedCondition {
+    Cmp(ResolvedCond),
+    InSubqueryResolved {
+        column: String,
+        negated: bool,
+        inner_table: String,
+        inner_projected: String,
+        /// Inner WHERE conditions with `auth.*` already substituted.
+        inner_conds: Vec<ResolvedCond>,
+    },
+}
+
+/// A grant condition fully resolved *and* executed: subqueries have become a
+/// concrete membership set. This is what the read/write/live paths enforce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnforcedCondition {
+    Cmp(ResolvedCond),
+    /// `column [NOT] IN (<values>)`. Empty positive set => match nothing (deny);
+    /// empty negated set => match everything.
+    InSet {
+        column: String,
+        negated: bool,
+        values: Vec<String>,
+    },
+}
+
 const VALID_OPS: &[&str] = &["=", "!=", ">", "<", ">=", "<="];
 
 fn parse_operand(tok: &str) -> Operand {
@@ -92,30 +144,26 @@ fn parse_operand(tok: &str) -> Operand {
     }
 }
 
-/// Parse a predicate from `column op operand [AND ...]` tokens.
+/// Parse a predicate: `<condition> [AND <condition> ...]`, where a condition is
+/// either `column op operand` or `column [NOT] IN ( SELECT ... )`.
 pub fn parse_predicate(tokens: &[&str]) -> Result<Predicate, String> {
+    parse_predicate_inner(tokens, true)
+}
+
+/// `allow_subquery` is false inside a subquery's own WHERE (depth-1 guard).
+fn parse_predicate_inner(tokens: &[&str], allow_subquery: bool) -> Result<Predicate, String> {
     let mut conditions = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
-        if i + 2 >= tokens.len() {
-            return Err("ERR incomplete grant predicate (expected column op operand)".to_string());
-        }
-        let column = tokens[i].to_string();
-        let op = tokens[i + 1].to_string();
-        if !VALID_OPS.contains(&op.as_str()) {
-            return Err(format!(
-                "ERR unsupported operator '{op}' in grant (use = != > < >= <=)"
-            ));
-        }
-        conditions.push(Condition {
-            column,
-            op,
-            operand: parse_operand(tokens[i + 2]),
-        });
-        i += 3;
+        let (cond, next) = parse_one_condition(tokens, i, allow_subquery)?;
+        conditions.push(cond);
+        i = next;
         if i < tokens.len() {
             if tokens[i].eq_ignore_ascii_case("AND") {
                 i += 1;
+                if i >= tokens.len() {
+                    return Err("ERR trailing 'AND' in grant predicate".to_string());
+                }
             } else {
                 return Err(format!(
                     "ERR expected 'AND' between grant conditions, got '{}'",
@@ -125,6 +173,139 @@ pub fn parse_predicate(tokens: &[&str]) -> Result<Predicate, String> {
         }
     }
     Ok(Predicate { conditions })
+}
+
+/// Parse one condition starting at `i`; return it and the index just past it.
+fn parse_one_condition(
+    tokens: &[&str],
+    i: usize,
+    allow_subquery: bool,
+) -> Result<(Condition, usize), String> {
+    let column = tokens
+        .get(i)
+        .ok_or_else(|| "ERR incomplete grant predicate (expected column)".to_string())?
+        .to_string();
+    let op_tok = tokens
+        .get(i + 1)
+        .ok_or_else(|| format!("ERR incomplete grant condition after '{column}'"))?;
+
+    // `column IN ( SELECT ... )`
+    if op_tok.eq_ignore_ascii_case("IN") {
+        let (subquery, next) = parse_subquery(tokens, i + 2, allow_subquery)?;
+        return Ok((
+            Condition::InSubquery {
+                column,
+                negated: false,
+                subquery,
+            },
+            next,
+        ));
+    }
+    // `column NOT IN ( SELECT ... )`
+    if op_tok.eq_ignore_ascii_case("NOT") {
+        let in_tok = tokens
+            .get(i + 2)
+            .ok_or_else(|| format!("ERR expected 'IN' after 'NOT' for column '{column}'"))?;
+        if !in_tok.eq_ignore_ascii_case("IN") {
+            return Err(format!("ERR expected 'IN' after 'NOT', got '{in_tok}'"));
+        }
+        let (subquery, next) = parse_subquery(tokens, i + 3, allow_subquery)?;
+        return Ok((
+            Condition::InSubquery {
+                column,
+                negated: true,
+                subquery,
+            },
+            next,
+        ));
+    }
+
+    // Simple `column op operand`.
+    let op = op_tok.to_string();
+    if !VALID_OPS.contains(&op.as_str()) {
+        return Err(format!(
+            "ERR unsupported operator '{op}' in grant (use = != > < >= <= or [NOT] IN)"
+        ));
+    }
+    let operand_tok = tokens
+        .get(i + 2)
+        .ok_or_else(|| format!("ERR grant condition '{column} {op}' is missing its value"))?;
+    Ok((
+        Condition::Cmp {
+            column,
+            op,
+            operand: parse_operand(operand_tok),
+        },
+        i + 3,
+    ))
+}
+
+/// Parse `( SELECT <col> FROM <table> [WHERE <inner-pred>] )` starting at the
+/// opening paren. Returns the subquery and the index just past the `)`.
+fn parse_subquery(
+    tokens: &[&str],
+    mut i: usize,
+    allow_subquery: bool,
+) -> Result<(Subquery, usize), String> {
+    if !allow_subquery {
+        return Err("ERR nested subquery in grant is not supported (depth-1 only)".to_string());
+    }
+    let expect = |i: usize, want: &str| -> Result<(), String> {
+        match tokens.get(i) {
+            Some(t) if t.eq_ignore_ascii_case(want) => Ok(()),
+            Some(t) => Err(format!(
+                "ERR expected '{want}' in grant subquery, got '{t}'"
+            )),
+            None => Err(format!(
+                "ERR grant subquery ended early (expected '{want}')"
+            )),
+        }
+    };
+    expect(i, "(")?;
+    i += 1;
+    expect(i, "SELECT")?;
+    i += 1;
+    let projected = tokens
+        .get(i)
+        .ok_or_else(|| "ERR grant subquery expects a column after SELECT".to_string())?
+        .to_string();
+    if projected == ")" || projected.eq_ignore_ascii_case("FROM") {
+        return Err("ERR grant subquery expects a single column after SELECT".to_string());
+    }
+    i += 1;
+    expect(i, "FROM")?;
+    i += 1;
+    let table = tokens
+        .get(i)
+        .ok_or_else(|| "ERR grant subquery expects a table after FROM".to_string())?
+        .to_string();
+    if table.to_ascii_lowercase().starts_with("auth.") {
+        return Err("ERR grant subquery may not read reserved 'auth.*' tables".to_string());
+    }
+    i += 1;
+
+    // Optional inner WHERE, gathered up to the matching `)`.
+    let mut inner_tokens: Vec<&str> = Vec::new();
+    if matches!(tokens.get(i), Some(t) if t.eq_ignore_ascii_case("WHERE")) {
+        i += 1;
+        while i < tokens.len() && tokens[i] != ")" {
+            inner_tokens.push(tokens[i]);
+            i += 1;
+        }
+    }
+    expect(i, ")")?;
+    i += 1;
+
+    // Inner predicate is Cmp-only (no nested subqueries).
+    let inner = parse_predicate_inner(&inner_tokens, false)?;
+    Ok((
+        Subquery {
+            projected,
+            table,
+            inner,
+        },
+        i,
+    ))
 }
 
 /// Parse a `GRANT` body: `<read[, write]> ON <table> [WHERE <predicate>]`.
@@ -194,42 +375,125 @@ pub fn parse_revoke(tokens: &[&str]) -> Result<(String, Vec<Scope>), String> {
     Ok((table, scopes))
 }
 
-/// Serialize a predicate to canonical text for storage / display.
+/// Serialize a predicate to canonical text for storage / display. The output is
+/// whitespace-separable so `load_grant_predicate` can re-tokenize it with
+/// `split_whitespace()` and parse back an identical predicate (every token,
+/// including parens, is space-delimited).
 pub fn predicate_to_string(pred: &Predicate) -> String {
     pred.conditions
         .iter()
-        .map(|c| {
-            let rhs = match &c.operand {
-                Operand::AuthUid => "auth.uid()".to_string(),
-                Operand::AuthClaim(name) => format!("auth.{name}"),
-                Operand::Literal(v) => v.clone(),
-            };
-            format!("{} {} {}", c.column, c.op, rhs)
-        })
+        .map(condition_to_string)
         .collect::<Vec<_>>()
         .join(" AND ")
 }
 
-/// Resolve a grant predicate's `auth.*` operands against the principal into
-/// concrete `(column, op, value)` conditions. `claim` looks up a claim value.
+fn operand_to_string(operand: &Operand) -> String {
+    match operand {
+        Operand::AuthUid => "auth.uid()".to_string(),
+        Operand::AuthClaim(name) => format!("auth.{name}"),
+        Operand::Literal(v) => v.clone(),
+    }
+}
+
+fn condition_to_string(c: &Condition) -> String {
+    match c {
+        Condition::Cmp {
+            column,
+            op,
+            operand,
+        } => format!("{column} {op} {}", operand_to_string(operand)),
+        Condition::InSubquery {
+            column,
+            negated,
+            subquery,
+        } => {
+            let kw = if *negated { "NOT IN" } else { "IN" };
+            let inner = predicate_to_string(&subquery.inner);
+            if inner.is_empty() {
+                format!(
+                    "{column} {kw} ( SELECT {} FROM {} )",
+                    subquery.projected, subquery.table
+                )
+            } else {
+                format!(
+                    "{column} {kw} ( SELECT {} FROM {} WHERE {inner} )",
+                    subquery.projected, subquery.table
+                )
+            }
+        }
+    }
+}
+
+fn resolve_operand(
+    operand: &Operand,
+    uid: &str,
+    claim: &impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    Ok(match operand {
+        Operand::AuthUid => uid.to_string(),
+        Operand::AuthClaim(name) => claim(name)
+            .ok_or_else(|| format!("ERR grant references auth.{name} but it is not present"))?,
+        Operand::Literal(v) => v.clone(),
+    })
+}
+
+/// Resolve a Cmp-only (inner) predicate to concrete `(column, op, value)`.
+fn resolve_cmp_only(
+    pred: &Predicate,
+    uid: &str,
+    claim: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<ResolvedCond>, String> {
+    let mut out = Vec::with_capacity(pred.conditions.len());
+    for c in &pred.conditions {
+        match c {
+            Condition::Cmp {
+                column,
+                op,
+                operand,
+            } => out.push(ResolvedCond {
+                column: column.clone(),
+                op: op.clone(),
+                value: resolve_operand(operand, uid, claim)?,
+            }),
+            Condition::InSubquery { .. } => {
+                return Err("ERR nested subquery in grant is not supported".to_string())
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a grant predicate's `auth.*` operands against the principal. Subquery
+/// conditions keep their (now resolved) inner WHERE for later execution.
 pub fn resolve(
     pred: &Predicate,
     uid: &str,
     claim: impl Fn(&str) -> Option<String>,
-) -> Result<Vec<ResolvedCond>, String> {
+) -> Result<Vec<ResolvedCondition>, String> {
     let mut out = Vec::with_capacity(pred.conditions.len());
     for c in &pred.conditions {
-        let value = match &c.operand {
-            Operand::AuthUid => uid.to_string(),
-            Operand::AuthClaim(name) => claim(name)
-                .ok_or_else(|| format!("ERR grant references auth.{name} but it is not present"))?,
-            Operand::Literal(v) => v.clone(),
-        };
-        out.push(ResolvedCond {
-            column: c.column.clone(),
-            op: c.op.clone(),
-            value,
-        });
+        match c {
+            Condition::Cmp {
+                column,
+                op,
+                operand,
+            } => out.push(ResolvedCondition::Cmp(ResolvedCond {
+                column: column.clone(),
+                op: op.clone(),
+                value: resolve_operand(operand, uid, &claim)?,
+            })),
+            Condition::InSubquery {
+                column,
+                negated,
+                subquery,
+            } => out.push(ResolvedCondition::InSubqueryResolved {
+                column: column.clone(),
+                negated: *negated,
+                inner_table: subquery.table.clone(),
+                inner_projected: subquery.projected.clone(),
+                inner_conds: resolve_cmp_only(&subquery.inner, uid, &claim)?,
+            }),
+        }
     }
     Ok(out)
 }
@@ -258,21 +522,51 @@ fn cmp(actual: &str, op: &str, target: &str) -> bool {
     }
 }
 
-/// True if a single concrete `value` satisfies one resolved grant condition.
-/// Used by the UPDATE WITH CHECK, which only needs to validate the columns a
-/// statement actually sets.
-pub fn cond_matches(cond: &ResolvedCond, value: &str) -> bool {
-    cmp(value, &cond.op, &cond.value)
+/// True if `value` is in (or, when negated, out of) the membership set.
+/// Equality is the membership test (`IN`); both sides are canonical engine
+/// string reps of the same column, so string equality is correct.
+fn in_set(value: &str, negated: bool, values: &[String]) -> bool {
+    let present = values.iter().any(|v| v == value);
+    present != negated
 }
 
-/// WITH CHECK: true if the row (looked up by `value(column)`) satisfies every
-/// resolved grant condition. Used on writes - the new row must fall inside the
-/// grant (e.g. you can't insert a row with someone else's `user_id`).
-pub fn row_satisfies(grant: &[ResolvedCond], value: impl Fn(&str) -> Option<String>) -> bool {
-    grant.iter().all(|g| {
-        value(&g.column)
-            .map(|v| cmp(&v, &g.op, &g.value))
-            .unwrap_or(false)
+/// WITH CHECK over enforced conditions (the new row must satisfy every one).
+/// A missing column can't satisfy a condition (deny).
+pub fn enforced_row_satisfies(
+    conds: &[EnforcedCondition],
+    value: impl Fn(&str) -> Option<String>,
+) -> bool {
+    conds.iter().all(|c| match c {
+        EnforcedCondition::Cmp(rc) => value(&rc.column)
+            .map(|v| cmp(&v, &rc.op, &rc.value))
+            .unwrap_or(false),
+        EnforcedCondition::InSet {
+            column,
+            negated,
+            values,
+        } => value(column)
+            .map(|v| in_set(&v, *negated, values))
+            .unwrap_or(false),
+    })
+}
+
+/// UPDATE WITH CHECK: only re-validate conditions whose column the statement
+/// actually sets (untouched columns were already in-scope via USING).
+pub fn enforced_set_satisfies(conds: &[EnforcedCondition], set_fields: &[(&str, &str)]) -> bool {
+    conds.iter().all(|c| {
+        let col = match c {
+            EnforcedCondition::Cmp(rc) => rc.column.as_str(),
+            EnforcedCondition::InSet { column, .. } => column.as_str(),
+        };
+        match set_fields.iter().find(|(f, _)| *f == col) {
+            None => true,
+            Some((_, new_val)) => match c {
+                EnforcedCondition::Cmp(rc) => cmp(new_val, &rc.op, &rc.value),
+                EnforcedCondition::InSet {
+                    negated, values, ..
+                } => in_set(new_val, *negated, values),
+            },
+        }
     })
 }
 
@@ -303,7 +597,13 @@ mod tests {
         .unwrap();
         assert_eq!(g.table, "messages");
         assert_eq!(g.scopes, vec![Scope::Read, Scope::Write]);
-        assert_eq!(g.predicate.conditions[0].operand, Operand::AuthUid);
+        assert!(matches!(
+            &g.predicate.conditions[0],
+            Condition::Cmp {
+                operand: Operand::AuthUid,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -335,7 +635,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolved,
-            vec![rc("owner", "=", "123abc"), rc("org", "=", "acme")]
+            vec![
+                ResolvedCondition::Cmp(rc("owner", "=", "123abc")),
+                ResolvedCondition::Cmp(rc("org", "=", "acme")),
+            ]
         );
     }
 
@@ -345,41 +648,45 @@ mod tests {
         assert!(resolve(&g.predicate, "123abc", |_| None).is_err());
     }
 
-    // ---- WITH CHECK (row_satisfies): the write-side security crux ----
+    // ---- WITH CHECK (enforced_row_satisfies): the write-side security crux ----
+
+    fn ec(col: &str, op: &str, val: &str) -> EnforcedCondition {
+        EnforcedCondition::Cmp(rc(col, op, val))
+    }
 
     #[test]
     fn row_inside_grant_is_allowed() {
-        let grant = vec![rc("user_id", "=", "123abc")];
+        let grant = vec![ec("user_id", "=", "123abc")];
         let row = |c: &str| (c == "user_id").then(|| "123abc".to_string());
-        assert!(row_satisfies(&grant, row));
+        assert!(enforced_row_satisfies(&grant, row));
     }
 
     #[test]
     fn row_outside_grant_is_denied() {
-        let grant = vec![rc("user_id", "=", "123abc")];
+        let grant = vec![ec("user_id", "=", "123abc")];
         let row = |c: &str| (c == "user_id").then(|| "someone_else".to_string());
-        assert!(!row_satisfies(&grant, row));
+        assert!(!enforced_row_satisfies(&grant, row));
         // a missing column can't satisfy a grant condition
-        assert!(!row_satisfies(&grant, |_| None));
+        assert!(!enforced_row_satisfies(&grant, |_| None));
     }
 
     #[test]
     fn row_must_satisfy_every_condition() {
-        let grant = vec![rc("user_id", "=", "123abc"), rc("org", "=", "acme")];
+        let grant = vec![ec("user_id", "=", "123abc"), ec("org", "=", "acme")];
         let only_user = |c: &str| (c == "user_id").then(|| "123abc".to_string());
-        assert!(!row_satisfies(&grant, only_user));
+        assert!(!enforced_row_satisfies(&grant, only_user));
         let both = |c: &str| match c {
             "user_id" => Some("123abc".to_string()),
             "org" => Some("acme".to_string()),
             _ => None,
         };
-        assert!(row_satisfies(&grant, both));
+        assert!(enforced_row_satisfies(&grant, both));
     }
 
     #[test]
     fn unconditional_grant_admits_any_row() {
         // GRANT write ON public_posts (no WHERE) -> any row passes WITH CHECK.
-        assert!(row_satisfies(&[], |_| None));
+        assert!(enforced_row_satisfies(&[], |_| None));
     }
 
     #[test]
@@ -393,5 +700,257 @@ mod tests {
         let (t, s) = parse_revoke(&["read,", "write", "ON", "messages"]).unwrap();
         assert_eq!(t, "messages");
         assert_eq!(s, vec![Scope::Read, Scope::Write]);
+    }
+
+    // ---- subquery (membership) grants ----
+
+    /// `messages WHERE workspace_id IN ( SELECT workspace_id FROM members WHERE user_id = auth.uid() )`
+    fn membership_grant() -> Grant {
+        parse_grant(&[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "workspace_id",
+            "IN",
+            "(",
+            "SELECT",
+            "workspace_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+            ")",
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_in_subquery() {
+        let g = membership_grant();
+        match &g.predicate.conditions[0] {
+            Condition::InSubquery {
+                column,
+                negated,
+                subquery,
+            } => {
+                assert_eq!(column, "workspace_id");
+                assert!(!negated);
+                assert_eq!(subquery.projected, "workspace_id");
+                assert_eq!(subquery.table, "members");
+                assert_eq!(subquery.inner.conditions.len(), 1);
+            }
+            other => panic!("expected InSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_not_in_subquery() {
+        let g = parse_grant(&[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "workspace_id",
+            "NOT",
+            "IN",
+            "(",
+            "SELECT",
+            "workspace_id",
+            "FROM",
+            "banned",
+            ")",
+        ])
+        .unwrap();
+        match &g.predicate.conditions[0] {
+            Condition::InSubquery {
+                negated, subquery, ..
+            } => {
+                assert!(negated);
+                assert!(subquery.inner.conditions.is_empty()); // no inner WHERE
+            }
+            other => panic!("expected InSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subquery_round_trips_through_string() {
+        let g = membership_grant();
+        let s = predicate_to_string(&g.predicate);
+        assert_eq!(
+            s,
+            "workspace_id IN ( SELECT workspace_id FROM members WHERE user_id = auth.uid() )"
+        );
+        // The stored string re-tokenizes (split_whitespace) and parses identically.
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        let reparsed = parse_predicate(&toks).unwrap();
+        assert_eq!(reparsed, g.predicate);
+    }
+
+    #[test]
+    fn subquery_combines_with_cmp() {
+        let g = parse_grant(&[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "tenant",
+            "=",
+            "auth.org_id",
+            "AND",
+            "workspace_id",
+            "IN",
+            "(",
+            "SELECT",
+            "workspace_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+            ")",
+        ])
+        .unwrap();
+        assert_eq!(g.predicate.conditions.len(), 2);
+        assert!(matches!(g.predicate.conditions[0], Condition::Cmp { .. }));
+        assert!(matches!(
+            g.predicate.conditions[1],
+            Condition::InSubquery { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_nested_subquery() {
+        // a subquery inside a subquery's WHERE is depth-2 => rejected.
+        let err = parse_grant(&[
+            "read", "ON", "m", "WHERE", "a", "IN", "(", "SELECT", "x", "FROM", "t", "WHERE", "y",
+            "IN", "(", "SELECT", "z", "FROM", "u", ")", ")",
+        ])
+        .unwrap_err();
+        assert!(err.contains("nested subquery"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_reserved_inner_table() {
+        let err = parse_grant(&[
+            "read",
+            "ON",
+            "m",
+            "WHERE",
+            "a",
+            "IN",
+            "(",
+            "SELECT",
+            "id",
+            "FROM",
+            "auth.users",
+            ")",
+        ])
+        .unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_cmp_operator_with_subquery_keywords() {
+        // `=` cannot take a subquery; only IN / NOT IN do.
+        let g = parse_grant(&[
+            "read", "ON", "m", "WHERE", "a", "=", "(", "SELECT", "x", "FROM", "t", ")",
+        ]);
+        // `=` parses `(` as a literal operand, leaving stray tokens => error.
+        assert!(g.is_err());
+    }
+
+    #[test]
+    fn resolve_substitutes_inside_subquery() {
+        let g = membership_grant();
+        let resolved = resolve(&g.predicate, "user-42", |_| None).unwrap();
+        match &resolved[0] {
+            ResolvedCondition::InSubqueryResolved {
+                column,
+                negated,
+                inner_table,
+                inner_projected,
+                inner_conds,
+            } => {
+                assert_eq!(column, "workspace_id");
+                assert!(!negated);
+                assert_eq!(inner_table, "members");
+                assert_eq!(inner_projected, "workspace_id");
+                assert_eq!(inner_conds, &vec![rc("user_id", "=", "user-42")]);
+            }
+            other => panic!("expected InSubqueryResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_missing_claim_inside_subquery_errors() {
+        let g = parse_grant(&[
+            "read",
+            "ON",
+            "m",
+            "WHERE",
+            "a",
+            "IN",
+            "(",
+            "SELECT",
+            "x",
+            "FROM",
+            "t",
+            "WHERE",
+            "org",
+            "=",
+            "auth.org_id",
+            ")",
+        ])
+        .unwrap();
+        assert!(resolve(&g.predicate, "u", |_| None).is_err());
+    }
+
+    // ---- enforced (post-execution) membership checks ----
+
+    #[test]
+    fn enforced_in_set_membership() {
+        let conds = vec![EnforcedCondition::InSet {
+            column: "workspace_id".into(),
+            negated: false,
+            values: vec!["w1".into(), "w2".into()],
+        }];
+        let row = |c: &str| (c == "workspace_id").then(|| "w1".to_string());
+        assert!(enforced_row_satisfies(&conds, row));
+        let outside = |c: &str| (c == "workspace_id").then(|| "w9".to_string());
+        assert!(!enforced_row_satisfies(&conds, outside));
+    }
+
+    #[test]
+    fn enforced_empty_in_set_denies_but_empty_not_in_admits() {
+        let deny = vec![EnforcedCondition::InSet {
+            column: "w".into(),
+            negated: false,
+            values: vec![],
+        }];
+        assert!(!enforced_row_satisfies(&deny, |c| (c == "w").then(|| "x".into())));
+        let admit = vec![EnforcedCondition::InSet {
+            column: "w".into(),
+            negated: true,
+            values: vec![],
+        }];
+        assert!(enforced_row_satisfies(&admit, |c| (c == "w").then(|| "x".into())));
+    }
+
+    #[test]
+    fn enforced_set_satisfies_only_checks_touched_columns() {
+        let conds = vec![EnforcedCondition::InSet {
+            column: "workspace_id".into(),
+            negated: false,
+            values: vec!["w1".into()],
+        }];
+        // Not setting workspace_id => fine (USING already scoped the row).
+        assert!(enforced_set_satisfies(&conds, &[("body", "hello")]));
+        // Setting it out of the membership set => denied.
+        assert!(!enforced_set_satisfies(&conds, &[("workspace_id", "w9")]));
+        assert!(enforced_set_satisfies(&conds, &[("workspace_id", "w1")]));
     }
 }
