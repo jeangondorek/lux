@@ -247,10 +247,10 @@ struct LocalConfig {
     local_resp_port: Option<u16>,
 }
 
-/// Pinned engine image `lux start` pulls. Bump alongside engine releases.
-const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:0.20.4";
-const LOCAL_CONTAINER: &str = "lux-local";
-const LOCAL_VOLUME: &str = "lux-local-data";
+/// Engine image `lux start` pulls. Tracks `:latest` (CI publishes it on every
+/// release) and `lux start` does an explicit `docker pull` each run, so local
+/// dev follows the newest engine without the CLI needing a release per bump.
+const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:latest";
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_RESP_PORT: u16 = 6379;
 
@@ -318,12 +318,81 @@ fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A stable 64-bit hash of `s` (FNV-free, std-only).
+fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// A per-project slug for naming the Docker container/volume, so several local
+/// projects don't collide on one fixed name (and clobber each other's data).
+/// `<sanitized-dir>-<hash6>` keeps it readable while disambiguating two dirs
+/// that share a basename (e.g. `app` in different repos). Derived from the cwd's
+/// absolute path so it's stable across restarts.
+fn project_slug() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let abs = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let base = abs
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("lux")
+        .to_ascii_lowercase();
+    let mut sanitized: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    while sanitized.contains("--") {
+        sanitized = sanitized.replace("--", "-");
+    }
+    let sanitized = sanitized.trim_matches('-');
+    let sanitized = if sanitized.is_empty() {
+        "lux"
+    } else {
+        sanitized
+    };
+    format!(
+        "{sanitized}-{:06x}",
+        hash_str(&abs.to_string_lossy()) & 0xff_ffff
+    )
+}
+
+/// True if `port` is bindable on localhost right now (so we can detect a port
+/// already taken by another local engine and pick a free one instead).
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Return `preferred` if free, else the next free port above it. Lets multiple
+/// projects run at once: the first gets the default port, the next bumps up.
+fn free_port_from(preferred: u16) -> u16 {
+    let mut p = preferred;
+    for _ in 0..500 {
+        if port_is_free(p) {
+            return p;
+        }
+        p = p.saturating_add(1);
+        if p == 0 {
+            break;
+        }
+    }
+    preferred
+}
+
 /// Load the persisted local state, generating + saving fresh creds on first use.
 fn ensure_local_state() -> LocalState {
-    if let Some(state) = load_local_state() {
+    if let Some(mut state) = load_local_state() {
+        // Track the current engine image (`:latest`) even for projects created
+        // before the CLI stopped pinning a specific version.
+        if state.image != LOCAL_ENGINE_IMAGE {
+            state.image = LOCAL_ENGINE_IMAGE.to_string();
+            save_local_state(&state);
+        }
         return state;
     }
     let local = load_local_config();
+    let slug = project_slug();
     let state = LocalState {
         password: format!("lux_sec_local_{}", random_hex(24)),
         publishable_key: format!("lux_pub_local_{}", random_hex(24)),
@@ -336,8 +405,8 @@ fn ensure_local_state() -> LocalState {
             .as_ref()
             .and_then(|c| c.local_resp_port)
             .unwrap_or(DEFAULT_RESP_PORT),
-        container: LOCAL_CONTAINER.to_string(),
-        volume: LOCAL_VOLUME.to_string(),
+        container: format!("lux-{slug}"),
+        volume: format!("lux-{slug}-data"),
         image: LOCAL_ENGINE_IMAGE.to_string(),
     };
     // secret_key == password: the operator credential and the SDK secret key are
@@ -868,7 +937,7 @@ pub async fn run() {
                 std::process::exit(1);
             }
 
-            let state = ensure_local_state();
+            let mut state = ensure_local_state();
             ensure_gitignore(&[".env.local", "lux/.lux-local.json"]);
 
             // Already running? Just reprint the connection block.
@@ -888,6 +957,26 @@ pub async fn run() {
                 let _ = docker_output(&["volume", "rm", &state.volume]);
             }
             let fresh_volume = fresh || !volume_existed;
+
+            // Pick free host ports if this project's configured ports are taken
+            // (e.g. another local project is already running). Removing the stale
+            // container above freed this project's own ports, so a same-project
+            // restart keeps them; only a real conflict bumps. Persist the choice.
+            let resp_port = free_port_from(state.resp_port);
+            let http_port = free_port_from(state.http_port);
+            if resp_port != state.resp_port || http_port != state.http_port {
+                println!(
+                    "{} ports {}/{} busy, using {}/{}",
+                    "Note:".yellow(),
+                    state.resp_port,
+                    state.http_port,
+                    resp_port,
+                    http_port
+                );
+                state.resp_port = resp_port;
+                state.http_port = http_port;
+                save_local_state(&state);
+            }
 
             println!("{} {}", "Pulling".bold(), state.image.dimmed());
             // Pull is best-effort: `docker run` will pull too, but doing it up
@@ -3086,6 +3175,42 @@ mod tests {
     }
 
     #[test]
+    fn project_slug_is_stable_readable_and_unique() {
+        // Stable for the same cwd across calls.
+        let a = project_slug();
+        let b = project_slug();
+        assert_eq!(a, b);
+        // Shape: `<sanitized>-<6 hex>`, lowercase/alnum/hyphen only.
+        let (name, hash) = a.rsplit_once('-').expect("slug has a -<hash> suffix");
+        assert_eq!(hash.len(), 6);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!name.is_empty());
+        assert!(name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+    }
+
+    #[test]
+    fn project_slug_hash_disambiguates_same_basename() {
+        // Two different absolute paths sharing a basename must not collide.
+        assert_ne!(
+            hash_str("/home/a/app") & 0xff_ffff,
+            hash_str("/home/b/app") & 0xff_ffff
+        );
+    }
+
+    #[test]
+    fn free_port_returns_preferred_when_open() {
+        // Bind a port, then confirm free_port_from skips it to a higher one.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = listener.local_addr().unwrap().port();
+        let chosen = free_port_from(taken);
+        assert_ne!(chosen, taken, "should not pick the bound port");
+        assert!(chosen > taken);
+        assert!(port_is_free(chosen));
+    }
+
+    #[test]
     fn parses_tls_connection_urls() {
         let target = parse_connection_url("luxs://:secret@db.example.com:6380");
 
@@ -3269,8 +3394,8 @@ mod tests {
             secret_key: "lux_sec_local_deadbeef".to_string(),
             http_port: 8080,
             resp_port: 6379,
-            container: LOCAL_CONTAINER.to_string(),
-            volume: LOCAL_VOLUME.to_string(),
+            container: "lux-sample-abc123".to_string(),
+            volume: "lux-sample-abc123-data".to_string(),
             image: LOCAL_ENGINE_IMAGE.to_string(),
         }
     }
