@@ -3107,6 +3107,16 @@ fn fire_key_events_slow(broker: &Broker, args: &[&[u8]]) {
     } else if cmd_eq_fast(cmd, b"RENAME") && args.len() >= 3 {
         broker.enqueue_key_event(args[1], cmd);
         broker.enqueue_key_event(args[2], cmd);
+    } else if cmd_eq_fast(cmd, b"TDELETE") {
+        // `TDELETE FROM <table> WHERE ...` puts the literal FROM at args[1], so
+        // the keyed entity is args[2]. Without this, table .live() subscribers
+        // never wake on a delete (the event fires on key "FROM").
+        let table = if args.len() >= 3 && cmd_eq_fast(args[1], b"FROM") {
+            args[2]
+        } else {
+            args[1]
+        };
+        broker.enqueue_key_event(table, cmd);
     } else {
         broker.enqueue_key_event(args[1], cmd);
     }
