@@ -157,7 +157,7 @@ pub(crate) fn bootstrap(
         cache,
         USERS_TABLE,
         &[
-            "id STR PRIMARY KEY,",
+            "id UUID PRIMARY KEY,",
             "email STR UNIQUE,",
             "phone STR UNIQUE,",
             "encrypted_password STR,",
@@ -179,7 +179,7 @@ pub(crate) fn bootstrap(
         IDENTITIES_TABLE,
         &[
             "id STR PRIMARY KEY,",
-            "user_id STR,",
+            "user_id UUID,",
             "provider STR,",
             "provider_id STR UNIQUE,",
             "identity_data STR,",
@@ -194,7 +194,7 @@ pub(crate) fn bootstrap(
         SESSIONS_TABLE,
         &[
             "id STR PRIMARY KEY,",
-            "user_id STR,",
+            "user_id UUID,",
             "refresh_token_hash STR UNIQUE,",
             "refresh_token_family STR,",
             "user_agent STR,",
@@ -457,7 +457,7 @@ fn signup(
     }
 
     let now_sec = unix_seconds();
-    let user_id = random_id("usr");
+    let user_id = tables::generate_uuid_v7();
     let password_hash = match hash_password(&password) {
         Ok(hash) => hash,
         Err(e) => return error(500, "Internal Server Error", &e),
@@ -1216,7 +1216,7 @@ fn oauth_sign_in(
         }
         (user_id, false)
     } else {
-        let user_id = random_id("usr");
+        let user_id = tables::generate_uuid_v7();
         let user_meta = user_meta.to_string();
         let app_meta = app_metadata_with_provider(None, provider);
         let email_confirmed_at = if email_confirmed {

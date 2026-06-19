@@ -1318,7 +1318,7 @@ fn current_epoch_ms() -> u64 {
 /// the leading bytes, the version/variant nibbles, the rest random. Being
 /// time-ordered it sorts chronologically and keeps index locality, which is why
 /// it is the modern default for primary keys.
-fn generate_uuid_v7() -> String {
+pub(crate) fn generate_uuid_v7() -> String {
     use rand_core::RngCore;
     let ms = current_epoch_ms();
     let mut b = [0u8; 16];
