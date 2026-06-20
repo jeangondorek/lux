@@ -69,6 +69,7 @@ lux migrate status                            # check status (local instance)
 lux migrate run                               # run pending migrations (local instance)
 lux migrate run my-app                        # run against a cloud project
 lux seed run                                  # run lux/seed.lux against the linked project
+lux types                                     # generate TypeScript types from your schema
 ```
 
 ## Local Connections
@@ -149,6 +150,24 @@ lux seed run --file lux/demo.seed.lux
 ```
 
 Seed files use the same command format as migrations, including JSON argv arrays. Seeds are not recorded in `__migrations`; write stable IDs if you want predictable demo data.
+
+## Types
+
+Generate TypeScript types from your project's table schema and feed them to the
+SDK for end-to-end inference:
+
+```bash
+lux types                       # writes lux/types/database.ts (local instance)
+lux types my-app                # generate from a cloud project
+lux types --out src/db.ts       # custom output path
+lux types --stdout              # print to stdout instead of writing a file
+lux types --host 10.0.0.5       # specific host
+```
+
+The generated file exports a `Row` type per table plus a `Database` map. Pass it
+to the SDK's `createClient<Database>()` so `lux.table(name)` infers row types and
+autocompletes table names. System tables (`auth.*`, internal `_t:`/`__`) are
+skipped. Re-run after a migration to keep types in sync.
 
 ## Project linking and env
 

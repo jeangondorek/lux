@@ -3248,8 +3248,7 @@ fn to_pascal_case(name: &str) -> String {
             let mut chars = word.chars();
             match chars.next() {
                 Some(first) => {
-                    first.to_uppercase().collect::<String>()
-                        + &chars.as_str().to_lowercase()
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
                 }
                 None => String::new(),
             }
@@ -3330,7 +3329,10 @@ fn parse_migration_commands(content: &str) -> Result<Vec<Vec<String>>, String> {
         }
         if s.starts_with('[') {
             let parsed: Vec<String> = serde_json::from_str(s).map_err(|e| {
-                format!("statement {} is not a valid JSON argv array: {e}", index + 1)
+                format!(
+                    "statement {} is not a valid JSON argv array: {e}",
+                    index + 1
+                )
             })?;
             if parsed.is_empty() {
                 return Err(format!("statement {} has an empty command", index + 1));
@@ -3504,13 +3506,34 @@ mod tests {
 
     #[test]
     fn field_spec_to_ts_column() {
-        assert_eq!(parse_field_spec("id UUID PRIMARY KEY"), Some(("id".into(), "string", false)));
-        assert_eq!(parse_field_spec("email STR UNIQUE NOT NULL"), Some(("email".into(), "string", false)));
-        assert_eq!(parse_field_spec("age INT"), Some(("age".into(), "number", true)));
-        assert_eq!(parse_field_spec("active BOOL"), Some(("active".into(), "boolean", true)));
-        assert_eq!(parse_field_spec("meta JSON"), Some(("meta".into(), "Json", true)));
-        assert_eq!(parse_field_spec("tags ARRAY"), Some(("tags".into(), "Json[]", true)));
-        assert_eq!(parse_field_spec("embedding VECTOR(384)"), Some(("embedding".into(), "number[]", true)));
+        assert_eq!(
+            parse_field_spec("id UUID PRIMARY KEY"),
+            Some(("id".into(), "string", false))
+        );
+        assert_eq!(
+            parse_field_spec("email STR UNIQUE NOT NULL"),
+            Some(("email".into(), "string", false))
+        );
+        assert_eq!(
+            parse_field_spec("age INT"),
+            Some(("age".into(), "number", true))
+        );
+        assert_eq!(
+            parse_field_spec("active BOOL"),
+            Some(("active".into(), "boolean", true))
+        );
+        assert_eq!(
+            parse_field_spec("meta JSON"),
+            Some(("meta".into(), "Json", true))
+        );
+        assert_eq!(
+            parse_field_spec("tags ARRAY"),
+            Some(("tags".into(), "Json[]", true))
+        );
+        assert_eq!(
+            parse_field_spec("embedding VECTOR(384)"),
+            Some(("embedding".into(), "number[]", true))
+        );
         // FK column: nullable (ON DELETE SET NULL must not read as NOT NULL).
         assert_eq!(
             parse_field_spec("author_id UUID REFERENCES authors(id) ON DELETE SET NULL"),
@@ -3735,10 +3758,9 @@ mod tests {
 
     #[test]
     fn semicolon_mode_strips_line_comments() {
-        let commands = parse_migration_commands(
-            "-- create\nTCREATE t id int; # then insert\nTINSERT t id 1;",
-        )
-        .expect("comments should be stripped in statement mode");
+        let commands =
+            parse_migration_commands("-- create\nTCREATE t id int; # then insert\nTINSERT t id 1;")
+                .expect("comments should be stripped in statement mode");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0], vec!["TCREATE", "t", "id", "int"]);
         assert_eq!(commands[1], vec!["TINSERT", "t", "id", "1"]);
