@@ -1196,11 +1196,23 @@ pub async fn run() {
             // The SPA runs in the browser, so the engine URL must be host-visible
             // (localhost), not a container-internal address. LUX_KEY is the
             // operator secret; everything stays on localhost.
+            // Display name: config.toml project_name, else the project dir name.
+            let project_name = load_local_config()
+                .and_then(|c| c.project_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| "local".to_string())
+                });
+
             let port_map = format!("{studio_port}:80");
             let e_url = format!("LUX_URL=http://localhost:{}", state.http_port);
             let e_key = format!("LUX_KEY={}", state.secret_key);
             let e_pub = format!("LUX_PUBLISHABLE_KEY={}", state.publishable_key);
             let e_direct = format!("LUX_DIRECT_URL={}", state.direct_url());
+            let e_name = format!("LUX_PROJECT_NAME={project_name}");
             let run_args: Vec<&str> = vec![
                 "run",
                 "-d",
@@ -1216,6 +1228,8 @@ pub async fn run() {
                 &e_pub,
                 "-e",
                 &e_direct,
+                "-e",
+                &e_name,
                 "--restart",
                 "unless-stopped",
                 STUDIO_IMAGE,
