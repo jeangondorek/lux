@@ -1398,6 +1398,47 @@ fn format_geo_coord(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// Table data/DDL commands that tolerate a trailing `;` statement terminator.
+fn is_table_terminator_command(cmd: &[u8]) -> bool {
+    const TABLE_CMDS: &[&[u8]] = &[
+        b"TSELECT",
+        b"TINSERT",
+        b"TUPSERT",
+        b"TUPDATE",
+        b"TDELETE",
+        b"TCREATE",
+        b"TDROP",
+        b"TINDEX",
+        b"TDROPINDEX",
+        b"TCOUNT",
+        b"TSCHEMA",
+        b"TALTER",
+        b"TLIST",
+        b"GRANT",
+        b"REVOKE",
+    ];
+    TABLE_CMDS.iter().any(|c| cmd_eq(cmd, c))
+}
+
+/// Drop a trailing `;` statement terminator from a table-command argv: either a
+/// standalone `;` token or a `;` suffix on the final token. Borrows the original
+/// bytes (no copy of token contents). Quoted values are unaffected because their
+/// final byte is the closing quote, not `;`.
+fn strip_trailing_terminator<'a>(args: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    match args.split_last() {
+        Some((last, head)) if **last == *b";" => head.to_vec(),
+        Some((last, head)) if last.last() == Some(&b';') => {
+            let mut v = head.to_vec();
+            let trimmed: &'a [u8] = &last[..last.len() - 1];
+            if !trimmed.is_empty() {
+                v.push(trimmed);
+            }
+            v
+        }
+        _ => args.to_vec(),
+    }
+}
+
 pub fn execute(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -1412,6 +1453,22 @@ pub fn execute(
     }
 
     let cmd = args[0];
+
+    // Tolerate a trailing `;` statement terminator on table commands, so SQL-style
+    // statements pasted into the console or written across lines in a migration
+    // file work (`TSELECT ... FROM t;`). RESP/argv clients never include one; this
+    // only normalizes the text frontends that tokenize a raw line. Scoped to table
+    // commands so KV value semantics (`SET k v;`) are untouched. Only allocates
+    // when a terminator is actually present.
+    let stripped_args;
+    let args: &[&[u8]] = if is_table_terminator_command(cmd)
+        && args.last().is_some_and(|t| t.last() == Some(&b';'))
+    {
+        stripped_args = strip_trailing_terminator(args);
+        &stripped_args
+    } else {
+        args
+    };
 
     if cmd_eq(cmd, b"AUTH") {
         return server::cmd_auth(args, store, out, now);
@@ -3480,6 +3537,48 @@ mod tests {
 
     fn exec_str(store: &Store, args: &[&[u8]]) -> String {
         String::from_utf8_lossy(&exec(store, args)).to_string()
+    }
+
+    #[test]
+    fn strip_terminator_suffix_on_last_token() {
+        let stripped = strip_trailing_terminator(&[b"TSELECT", b"*", b"FROM", b"workspaces;"]);
+        assert_eq!(stripped.len(), 4);
+        assert_eq!(stripped[3], b"workspaces".as_slice());
+    }
+
+    #[test]
+    fn strip_terminator_standalone_token() {
+        let stripped = strip_trailing_terminator(&[b"TSELECT", b"*", b"FROM", b"t", b";"]);
+        assert_eq!(stripped.len(), 4);
+        assert_eq!(stripped[3], b"t".as_slice());
+    }
+
+    #[test]
+    fn strip_terminator_noop_without_terminator() {
+        let stripped = strip_trailing_terminator(&[b"TSELECT", b"*", b"FROM", b"t"]);
+        assert_eq!(stripped.len(), 4);
+        assert_eq!(stripped[3], b"t".as_slice());
+    }
+
+    #[test]
+    fn tselect_trailing_semicolon_not_in_table_name() {
+        let store = Store::new();
+        // The terminator must not leak into the table name lookup.
+        let out = exec_str(&store, &[b"TSELECT", b"*", b"FROM", b"ghost;"]);
+        assert!(out.contains("ghost"), "got: {out}");
+        assert!(
+            !out.contains("ghost;"),
+            "terminator leaked into name: {out}"
+        );
+    }
+
+    #[test]
+    fn tselect_trailing_semicolon_succeeds_on_real_table() {
+        let store = Store::new();
+        exec(&store, &[b"TCREATE", b"widgets", b"id", b"int"]);
+        let out = exec_str(&store, &[b"TSELECT", b"*", b"FROM", b"widgets;"]);
+        assert!(!out.contains("does not exist"), "got: {out}");
+        assert!(!out.to_lowercase().contains("err"), "got: {out}");
     }
 
     #[test]

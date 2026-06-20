@@ -3084,6 +3084,96 @@ fn get_local_migrations(dir: &Path) -> Vec<(String, String)> {
 }
 
 fn parse_migration_commands(content: &str) -> Result<Vec<Vec<String>>, String> {
+    let (statements, saw_semicolon) = split_statements(content);
+    if !saw_semicolon {
+        // No `;` terminator present: legacy one-command-per-line format.
+        return parse_migration_lines(content);
+    }
+    // Statement-oriented: `;` terminates and newlines are whitespace, so one
+    // statement (e.g. a TSELECT with a JOIN) can span multiple lines.
+    let mut commands = Vec::new();
+    for (index, stmt) in statements.iter().enumerate() {
+        let s = stmt.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if s.starts_with('[') {
+            let parsed: Vec<String> = serde_json::from_str(s).map_err(|e| {
+                format!("statement {} is not a valid JSON argv array: {e}", index + 1)
+            })?;
+            if parsed.is_empty() {
+                return Err(format!("statement {} has an empty command", index + 1));
+            }
+            commands.push(parsed);
+            continue;
+        }
+        let parsed = split_command_line(s)
+            .map_err(|e| format!("statement {} could not be parsed: {e}", index + 1))?;
+        if !parsed.is_empty() {
+            commands.push(parsed);
+        }
+    }
+    Ok(commands)
+}
+
+/// Split a migration body into raw statement strings on unquoted `;`, treating
+/// newlines as whitespace and stripping `#` / `--` line comments. Returns the
+/// statements and whether any `;` terminator was seen (false => the caller falls
+/// back to the legacy one-command-per-line format, so old migrations are
+/// unaffected).
+fn split_statements(content: &str) -> (Vec<String>, bool) {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut line_comment = false;
+    let mut saw_semicolon = false;
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+                current.push(' ');
+            }
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                current.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '#' {
+                    line_comment = true;
+                } else if ch == '-' && chars.peek() == Some(&'-') {
+                    chars.next();
+                    line_comment = true;
+                } else if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                    current.push(ch);
+                } else if ch == ';' {
+                    saw_semicolon = true;
+                    statements.push(std::mem::take(&mut current));
+                } else if ch == '\n' || ch == '\r' {
+                    current.push(' ');
+                } else {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+    if !current.trim().is_empty() {
+        statements.push(current);
+    }
+    (statements, saw_semicolon)
+}
+
+fn parse_migration_lines(content: &str) -> Result<Vec<Vec<String>>, String> {
     let mut commands = Vec::new();
     for (index, raw) in content.lines().enumerate() {
         let line = raw.trim();
@@ -3329,6 +3419,38 @@ mod tests {
                 "auth.uid()"
             ]
         );
+    }
+
+    #[test]
+    fn parses_multiline_semicolon_statements() {
+        let commands = parse_migration_commands(
+            "TSELECT a.id, b.title\n  FROM authors a\n  JOIN posts b ON a.id = b.author_id;\nTINSERT users id u1;",
+        )
+        .expect("multi-line statements should parse");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0][0], "TSELECT");
+        assert!(commands[0].iter().any(|t| t == "FROM"));
+        assert!(commands[0].iter().any(|t| t == "JOIN"));
+        assert_eq!(commands[1], vec!["TINSERT", "users", "id", "u1"]);
+    }
+
+    #[test]
+    fn semicolon_inside_quotes_is_not_a_separator() {
+        let commands = parse_migration_commands("TINSERT t id 1 note \"a; b\";")
+            .expect("quoted semicolon should not split");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], vec!["TINSERT", "t", "id", "1", "note", "a; b"]);
+    }
+
+    #[test]
+    fn semicolon_mode_strips_line_comments() {
+        let commands = parse_migration_commands(
+            "-- create\nTCREATE t id int; # then insert\nTINSERT t id 1;",
+        )
+        .expect("comments should be stripped in statement mode");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], vec!["TCREATE", "t", "id", "int"]);
+        assert_eq!(commands[1], vec!["TINSERT", "t", "id", "1"]);
     }
 
     #[test]
