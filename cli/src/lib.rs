@@ -143,8 +143,10 @@ enum Commands {
         port: Option<u16>,
         #[arg(short = 'a', long, help = "Password (for direct connection)")]
         password: Option<String>,
-        #[arg(short, long, help = "Write to a file instead of stdout")]
+        #[arg(short, long, help = "Output file (default: lux/types/database.ts)")]
         out: Option<String>,
+        #[arg(long, help = "Print to stdout instead of writing a file")]
+        stdout: bool,
     },
 }
 
@@ -2226,6 +2228,7 @@ pub async fn run() {
             port,
             password,
             out,
+            stdout,
         } => {
             let mut target = resolve_migrate_target(
                 project.as_deref(),
@@ -2269,8 +2272,19 @@ pub async fn run() {
             }
 
             let ts = generate_types(&tables);
-            match out {
-                Some(path) => match std::fs::write(&path, &ts) {
+            if stdout {
+                print!("{ts}");
+            } else {
+                let path = out.unwrap_or_else(|| "lux/types/database.ts".to_string());
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!("{} creating {}: {e}", "Error:".red(), parent.display());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                match std::fs::write(&path, &ts) {
                     Ok(()) => println!(
                         "{} wrote {} ({} table{})",
                         "✓".green(),
@@ -2282,8 +2296,7 @@ pub async fn run() {
                         eprintln!("{} writing {path}: {e}", "Error:".red());
                         std::process::exit(1);
                     }
-                },
-                None => print!("{ts}"),
+                }
             }
         }
     }
