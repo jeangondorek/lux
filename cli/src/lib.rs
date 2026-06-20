@@ -1199,6 +1199,8 @@ pub async fn run() {
             let port_map = format!("{studio_port}:80");
             let e_url = format!("LUX_URL=http://localhost:{}", state.http_port);
             let e_key = format!("LUX_KEY={}", state.secret_key);
+            let e_pub = format!("LUX_PUBLISHABLE_KEY={}", state.publishable_key);
+            let e_direct = format!("LUX_DIRECT_URL={}", state.direct_url());
             let run_args: Vec<&str> = vec![
                 "run",
                 "-d",
@@ -1210,6 +1212,10 @@ pub async fn run() {
                 &e_url,
                 "-e",
                 &e_key,
+                "-e",
+                &e_pub,
+                "-e",
+                &e_direct,
                 "--restart",
                 "unless-stopped",
                 STUDIO_IMAGE,
