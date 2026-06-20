@@ -28,6 +28,8 @@ enum Commands {
     Start {
         #[arg(long, help = "Recreate from a fresh data volume (drops local data)")]
         fresh: bool,
+        #[arg(long, help = "Start only the engine; don't launch Lux Studio")]
+        no_studio: bool,
     },
     /// Stop the local Lux engine.
     Stop {
@@ -607,6 +609,99 @@ fn wait_for_studio_ready(port: u16) -> bool {
     false
 }
 
+/// The Studio display name: config.toml project_name, else the project dir name.
+fn studio_project_name() -> String {
+    load_local_config()
+        .and_then(|c| c.project_name)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "local".to_string())
+        })
+}
+
+/// Ensure the Lux Studio container is running against `state`'s engine, then
+/// print its URL (and optionally open a browser). Assumes the engine is up.
+/// Non-fatal: warns and returns on failure so callers like `lux start` keep
+/// going. The SPA runs in the browser, so LUX_URL is host-visible localhost;
+/// LUX_KEY is the operator secret and never leaves the machine.
+fn ensure_studio(state: &mut LocalState, open_browser: bool) {
+    if docker_container_state(&state.studio_container).as_deref() == Some("running") {
+        let url = format!("http://localhost:{}", state.studio_port);
+        println!("{} {}", "Lux Studio:".bold(), url.cyan());
+        if open_browser {
+            let _ = open::that(&url);
+        }
+        return;
+    }
+    if docker_container_state(&state.studio_container).is_some() {
+        let _ = docker_output(&["rm", "-f", &state.studio_container]);
+    }
+    let studio_port = free_port_from(state.studio_port);
+    if studio_port != state.studio_port {
+        state.studio_port = studio_port;
+        save_local_state(state);
+    }
+
+    println!("{} {}", "Pulling".bold(), STUDIO_IMAGE.dimmed());
+    let _ = std::process::Command::new("docker")
+        .args(["pull", STUDIO_IMAGE])
+        .status();
+
+    let port_map = format!("{studio_port}:80");
+    let e_url = format!("LUX_URL=http://localhost:{}", state.http_port);
+    let e_key = format!("LUX_KEY={}", state.secret_key);
+    let e_pub = format!("LUX_PUBLISHABLE_KEY={}", state.publishable_key);
+    let e_direct = format!("LUX_DIRECT_URL={}", state.direct_url());
+    let e_name = format!("LUX_PROJECT_NAME={}", studio_project_name());
+    let run_args: Vec<&str> = vec![
+        "run",
+        "-d",
+        "--name",
+        &state.studio_container,
+        "-p",
+        &port_map,
+        "-e",
+        &e_url,
+        "-e",
+        &e_key,
+        "-e",
+        &e_pub,
+        "-e",
+        &e_direct,
+        "-e",
+        &e_name,
+        "--restart",
+        "unless-stopped",
+        STUDIO_IMAGE,
+    ];
+    if let Err(e) = docker_output(&run_args) {
+        eprintln!("{} Studio failed to start: {e}", "Warning:".yellow());
+        return;
+    }
+
+    print!("{}", "Waiting for Studio...".dimmed());
+    std::io::stdout().flush().ok();
+    if !wait_for_studio_ready(studio_port) {
+        println!(" {}", "TIMEOUT".red());
+        eprintln!(
+            "{} Studio did not become ready. Check {}.",
+            "Warning:".yellow(),
+            format!("docker logs {}", state.studio_container).cyan()
+        );
+        return;
+    }
+    println!(" {}", "ready".green());
+
+    let url = format!("http://localhost:{studio_port}");
+    println!("{} {}", "Lux Studio:".bold(), url.cyan());
+    if open_browser {
+        let _ = open::that(&url);
+    }
+}
+
 /// Apply pending migrations from `dir` against a local Direct target. Returns the
 /// count applied. Exits the process on a migration error (mirrors `migrate run`).
 async fn apply_pending_migrations(target: &mut MigrateTarget, dir: &Path) -> usize {
@@ -997,7 +1092,7 @@ pub async fn run() {
             println!("Next: {} to boot a local engine.", "lux start".cyan());
         }
 
-        Commands::Start { fresh } => {
+        Commands::Start { fresh, no_studio } => {
             if let Err(e) = docker_preflight() {
                 eprintln!("{} {e}", "Error:".red());
                 std::process::exit(1);
@@ -1011,6 +1106,9 @@ pub async fn run() {
                 println!("{}", "Local Lux engine already running.".green());
                 write_env_local(&state);
                 print_connection_block(&state);
+                if !no_studio {
+                    ensure_studio(&mut state, false);
+                }
                 return;
             }
 
@@ -1149,6 +1247,9 @@ pub async fn run() {
 
             write_env_local(&state);
             print_connection_block(&state);
+            if !no_studio {
+                ensure_studio(&mut state, false);
+            }
         }
 
         Commands::Studio { no_open } => {
@@ -1168,95 +1269,7 @@ pub async fn run() {
                 std::process::exit(1);
             }
 
-            // Already up? Just reprint + reopen.
-            if docker_container_state(&state.studio_container).as_deref() == Some("running") {
-                let url = format!("http://localhost:{}", state.studio_port);
-                println!("{} {}", "Lux Studio:".bold(), url.cyan());
-                if !no_open {
-                    let _ = open::that(&url);
-                }
-                return;
-            }
-
-            // Clear any stale container, then pick a free host port.
-            if docker_container_state(&state.studio_container).is_some() {
-                let _ = docker_output(&["rm", "-f", &state.studio_container]);
-            }
-            let studio_port = free_port_from(state.studio_port);
-            if studio_port != state.studio_port {
-                state.studio_port = studio_port;
-                save_local_state(&state);
-            }
-
-            println!("{} {}", "Pulling".bold(), STUDIO_IMAGE.dimmed());
-            let _ = std::process::Command::new("docker")
-                .args(["pull", STUDIO_IMAGE])
-                .status();
-
-            // The SPA runs in the browser, so the engine URL must be host-visible
-            // (localhost), not a container-internal address. LUX_KEY is the
-            // operator secret; everything stays on localhost.
-            // Display name: config.toml project_name, else the project dir name.
-            let project_name = load_local_config()
-                .and_then(|c| c.project_name)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-                        .unwrap_or_else(|| "local".to_string())
-                });
-
-            let port_map = format!("{studio_port}:80");
-            let e_url = format!("LUX_URL=http://localhost:{}", state.http_port);
-            let e_key = format!("LUX_KEY={}", state.secret_key);
-            let e_pub = format!("LUX_PUBLISHABLE_KEY={}", state.publishable_key);
-            let e_direct = format!("LUX_DIRECT_URL={}", state.direct_url());
-            let e_name = format!("LUX_PROJECT_NAME={project_name}");
-            let run_args: Vec<&str> = vec![
-                "run",
-                "-d",
-                "--name",
-                &state.studio_container,
-                "-p",
-                &port_map,
-                "-e",
-                &e_url,
-                "-e",
-                &e_key,
-                "-e",
-                &e_pub,
-                "-e",
-                &e_direct,
-                "-e",
-                &e_name,
-                "--restart",
-                "unless-stopped",
-                STUDIO_IMAGE,
-            ];
-            if let Err(e) = docker_output(&run_args) {
-                eprintln!("{} Failed to start Studio: {e}", "Error:".red());
-                std::process::exit(1);
-            }
-
-            print!("{}", "Waiting for Studio...".dimmed());
-            std::io::stdout().flush().ok();
-            if !wait_for_studio_ready(studio_port) {
-                println!(" {}", "TIMEOUT".red());
-                eprintln!(
-                    "{} Studio did not become ready. Check {}.",
-                    "Error:".red(),
-                    format!("docker logs {}", state.studio_container).cyan()
-                );
-                std::process::exit(1);
-            }
-            println!(" {}", "ready".green());
-
-            let url = format!("http://localhost:{studio_port}");
-            println!("{} {}", "Lux Studio:".bold(), url.cyan());
-            if !no_open {
-                let _ = open::that(&url);
-            }
+            ensure_studio(&mut state, !no_open);
         }
 
         Commands::Stop { clear } => {
