@@ -6,6 +6,7 @@ import { LuxRealtimeManager } from './realtime';
 import { TableQueryBuilder, type TableQueryBuilderOptions } from './table';
 import type {
 	KSubEvent,
+	LuxSchema,
 	LuxTypedRow,
 	TableRow,
 	TSAddOptions,
@@ -393,13 +394,17 @@ export class Lux extends Redis {
 	}
 }
 
-export function createClient(url: string, key: string, options?: Omit<LuxProjectOptions, 'url' | 'key'>): LuxProjectClient;
+export function createClient<DB extends Record<string, object> = LuxSchema>(
+	url: string,
+	key: string,
+	options?: Omit<LuxProjectOptions, 'url' | 'key'>
+): LuxProjectClient<DB>;
 export function createClient(options?: LuxClientOptions | RedisOptions | string): Lux;
 export function createClient(
 	optionsOrUrl?: LuxClientOptions | RedisOptions | string,
 	key?: string,
 	projectOptions?: Omit<LuxProjectOptions, 'url' | 'key'>
-): Lux | LuxProjectClient {
+): Lux | LuxProjectClient<any> {
 	if (typeof optionsOrUrl === 'string' && typeof key === 'string') {
 		return createProjectClient({ ...(projectOptions ?? {}), url: optionsOrUrl, key });
 	}

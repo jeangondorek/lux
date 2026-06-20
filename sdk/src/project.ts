@@ -1,6 +1,6 @@
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
 import { LuxStorageNamespace } from './storage';
-import type { LuxError, LuxResult, LuxTypedRow } from './types';
+import type { LuxError, LuxResult, LuxSchema, LuxTypedRow } from './types';
 import { err, ok, toLuxError } from './utils';
 
 export interface LuxProjectOptions {
@@ -112,7 +112,7 @@ interface LiveSubscriptionRecord {
 	error: (error: { code?: string; message?: string }) => void;
 }
 
-export class LuxProjectClient {
+export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 	readonly url: string;
 	readonly key: string;
 	readonly auth: LuxAuthClient;
@@ -137,8 +137,18 @@ export class LuxProjectClient {
 		this.storage = new LuxStorageNamespace(this);
 	}
 
-	table<T extends object | readonly object[] = Record<string, unknown>>(name: string): LuxProjectTable<LuxTypedRow<T>> {
-		return new LuxProjectTable<LuxTypedRow<T>>(this, name);
+	/**
+	 * Typed table accessor. When the client is created with a schema
+	 * (`createClient<Database>(...)`), the table name autocompletes and the row
+	 * type is inferred — no per-call generic. Otherwise pass the row type
+	 * explicitly: `table<Row>(name)`.
+	 */
+	table<K extends keyof DB & string>(name: K): LuxProjectTable<DB[K]>;
+	table<T extends object | readonly object[] = Record<string, unknown>>(
+		name: string
+	): LuxProjectTable<LuxTypedRow<T>>;
+	table(name: string): LuxProjectTable<any> {
+		return new LuxProjectTable<any>(this, name);
 	}
 
 	async ping(): Promise<LuxResult<unknown>> {
@@ -322,7 +332,7 @@ export class LuxProjectClient {
 }
 
 export class LuxProjectTable<T extends object> {
-	constructor(private client: LuxProjectClient, private name: string) {}
+	constructor(private client: LuxProjectClient<any>, private name: string) {}
 
 	select<TResult extends object = T>(columns = '*'): LuxProjectSelectBuilder<T, TResult[]> {
 		return new LuxProjectSelectBuilder<T, TResult[]>(this.client, this.name, columns);
@@ -437,7 +447,7 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 	protected offsetCount?: number;
 
 	protected constructor(
-		protected client: LuxProjectClient,
+		protected client: LuxProjectClient<any>,
 		protected tableName: string,
 	) {
 		super();
@@ -562,7 +572,7 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 	private expectSingle = false;
 
 	constructor(
-		client: LuxProjectClient,
+		client: LuxProjectClient<any>,
 		tableName: string,
 		private columns: string,
 	) {
@@ -658,7 +668,7 @@ export class LuxProjectLiveSubscription<T extends object> {
 	private closed = false;
 
 	constructor(
-		private client: LuxProjectClient,
+		private client: LuxProjectClient<any>,
 		private table: string,
 		private columns: string,
 		private filters: QueryFilter[],
@@ -831,7 +841,7 @@ export class LuxProjectLiveSubscription<T extends object> {
 
 export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult> {
 	constructor(
-		private client: LuxProjectClient,
+		private client: LuxProjectClient<any>,
 		private tableName: string,
 		private rowOrRows: Record<string, QueryValue> | Array<Record<string, QueryValue>>,
 		private upsertOptions?: { upsert: boolean; onConflict?: string },
@@ -858,7 +868,7 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 
 export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectMutationBuilder<TResult>> {
 	constructor(
-		client: LuxProjectClient,
+		client: LuxProjectClient<any>,
 		tableName: string,
 		private method: 'PATCH' | 'DELETE',
 		private body?: Record<string, QueryValue>,
@@ -973,12 +983,18 @@ function formatWhereValue(value: QueryValue): string {
 	return `'${escaped}'`;
 }
 
-export function createProjectClient(options: LuxProjectOptions): LuxProjectClient {
-	return new LuxProjectClient(options);
+export function createProjectClient<DB extends Record<string, object> = LuxSchema>(
+	options: LuxProjectOptions
+): LuxProjectClient<DB> {
+	return new LuxProjectClient<DB>(options);
 }
 
-export function createClient(url: string, key: string, options: Omit<LuxProjectOptions, 'url' | 'key'> = {}): LuxProjectClient {
-	return new LuxProjectClient({ ...options, url, key });
+export function createClient<DB extends Record<string, object> = LuxSchema>(
+	url: string,
+	key: string,
+	options: Omit<LuxProjectOptions, 'url' | 'key'> = {}
+): LuxProjectClient<DB> {
+	return new LuxProjectClient<DB>({ ...options, url, key });
 }
 
 function resolveFetch(fetchImpl?: typeof fetch): typeof fetch {

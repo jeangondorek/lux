@@ -3293,7 +3293,9 @@ fn generate_types(tables: &[TableModel]) -> String {
         }
         out.push_str("}\n\n");
     }
-    out.push_str("export interface Database {\n");
+    // A `type` alias (not an interface) so it satisfies the SDK's schema
+    // constraint: `createClient<Database>(...)` then `client.from('table')`.
+    out.push_str("export type Database = {\n");
     for (table, _) in tables {
         let iface = to_pascal_case(table);
         let key = if is_ts_ident(table) {
@@ -3303,7 +3305,7 @@ fn generate_types(tables: &[TableModel]) -> String {
         };
         out.push_str(&format!("  {key}: {iface};\n"));
     }
-    out.push_str("}\n");
+    out.push_str("};\n");
     out
 }
 
@@ -3538,7 +3540,7 @@ mod tests {
         assert!(ts.contains("export interface Authors {"));
         assert!(ts.contains("  id: string;"));
         assert!(ts.contains("  bio: string | null;"));
-        assert!(ts.contains("export interface Database {"));
+        assert!(ts.contains("export type Database = {"));
         assert!(ts.contains("  authors: Authors;"));
     }
 

@@ -1,5 +1,6 @@
 import { createClient, type LuxProjectOptions } from './project';
 import type { LuxAuthStorage } from './auth';
+import type { LuxSchema } from './types';
 
 export interface LuxCookieOptions {
 	domain?: string;
@@ -31,7 +32,7 @@ export interface LuxServerClientOptions extends Omit<LuxProjectOptions, 'url' | 
 
 const DEFAULT_COOKIE = 'lux-auth-session';
 
-export function createServerClient(
+export function createServerClient<DB extends Record<string, object> = LuxSchema>(
 	url: string,
 	key: string,
 	options: LuxServerClientOptions = {},
@@ -47,7 +48,7 @@ export function createServerClient(
 	// client: no session storage, nothing to persist.
 	const hasCookies = options.cookies !== undefined;
 
-	return createClient(url, key, {
+	return createClient<DB>(url, key, {
 		fetch: options.fetch,
 		auth: {
 			persistSession: hasCookies,

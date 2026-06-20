@@ -37,7 +37,7 @@ export interface LuxStorageSignOptions {
 type UploadBody = Blob | ArrayBuffer | Uint8Array | Buffer | string;
 
 export class LuxStorageNamespace {
-	constructor(private client: LuxProjectClient) {}
+	constructor(private client: LuxProjectClient<any>) {}
 
 	bucket(name: string): LuxStorageBucketClient {
 		return new LuxStorageBucketClient(this.client, name);
@@ -46,7 +46,7 @@ export class LuxStorageNamespace {
 
 export class LuxStorageBucketClient {
 	constructor(
-		private client: LuxProjectClient,
+		private client: LuxProjectClient<any>,
 		readonly name: string,
 	) {}
 

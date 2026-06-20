@@ -140,6 +140,29 @@ await lux.table("events").select().contains("tags", "urgent");
 await lux.table("events").createIndex("metadata.plan.tier", "str");
 ```
 
+## Typed client
+
+Generate types from your schema with the CLI, then pass them to `createClient`
+for end-to-end inference — no hand-written interfaces:
+
+```bash
+lux types            # writes lux/types/database.ts
+```
+```ts
+import { createClient } from "@luxdb/sdk";
+import type { Database } from "./lux/types/database";
+
+const lux = createClient<Database>(url, key);
+
+const { data } = await lux.table("posts").select(); // rows typed; "posts" autocompletes
+data?.[0].title;                                    // ✅
+// data?.[0].nope -> compile error (unknown column)
+```
+
+`table(name)` infers the row type from `Database` and autocompletes your table
+names — no per-call generic. Untyped clients keep working, and the explicit
+`table<Row>(name)` form is unchanged. Re-run `lux types` after a migration.
+
 ## Live tables
 
 Browser clients can subscribe to table queries over Lux Live. The SDK opens a WebSocket to the project live endpoint, and Lux core sends a snapshot followed by insert/update/delete events for rows matching the query.
