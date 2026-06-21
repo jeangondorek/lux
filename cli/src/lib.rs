@@ -656,6 +656,12 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
     let e_pub = format!("LUX_PUBLISHABLE_KEY={}", state.publishable_key);
     let e_direct = format!("LUX_DIRECT_URL={}", state.direct_url());
     let e_name = format!("LUX_PROJECT_NAME={}", studio_project_name());
+    // Optional: enables AI grant drafting in Studio. The browser calls OpenRouter
+    // directly with this key; localhost-only.
+    let or_key = std::env::var("LUX_OPENROUTER_KEY")
+        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+        .unwrap_or_default();
+    let e_or = format!("LUX_OPENROUTER_KEY={or_key}");
     let run_args: Vec<&str> = vec![
         "run",
         "-d",
@@ -673,6 +679,8 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
         &e_direct,
         "-e",
         &e_name,
+        "-e",
+        &e_or,
         "--restart",
         "unless-stopped",
         STUDIO_IMAGE,
