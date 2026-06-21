@@ -492,6 +492,68 @@ fn http_auth_token_users_denied_data_apis() {
 }
 
 #[test]
+fn http_vector_search_is_grant_scoped() {
+    // RLS-scoped vector search: a token user's near() search is bounded by their
+    // read grant BEFORE ranking (pre-filter). So another tenant's globally-closer
+    // vectors never leak, AND the user still gets their own best matches (a
+    // post-filter design would return the empty set here). Guards the
+    // grant -> combine_where -> near read-path wiring end to end.
+    let _server = start_lux_with_env(17760, 17761, "rootsecret", &[("LUX_AUTH_ENABLED", "true")]);
+
+    let (status, signup_body) = http_request(
+        17761,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"vrls@example.com","password":"password123"}"#),
+        None,
+    );
+    assert_eq!(status, 200, "signup: {signup_body}");
+    let signup_json: serde_json::Value = serde_json::from_str(&signup_body).unwrap();
+    let access_token = signup_json["access_token"].as_str().unwrap();
+    let uid = signup_json["user"]["id"].as_str().unwrap();
+
+    // Operator builds the schema + adversarial data: the OTHER tenant's vectors
+    // are the globally closest to the query [1,0].
+    let exec = |cmd: &str| {
+        let (s, b) = http_request(17761, "POST", "/v1/exec", Some(cmd), Some("rootsecret"));
+        assert_eq!(s, 200, "exec {cmd}: {b}");
+    };
+    exec(
+        r#"{"command":["TCREATE","docs","id","STR","PRIMARY","KEY",",","owner_id","STR",",","embedding","VECTOR(2)"]}"#,
+    );
+    exec(&format!(
+        r#"{{"command":["TINSERT","docs","id","a1","owner_id","{uid}","embedding","[0.8,0.2]"]}}"#
+    ));
+    exec(r#"{"command":["TINSERT","docs","id","b1","owner_id","tenantB","embedding","[1,0]"]}"#);
+    exec(
+        r#"{"command":["TINSERT","docs","id","b2","owner_id","tenantB","embedding","[0.99,0.01]"]}"#,
+    );
+    exec(r#"{"command":["GRANT","read","ON","docs","WHERE","owner_id","=","auth.uid()"]}"#);
+
+    // Token user searches near the query the OTHER tenant matches best, k=2.
+    let (status, body) = http_request(
+        17761,
+        "GET",
+        "/v1/tables/docs?near_field=embedding&near_vector=[1,0]&near_k=2",
+        None,
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "grant-scoped near read: {body}");
+    // Pre-filter keeps the user's own row even though it is not in the global top-K.
+    assert!(
+        body.contains(r#""id":"a1""#),
+        "user should get their own match: {body}"
+    );
+    // The other tenant's closer vectors must never leak.
+    assert!(
+        !body.contains(r#""id":"b1""#)
+            && !body.contains(r#""id":"b2""#)
+            && !body.contains("tenantB"),
+        "other tenant's vectors must not leak through near(): {body}"
+    );
+}
+
+#[test]
 fn http_auth_sessions_keys_and_revocation_survive_restart() {
     let data_dir = tempfile::tempdir().unwrap();
     let first_env = [
