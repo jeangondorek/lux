@@ -550,6 +550,36 @@ fn clear_row_ttl(store: &Store, table: &str, pk: &str, now: Instant) {
     let _ = store.zrem(ttl_index_key().as_bytes(), &[member.as_bytes()], now);
 }
 
+// ---- Table-write WAL logging ----------------------------------------------
+// Table data writes are logged HERE (the leaf functions), not by execute_with_wal,
+// for two reasons:
+//   1. Durability: HTTP table writes bypass execute_with_wal entirely, so without
+//      this they are never WAL'd and are lost on crash since the last snapshot.
+//   2. Determinism: the raw command carries no generated PK / resolved default, so
+//      replaying it regenerates uuid()/now() and the row's identity changes. We log
+//      the RESOLVED command (explicit PK + resolved values) so replay reproduces the
+//      exact row.
+// `wal_log_command` no-ops when the WAL is disabled or suppressed (during replay),
+// so these calls are safe everywhere. execute_with_wal must NOT also raw-log these
+// commands (it skips all T* writes) or the row would be applied twice on replay.
+
+/// The PK column name for a table (the declared PK, else the implicit `id`).
+fn pk_column_name(schema: &[FieldDef]) -> &str {
+    schema
+        .iter()
+        .find(|f| f.primary_key)
+        .map(|f| f.name.as_str())
+        .unwrap_or("id")
+}
+
+fn ttl_wal_tokens(ttl: Option<TtlOp>) -> Option<(&'static [u8], Vec<u8>)> {
+    match ttl {
+        Some(TtlOp::Set(secs)) => Some((b"TTL", secs.to_string().into_bytes())),
+        Some(TtlOp::Clear) => Some((b"TTL", b"0".to_vec())),
+        None => None,
+    }
+}
+
 fn apply_row_ttl(store: &Store, table: &str, pk: &str, ttl: Option<TtlOp>, now: Instant) {
     match ttl {
         Some(TtlOp::Set(secs)) => set_row_ttl(store, table, pk, secs, now),
@@ -1457,6 +1487,8 @@ pub fn table_create(
         return Err(format!("ERR table '{}' already exists", table));
     }
 
+    // Keep the original column list (incl. any `WITH TTL`) for the WAL log below.
+    let orig_col_args = col_args;
     // `... WITH TTL <secs>` gives every row in the table a default expiry.
     let (col_args, default_ttl) = split_with_ttl(col_args);
     let fields = parse_column_list(col_args)?;
@@ -1506,6 +1538,18 @@ pub fn table_create(
         let mut w = cache.write();
         w.insert(table, fields);
         w.insert_default_ttl(table, default_ttl);
+    }
+
+    // WAL: schema creation is deterministic; log the original column list so the
+    // table exists after a crash (HTTP TCREATE bypasses execute_with_wal).
+    if store.wal_enabled() {
+        let mut a: Vec<&[u8]> = Vec::with_capacity(orig_col_args.len() + 2);
+        a.push(b"TCREATE");
+        a.push(table.as_bytes());
+        for c in orig_col_args {
+            a.push(c.as_bytes());
+        }
+        let _ = store.wal_log_command(&a);
     }
 
     Ok(())
@@ -1976,6 +2020,34 @@ fn table_insert_pk(
     // (`TCREATE ... WITH TTL`). An explicit `TTL 0` (Clear) does not fall back.
     let effective_ttl = ttl.or_else(|| table_default_ttl(store, cache, table, now).map(TtlOp::Set));
     apply_row_ttl(store, table, &pk_str, effective_ttl, now);
+
+    // WAL: log the RESOLVED insert (explicit PK + the resolved column values that
+    // were actually stored) so crash replay reproduces this exact row.
+    if store.wal_enabled() {
+        let mut a: Vec<Vec<u8>> = Vec::with_capacity(provided.len() * 2 + 6);
+        a.push(b"TINSERT".to_vec());
+        a.push(table.as_bytes().to_vec());
+        if !has_explicit_pk {
+            a.push(b"id".to_vec());
+            a.push(pk_str.as_bytes().to_vec());
+        }
+        for field in &schema {
+            if let Some(v) = provided.get(field.name.as_str()) {
+                a.push(field.name.as_bytes().to_vec());
+                a.push(v.as_bytes().to_vec());
+            } else if field.primary_key {
+                a.push(field.name.as_bytes().to_vec());
+                a.push(pk_str.as_bytes().to_vec());
+            }
+        }
+        if let Some((tok, val)) = ttl_wal_tokens(ttl) {
+            a.push(tok.to_vec());
+            a.push(val);
+        }
+        let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
+        let _ = store.wal_log_command(&refs);
+    }
+
     Ok(pk_str)
 }
 
@@ -2112,6 +2184,29 @@ fn table_update_by_pk_str(
         .map(|(k, v)| (k.as_bytes() as &[u8], v.as_slice()))
         .collect();
     store.hset(rk.as_bytes(), &pair_refs, now)?;
+
+    // WAL: log the resolved per-row update so crash replay re-applies it. SET
+    // values are already explicit; keyed by the actual PK so it never re-matches
+    // a different row on replay. (A WHERE-update logs one such command per matched
+    // row.) Row-TTL refresh on an update is applied by the caller and is the known
+    // replay-resets-TTL limitation, not logged here.
+    if store.wal_enabled() {
+        let pkcol = pk_column_name(&schema);
+        let mut a: Vec<Vec<u8>> = Vec::with_capacity(field_values.len() * 2 + 7);
+        a.push(b"TUPDATE".to_vec());
+        a.push(table.as_bytes().to_vec());
+        a.push(b"SET".to_vec());
+        for (k, v) in field_values {
+            a.push(k.as_bytes().to_vec());
+            a.push(v.as_bytes().to_vec());
+        }
+        a.push(b"WHERE".to_vec());
+        a.push(pkcol.as_bytes().to_vec());
+        a.push(b"=".to_vec());
+        a.push(pk_str.as_bytes().to_vec());
+        let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
+        let _ = store.wal_log_command(&refs);
+    }
 
     Ok(())
 }
@@ -2323,6 +2418,24 @@ fn table_delete_inner(
     clear_row_ttl(store, table, pk_str, now);
 
     store.del(&[rk.as_bytes()]);
+
+    // WAL: log the resolved per-row delete (keyed by the actual PK) only at the
+    // top level. Cascaded child deletes (depth > 0) are NOT logged: replaying the
+    // parent's delete re-runs the same FK cascade deterministically, so logging
+    // children too would double-delete (harmless but noisy) on replay.
+    if depth == 0 && store.wal_enabled() {
+        let pkcol = pk_column_name(&schema);
+        let a: Vec<&[u8]> = vec![
+            b"TDELETE",
+            b"FROM",
+            table.as_bytes(),
+            b"WHERE",
+            pkcol.as_bytes(),
+            b"=",
+            pk_str.as_bytes(),
+        ];
+        let _ = store.wal_log_command(&a);
+    }
 
     Ok(())
 }
@@ -2701,6 +2814,13 @@ pub fn table_drop(
 
     // Evict from cache
     cache.write().remove(table);
+
+    // WAL: log the drop so a dropped table stays dropped after a crash (HTTP
+    // TDROP bypasses execute_with_wal).
+    if store.wal_enabled() {
+        let a: Vec<&[u8]> = vec![b"TDROP", table.as_bytes()];
+        let _ = store.wal_log_command(&a);
+    }
 
     Ok(())
 }

@@ -2226,12 +2226,35 @@ pub fn execute_with_wal(
             resp::write_error(out, &err);
             return CmdResult::Written;
         }
-        if let Err(e) = store.wal_log_command(args) {
-            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-            return CmdResult::Written;
+        // Table data/schema writes log their own RESOLVED command from the table
+        // layer (for crash determinism + so HTTP table writes, which never reach
+        // this function, are durable). Raw-logging them here too would apply the
+        // row twice on replay, so skip them.
+        if !command_self_logs_wal(args[0]) {
+            if let Err(e) = store.wal_log_command(args) {
+                resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                return CmdResult::Written;
+            }
         }
     }
     execute(store, cache, broker, args, out, now)
+}
+
+/// Table writes that append their own resolved command to the WAL from the table
+/// layer; `execute_with_wal` must not also raw-log them.
+fn command_self_logs_wal(cmd: &[u8]) -> bool {
+    let mut up = [0u8; 8];
+    if cmd.len() > up.len() {
+        return false;
+    }
+    for (i, b) in cmd.iter().enumerate() {
+        up[i] = b.to_ascii_uppercase();
+    }
+    let c = &up[..cmd.len()];
+    matches!(
+        c,
+        b"TINSERT" | b"TUPSERT" | b"TUPDATE" | b"TDELETE" | b"TCREATE" | b"TDROP"
+    )
 }
 
 #[allow(dead_code)]
