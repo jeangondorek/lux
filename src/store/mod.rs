@@ -722,54 +722,63 @@ impl Store {
     /// write lock is dropped before disk I/O to avoid blocking other operations.
     pub fn evict_key(&self, shard_idx: usize, key: &[u8]) -> bool {
         if let Some(ref disk_shards) = self.disk_shards {
-            let shard = self.shards[shard_idx].write();
-            if let Some(entry) = shard.data.get(key) {
-                if matches!(entry.value, StoreValue::Vector(_)) {
-                    return false;
+            // Hold the shard lock across the disk write AND the removal so the
+            // entry we serialize to disk is exactly the one we remove. Dropping
+            // the lock for the disk I/O (as this used to) let a concurrent write
+            // land a new value in the gap, which the unconditional remove then
+            // discarded -- a silent lost update made durable by the next snapshot.
+            // Lock order is shard -> disk; `try_promote` releases its disk lock
+            // before taking a shard lock, so there is no AB-BA deadlock.
+            let mut shard = self.shards[shard_idx].write();
+            let (key_string, dump, mem) = match shard.data.get(key) {
+                Some(entry) => {
+                    if matches!(entry.value, StoreValue::Vector(_)) {
+                        return false;
+                    }
+                    let now = Instant::now();
+                    let ttl_ms = entry
+                        .expires_at
+                        .map(|exp| {
+                            if exp > now {
+                                exp.duration_since(now).as_millis() as i64
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0);
+                    let key_string = key_string(key);
+                    let dump = self.entry_to_dump(&key_string, &entry.value, ttl_ms);
+                    let mem = estimate_entry_memory(key, &entry.value);
+                    (key_string, dump, mem)
                 }
-                let now = Instant::now();
-                let ttl_ms = entry
-                    .expires_at
-                    .map(|exp| {
-                        if exp > now {
-                            exp.duration_since(now).as_millis() as i64
-                        } else {
-                            0
-                        }
-                    })
-                    .unwrap_or(0);
-                let key_string = key_string(key);
-                let dump = self.entry_to_dump(&key_string, &entry.value, ttl_ms);
-                drop(shard);
+                None => return false,
+            };
 
-                let disk_idx = (fx_hash(key) % disk_shards.len() as u64) as usize;
-                let mut disk = disk_shards[disk_idx].lock();
-                if let Err(e) = disk.put(&key_string, &dump) {
-                    self.record_disk_write_error();
-                    self.emit_error(crate::ServerErrorEvent::DiskEvictionWriteFailed {
-                        key: key_string,
+            let disk_idx = (fx_hash(key) % disk_shards.len() as u64) as usize;
+            let mut disk = disk_shards[disk_idx].lock();
+            if let Err(e) = disk.put(&key_string, &dump) {
+                self.record_disk_write_error();
+                self.emit_error(crate::ServerErrorEvent::DiskEvictionWriteFailed {
+                    key: key_string,
+                    error: e.to_string(),
+                });
+                return false;
+            }
+            if disk.should_compact() {
+                if let Err(e) = disk.compact() {
+                    self.emit_error(crate::ServerErrorEvent::InlineCompactionFailed {
                         error: e.to_string(),
                     });
-                    return false;
                 }
-                if disk.should_compact() {
-                    if let Err(e) = disk.compact() {
-                        self.emit_error(crate::ServerErrorEvent::InlineCompactionFailed {
-                            error: e.to_string(),
-                        });
-                    }
-                }
-                drop(disk);
+            }
+            drop(disk);
 
-                let mut shard = self.shards[shard_idx].write();
-                if let Some(entry) = shard.data.remove(key) {
-                    self.key_removed();
-                    let mem = estimate_entry_memory(key, &entry.value);
-                    shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    self.mem_sub(mem);
-                    shard.version += 1;
-                    return true;
-                }
+            if shard.data.remove(key).is_some() {
+                self.key_removed();
+                shard.used_memory = shard.used_memory.saturating_sub(mem);
+                self.mem_sub(mem);
+                shard.version += 1;
+                return true;
             }
         } else {
             let mut shard = self.shards[shard_idx].write();
