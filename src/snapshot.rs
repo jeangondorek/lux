@@ -6,7 +6,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const HEADER_V1: &[u8; 4] = b"LUX\x01";
-const HEADER: &[u8; 4] = b"LUX\x02";
+const HEADER_V2: &[u8; 4] = b"LUX\x02";
+// V3 persists key TTLs as ABSOLUTE epoch-ms deadlines instead of relative
+// remaining-ms. V2 rebased the remaining time to load-time, so a key with N ms
+// left at save time got a full fresh N ms on restart -- TTLs paused across
+// downtime and keys that should have expired while down resurrected. V3 subtracts
+// elapsed wall-clock on load so deadlines are honored across restarts.
+const HEADER: &[u8; 4] = b"LUX\x03";
+
+/// Wall-clock now in epoch milliseconds (for absolute TTL deadlines).
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn snapshot_path(store: &Store) -> String {
     let dir = &store.config().data_dir;
@@ -148,7 +162,14 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
         };
         w.write_all(&[type_byte])?;
         write_bytes(w, entry.key.as_bytes())?;
-        let ttl = if entry.ttl_ms > 0 { entry.ttl_ms } else { -1 };
+        // `entry.ttl_ms` is relative remaining-ms (computed at dump time, a few ms
+        // ago). Persist an ABSOLUTE epoch-ms deadline so load can subtract elapsed
+        // downtime; `-1` means no expiry.
+        let ttl = if entry.ttl_ms > 0 {
+            now_epoch_ms().saturating_add(entry.ttl_ms as u64) as i64
+        } else {
+            -1
+        };
         write_i64(w, ttl)?;
 
         match &entry.value {
@@ -263,16 +284,25 @@ fn load_from_reader(store: &Store, mut file: fs::File) -> io::Result<usize> {
     let mut header = [0u8; 4];
     let n = file.read(&mut header)?;
     if n == 4 && &header == HEADER {
-        load_binary(store, &mut io::BufReader::new(file), true)
+        // V3: absolute-deadline TTLs, stream groups present.
+        load_binary(store, &mut io::BufReader::new(file), true, true)
+    } else if n == 4 && &header == HEADER_V2 {
+        // V2: relative remaining-ms TTLs (legacy; rebased to now on load).
+        load_binary(store, &mut io::BufReader::new(file), true, false)
     } else if n == 4 && &header == HEADER_V1 {
-        load_binary(store, &mut io::BufReader::new(file), false)
+        load_binary(store, &mut io::BufReader::new(file), false, false)
     } else {
         file.seek(SeekFrom::Start(0))?;
         load_legacy(store, file)
     }
 }
 
-fn load_binary(store: &Store, r: &mut impl Read, stream_groups: bool) -> io::Result<usize> {
+fn load_binary(
+    store: &Store,
+    r: &mut impl Read,
+    stream_groups: bool,
+    absolute_ttl: bool,
+) -> io::Result<usize> {
     let mut count = 0;
     loop {
         let mut type_buf = [0u8; 1];
@@ -284,10 +314,20 @@ fn load_binary(store: &Store, r: &mut impl Read, stream_groups: bool) -> io::Res
 
         let key = read_string(r)?;
         let ttl_ms = read_i64(r)?;
-        let ttl = if ttl_ms > 0 {
-            Some(Duration::from_millis(ttl_ms as u64))
+        // V3 stores an absolute epoch-ms deadline: subtract elapsed wall-clock so
+        // downtime counts (a key whose deadline already passed is dropped, not
+        // resurrected). V2/V1 stored relative remaining-ms (legacy rebase).
+        let (ttl, expired) = if ttl_ms <= 0 {
+            (None, false)
+        } else if absolute_ttl {
+            let remaining = ttl_ms.saturating_sub(now_epoch_ms() as i64);
+            if remaining <= 0 {
+                (None, true)
+            } else {
+                (Some(Duration::from_millis(remaining as u64)), false)
+            }
         } else {
-            None
+            (Some(Duration::from_millis(ttl_ms as u64)), false)
         };
 
         let value = match type_buf[0] {
@@ -424,8 +464,12 @@ fn load_binary(store: &Store, r: &mut impl Read, stream_groups: bool) -> io::Res
             }
         };
 
-        store.load_entry(key, value, ttl);
-        count += 1;
+        // The value bytes were read above to advance the stream; only store the
+        // entry if its absolute deadline hasn't already passed during downtime.
+        if !expired {
+            store.load_entry(key, value, ttl);
+            count += 1;
+        }
     }
     Ok(count)
 }
