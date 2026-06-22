@@ -580,6 +580,61 @@ fn ttl_wal_tokens(ttl: Option<TtlOp>) -> Option<(&'static [u8], Vec<u8>)> {
     }
 }
 
+/// Read-validate a unique-index hit: does the holder row actually still carry
+/// `value` in `field`? A stale entry (row gone or value changed without the index
+/// being updated) returns false, so the uniqueness check treats it as free.
+fn uniq_holder_holds_value(
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    holder_pk: &str,
+    value: &str,
+    now: Instant,
+) -> bool {
+    let rk = row_key_for_pk(table, holder_pk);
+    match store.hget(rk.as_bytes(), field.name.as_bytes(), now) {
+        // Compare in the stored (encoded) form so the match is exact.
+        Some(raw) => field
+            .field_type
+            .encode_value(value)
+            .map(|enc| enc == raw)
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Register a new row's TTL deadline in the global `_t:_ttl` index and return the
+/// hidden-field bytes to fold into the row commit -- WITHOUT writing the row hash,
+/// so the deadline becomes visible atomically with the row (write-row-last).
+/// Returns `None` when the row has no TTL.
+fn stage_row_ttl(
+    store: &Store,
+    table: &str,
+    pk: &str,
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    match ttl {
+        Some(TtlOp::Set(secs)) => {
+            let deadline_ms = current_epoch_ms().saturating_add(secs.saturating_mul(1000));
+            let member = ttl_member(table, pk);
+            let _ = store.zadd(
+                ttl_index_key().as_bytes(),
+                &[(member.as_bytes(), deadline_ms as f64)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                now,
+            );
+            Some(deadline_ms.to_string().into_bytes())
+        }
+        // On a fresh insert there is no prior deadline to clear.
+        Some(TtlOp::Clear) | None => None,
+    }
+}
+
 fn apply_row_ttl(store: &Store, table: &str, pk: &str, ttl: Option<TtlOp>, now: Instant) {
     match ttl {
         Some(TtlOp::Set(secs)) => set_row_ttl(store, table, pk, secs, now),
@@ -1877,18 +1932,25 @@ fn table_insert_pk(
             }
         }
 
-        // UNIQUE / PRIMARY KEY uniqueness check. A value held only by an expired
-        // (not-yet-swept) row is freed by purging that row first.
+        // UNIQUE / PRIMARY KEY uniqueness check. The uniq index is advisory: only
+        // reject if a LIVE row genuinely still holds this value. A value held by an
+        // expired row is freed by purging it; a stale index entry (holder row gone
+        // or no longer carrying this value, e.g. from a partial update) is dropped
+        // and the insert is allowed -- never a false "duplicate".
         if field.unique {
             let ukey = uniq_key(table, &field.name);
             if let Some(holder) = store.hget(ukey.as_bytes(), value.as_bytes(), now) {
                 let holder_pk = String::from_utf8_lossy(&holder).to_string();
-                if !purge_if_expired(store, cache, table, &holder_pk, now) {
+                let absent = purge_if_expired(store, cache, table, &holder_pk, now);
+                if !absent && uniq_holder_holds_value(store, table, field, &holder_pk, value, now) {
                     return Err(format!(
                         "ERR unique constraint violation on column '{}': value '{}' already exists",
                         field.name, value
                     ));
                 }
+                // Stale entry -> drop it so it doesn't block this (valid) insert,
+                // which writes the fresh holder below.
+                let _ = store.hdel(ukey.as_bytes(), &[value.as_bytes()], now);
             }
         }
     }
@@ -1959,11 +2021,13 @@ fn table_insert_pk(
         }
     }
 
-    let pair_refs: Vec<(&[u8], &[u8])> = pairs_owned
-        .iter()
-        .map(|(k, v)| (k.as_bytes() as &[u8], v.as_slice()))
-        .collect();
-    store.hset(rk.as_bytes(), &pair_refs, now)?;
+    // NOTE: the row hash is committed LAST (after `:ids`, indexes, uniq, vector,
+    // and the staged TTL field). Reach-structures point at a pk whose row hash
+    // does not exist yet; reads re-fetch the row and filter it out (treated as
+    // "not committed"). The single final `hset` then flips the row visible
+    // everywhere atomically. A failure before the commit leaves only orphan index
+    // entries (harmless to reads via read-validation; cleaned lazily), never a
+    // half-applied row.
 
     // Track this row in the ids sorted set.
     // Member = pk_str, score = numeric pk if possible, else a monotonic counter.
@@ -2018,8 +2082,19 @@ fn table_insert_pk(
 
     // An explicit write TTL wins; otherwise a new row inherits the table default
     // (`TCREATE ... WITH TTL`). An explicit `TTL 0` (Clear) does not fall back.
+    // Register the deadline and fold the hidden TTL field into the row commit so
+    // it appears atomically with the row.
     let effective_ttl = ttl.or_else(|| table_default_ttl(store, cache, table, now).map(TtlOp::Set));
-    apply_row_ttl(store, table, &pk_str, effective_ttl, now);
+    if let Some(ttl_bytes) = stage_row_ttl(store, table, &pk_str, effective_ttl, now) {
+        pairs_owned.push((String::from("\u{0}ttl"), ttl_bytes));
+    }
+
+    // --- Commit: write the complete row hash LAST (the atomic visibility point) ---
+    let pair_refs: Vec<(&[u8], &[u8])> = pairs_owned
+        .iter()
+        .map(|(k, v)| (k.as_bytes() as &[u8], v.as_slice()))
+        .collect();
+    store.hset(rk.as_bytes(), &pair_refs, now)?;
 
     // WAL: log the RESOLVED insert (explicit PK + the resolved column values that
     // were actually stored) so crash replay reproduces this exact row.

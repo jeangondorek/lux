@@ -1883,3 +1883,41 @@ fn vector_index_cleaned_on_delete_and_drop() {
     child.kill().ok();
     child.wait().ok();
 }
+
+#[test]
+fn unique_constraint_still_correct_after_writes() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(
+        &mut s,
+        &["TCREATE", "u", "id INT PRIMARY KEY,", "email STR UNIQUE"],
+    );
+    let r = send(&mut s, &["TINSERT", "u", "id", "1", "email", "a@x.com"]);
+    assert!(!r.starts_with('-'), "first insert ok: {}", r);
+
+    // A genuine duplicate must still be rejected.
+    let r = send(&mut s, &["TINSERT", "u", "id", "2", "email", "a@x.com"]);
+    assert!(
+        r.starts_with('-'),
+        "duplicate email must be rejected: {}",
+        r
+    );
+
+    // After deleting the holder, the value is free again (self-heals).
+    send(&mut s, &["TDELETE", "FROM", "u", "WHERE", "id", "=", "1"]);
+    let r = send(&mut s, &["TINSERT", "u", "id", "3", "email", "a@x.com"]);
+    assert!(
+        !r.starts_with('-'),
+        "email reusable after holder deleted: {}",
+        r
+    );
+
+    // And that new holder is now authoritative (rejects another dup).
+    let r = send(&mut s, &["TINSERT", "u", "id", "4", "email", "a@x.com"]);
+    assert!(r.starts_with('-'), "new holder enforces uniqueness: {}", r);
+
+    child.kill().ok();
+    child.wait().ok();
+}
