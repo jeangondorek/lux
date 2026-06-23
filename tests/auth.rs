@@ -1,5 +1,46 @@
 mod common;
 use common::{send_and_read, LuxServer};
+use std::io::Write;
+
+// Raw-KV access to the internal `_t:` namespace (where auth rows live --
+// password hashes, the JWT signing key, OAuth secrets) is reserved, for reads
+// as well as writes, and on the batched pipeline path as well as the generic
+// dispatch. Regression coverage for that guard, which was previously untested
+// on the read/pipeline path. A bypass would return row data / empty arrays
+// instead of the reserved-namespace error.
+#[test]
+fn pipelined_raw_kv_read_of_auth_keys_is_blocked() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    let mut batch = common::resp_cmd(&["HGETALL", "_t:auth.users:row:x"]);
+    batch.extend_from_slice(&common::resp_cmd(&[
+        "HGET",
+        "_t:auth.signing_keys:row:1",
+        "private_key_encrypted",
+    ]));
+    conn.write_all(&batch).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let resp = common::read_all(&mut conn);
+
+    let blocked = resp.matches("reserved internal namespace").count();
+    assert!(
+        blocked >= 2,
+        "both pipelined auth-key reads must be blocked, got: {resp:?}"
+    );
+}
+
+// Same protection on a single (non-pipelined) read.
+#[test]
+fn raw_kv_read_of_auth_key_is_blocked() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    let resp = send_and_read(&mut conn, &["HGETALL", "_t:auth.users:row:x"]);
+    assert!(
+        resp.contains("reserved internal namespace"),
+        "auth-key read must be refused, got: {resp:?}"
+    );
+}
 
 #[test]
 fn commands_rejected_without_auth() {
