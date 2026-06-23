@@ -30,6 +30,18 @@ enum Commands {
         fresh: bool,
         #[arg(long, help = "Start only the engine; don't launch Lux Studio")]
         no_studio: bool,
+        #[arg(
+            long,
+            value_name = "PORT",
+            help = "Host port for the RESP API (default 6379, auto-bumps if taken)"
+        )]
+        resp_port: Option<u16>,
+        #[arg(
+            long,
+            value_name = "PORT",
+            help = "Host port for the HTTP API (default 8080, auto-bumps if taken)"
+        )]
+        http_port: Option<u16>,
     },
     /// Stop the local Lux engine.
     Stop {
@@ -1104,7 +1116,12 @@ pub async fn run() {
             println!("Next: {} to boot a local engine.", "lux start".cyan());
         }
 
-        Commands::Start { fresh, no_studio } => {
+        Commands::Start {
+            fresh,
+            no_studio,
+            resp_port: resp_port_flag,
+            http_port: http_port_flag,
+        } => {
             if let Err(e) = docker_preflight() {
                 eprintln!("{} {e}", "Error:".red());
                 std::process::exit(1);
@@ -1138,17 +1155,43 @@ pub async fn run() {
             // (e.g. another local project is already running). Removing the stale
             // container above freed this project's own ports, so a same-project
             // restart keeps them; only a real conflict bumps. Persist the choice.
-            let resp_port = free_port_from(state.resp_port);
-            let http_port = free_port_from(state.http_port);
+            // An explicit --resp-port/--http-port pins that exact host port (hard
+            // error if it's taken -- the user asked for it specifically). Without
+            // a flag, fall back to the configured port and auto-bump past any
+            // conflict so multiple projects can run at once.
+            let pin = |label: &str, p: u16| {
+                if !port_is_free(p) {
+                    eprintln!("{} {label} port {p} is already in use", "Error:".red());
+                    std::process::exit(1);
+                }
+                p
+            };
+            let resp_port = match resp_port_flag {
+                Some(p) => pin("RESP", p),
+                None => free_port_from(state.resp_port),
+            };
+            let http_port = match http_port_flag {
+                Some(p) => {
+                    if p == resp_port {
+                        eprintln!("{} --resp-port and --http-port must differ", "Error:".red());
+                        std::process::exit(1);
+                    }
+                    pin("HTTP", p)
+                }
+                None => free_port_from(state.http_port),
+            };
             if resp_port != state.resp_port || http_port != state.http_port {
-                println!(
-                    "{} ports {}/{} busy, using {}/{}",
-                    "Note:".yellow(),
-                    state.resp_port,
-                    state.http_port,
-                    resp_port,
-                    http_port
-                );
+                // Only narrate auto-bumps; an explicit flag is the user's choice.
+                if resp_port_flag.is_none() && http_port_flag.is_none() {
+                    println!(
+                        "{} ports {}/{} busy, using {}/{}",
+                        "Note:".yellow(),
+                        state.resp_port,
+                        state.http_port,
+                        resp_port,
+                        http_port
+                    );
+                }
                 state.resp_port = resp_port;
                 state.http_port = http_port;
                 save_local_state(&state);
