@@ -279,6 +279,18 @@ struct LocalConfig {
     /// inside the container; these map to the host).
     local_http_port: Option<u16>,
     local_resp_port: Option<u16>,
+    /// Pin the local engine to a specific version (e.g. "0.23.0") instead of
+    /// tracking `:latest`. Maps to the `ghcr.io/lux-db/lux:<version>` image.
+    engine_version: Option<String>,
+}
+
+/// The engine image `lux start` should run: a pinned `engine_version` from
+/// `lux/config.toml`, else `:latest`.
+fn desired_engine_image(config: Option<&LocalConfig>) -> String {
+    match config.and_then(|c| c.engine_version.as_deref()) {
+        Some(v) if !v.trim().is_empty() => format!("ghcr.io/lux-db/lux:{}", v.trim()),
+        _ => LOCAL_ENGINE_IMAGE.to_string(),
+    }
 }
 
 /// Engine image `lux start` pulls. Tracks `:latest` (CI publishes it on every
@@ -439,10 +451,12 @@ fn free_port_from(preferred: u16) -> u16 {
 fn ensure_local_state() -> LocalState {
     if let Some(mut state) = load_local_state() {
         let mut dirty = false;
-        // Track the current engine image (`:latest`) even for projects created
-        // before the CLI stopped pinning a specific version.
-        if state.image != LOCAL_ENGINE_IMAGE {
-            state.image = LOCAL_ENGINE_IMAGE.to_string();
+        // Follow the engine image config.toml asks for: a pinned `engine_version`,
+        // else `:latest`. Re-evaluated each load so editing config.toml takes
+        // effect on the next `lux start`.
+        let desired_image = desired_engine_image(load_local_config().as_ref());
+        if state.image != desired_image {
+            state.image = desired_image;
             dirty = true;
         }
         // Backfill Studio fields for states written before Studio existed.
@@ -475,7 +489,7 @@ fn ensure_local_state() -> LocalState {
             .unwrap_or(DEFAULT_RESP_PORT),
         container: format!("lux-{slug}"),
         volume: format!("lux-{slug}-data"),
-        image: LOCAL_ENGINE_IMAGE.to_string(),
+        image: desired_engine_image(local.as_ref()),
         studio_port: DEFAULT_STUDIO_PORT,
         studio_container: format!("lux-{slug}-studio"),
     };
@@ -890,6 +904,7 @@ fn load_local_config() -> Option<LocalConfig> {
             "project_name" => config.project_name = parse_config_string(value),
             "local_http_port" => config.local_http_port = parse_config_u16(value),
             "local_resp_port" => config.local_resp_port = parse_config_u16(value),
+            "engine_version" => config.engine_version = parse_config_string(value),
             _ => {}
         }
     }
@@ -912,6 +927,14 @@ fn save_local_config(config: &LocalConfig) {
     }
     if let Some(p) = config.local_resp_port {
         data.push_str(&format!("local_resp_port = {p}\n"));
+    }
+    if let Some(v) = &config.engine_version {
+        if !v.is_empty() {
+            data.push_str(&format!(
+                "engine_version = \"{}\"\n",
+                escape_config_string(v)
+            ));
+        }
     }
     std::fs::write(path, data).unwrap_or_else(|e| {
         eprintln!("{} {e}", "Failed to write lux/config.toml:".red());
@@ -1413,6 +1436,7 @@ pub async fn run() {
                 project_name: Some(inst.name.clone()),
                 local_http_port: existing.local_http_port,
                 local_resp_port: existing.local_resp_port,
+                engine_version: existing.engine_version,
             });
             println!("{} Linked to project '{}'", "Done.".green(), inst.name);
             println!("{} {}", "ID:".bold(), inst.id);
@@ -4112,6 +4136,31 @@ mod tests {
     }
 
     #[test]
+    fn engine_version_pins_image_else_latest() {
+        // No config / no version -> track :latest.
+        assert_eq!(desired_engine_image(None), LOCAL_ENGINE_IMAGE);
+        let unpinned = LocalConfig::default();
+        assert_eq!(desired_engine_image(Some(&unpinned)), LOCAL_ENGINE_IMAGE);
+
+        // Pinned version -> the matching ghcr image tag.
+        let pinned = LocalConfig {
+            engine_version: Some("0.23.0".to_string()),
+            ..LocalConfig::default()
+        };
+        assert_eq!(
+            desired_engine_image(Some(&pinned)),
+            "ghcr.io/lux-db/lux:0.23.0"
+        );
+
+        // Blank/whitespace version is ignored (back to :latest).
+        let blank = LocalConfig {
+            engine_version: Some("  ".to_string()),
+            ..LocalConfig::default()
+        };
+        assert_eq!(desired_engine_image(Some(&blank)), LOCAL_ENGINE_IMAGE);
+    }
+
+    #[test]
     fn gitignore_merge_appends_only_missing() {
         // Empty file -> both entries added.
         let merged = gitignore_merge("", &[".env.local", "lux/.lux-local.json"]).unwrap();
@@ -4166,14 +4215,16 @@ mod tests {
             project_name: Some("n".to_string()),
             local_http_port: Some(9090),
             local_resp_port: Some(6400),
+            engine_version: Some("0.23.0".to_string()),
         };
         // Re-parse the lines save_local_config would emit.
         let serialized = format!(
-            "project_id = \"{}\"\nproject_name = \"{}\"\nlocal_http_port = {}\nlocal_resp_port = {}\n",
+            "project_id = \"{}\"\nproject_name = \"{}\"\nlocal_http_port = {}\nlocal_resp_port = {}\nengine_version = \"{}\"\n",
             cfg.project_id.as_deref().unwrap(),
             cfg.project_name.as_deref().unwrap(),
             cfg.local_http_port.unwrap(),
             cfg.local_resp_port.unwrap(),
+            cfg.engine_version.as_deref().unwrap(),
         );
         let mut parsed = LocalConfig::default();
         for line in serialized.lines() {
@@ -4183,10 +4234,12 @@ mod tests {
                 "project_name" => parsed.project_name = parse_config_string(v),
                 "local_http_port" => parsed.local_http_port = parse_config_u16(v),
                 "local_resp_port" => parsed.local_resp_port = parse_config_u16(v),
+                "engine_version" => parsed.engine_version = parse_config_string(v),
                 _ => {}
             }
         }
         assert_eq!(parsed.local_http_port, Some(9090));
         assert_eq!(parsed.local_resp_port, Some(6400));
+        assert_eq!(parsed.engine_version.as_deref(), Some("0.23.0"));
     }
 }
