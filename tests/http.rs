@@ -409,6 +409,16 @@ fn http_vector_search_is_grant_scoped() {
         body.contains(r#""id":"a1""#),
         "user should get their own match: {body}"
     );
+    // VECTOR columns read back as a JSON array (matching the `number[]` SDK type),
+    // not the comma-joined string they're stored as.
+    assert!(
+        body.contains(r#""embedding":[0.8"#),
+        "vector column must read as a JSON array: {body}"
+    );
+    assert!(
+        !body.contains(r#""embedding":""#),
+        "vector column must not read as a quoted string: {body}"
+    );
     // The other tenant's closer vectors must never leak.
     assert!(
         !body.contains(r#""id":"b1""#)
