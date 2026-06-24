@@ -644,6 +644,51 @@ fn update_ttl_active_after_wal_replay() {
     );
 }
 
+// A TTL set by an UPSERT onto an existing (conflicting) row must survive WAL
+// replay. Covers both shapes: an upsert that also writes a non-key field, and a
+// TTL-only refresh (no non-key fields) -- the latter previously logged no command
+// at all, so its deadline vanished on replay and the row lived forever.
+#[test]
+fn upsert_ttl_active_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(
+        &mut c,
+        &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"],
+    );
+    send(&mut c, &["TINSERT", "pres", "user_id", "keep", "room", "a"]);
+    send(&mut c, &["TINSERT", "pres", "user_id", "gone", "room", "a"]);
+    // `keep`: upsert that also updates a field. `gone`: TTL-only upsert (conflict
+    // key is the sole field) -- the case that logged nothing before the fix.
+    send(
+        &mut c,
+        &[
+            "TUPSERT", "pres", "user_id", "keep", "room", "b", "TTL", "60",
+        ],
+    );
+    send(&mut c, &["TUPSERT", "pres", "user_id", "gone", "TTL", "2"]);
+    // NO SAVE -> recovery is from WAL replay only.
+    drop(c);
+    srv.kill();
+    srv.restart();
+    let mut c = srv.conn();
+
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row recovers: {resp}");
+    assert!(
+        resp.contains("gone"),
+        "TTL-only-upsert row recovers: {resp}"
+    );
+
+    thread::sleep(Duration::from_millis(2600));
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
+    assert!(
+        !resp.contains("gone"),
+        "upsert-set TTL must survive replay and expire the row: {resp}"
+    );
+}
+
 // A row with an auto-generated UUID primary key must keep the SAME id across a
 // WAL-replay recovery. The table layer logs the RESOLVED insert (explicit uuid),
 // so replay reproduces the exact row instead of regenerating it. This also guards

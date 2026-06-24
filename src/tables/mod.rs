@@ -1832,15 +1832,22 @@ pub fn table_upsert_returning_ttl(
     match existing_pk {
         Some(pk) => {
             // Update the conflicting row with the non-key fields, then return it.
-            let updates: Vec<(&str, &str)> = field_values
+            let mut updates: Vec<(&str, &str)> = field_values
                 .iter()
                 .copied()
                 .filter(|(k, _)| *k != conflict)
                 .collect();
-            if !updates.is_empty() {
-                table_update_by_pk_str(store, cache, table, &pk, &updates, None, now)?;
+            // A TTL-only upsert (no non-key fields) still needs a logged command so
+            // the refreshed deadline survives WAL replay. Carry it on a no-op write
+            // of the conflict column to its matched value.
+            if updates.is_empty() && ttl.is_some() {
+                updates.push((conflict, cval));
             }
-            apply_row_ttl(store, table, &pk, ttl, now);
+            // The leaf applies AND WAL-logs the TTL atomically with the row update,
+            // so replay preserves the deadline instead of dropping it.
+            if !updates.is_empty() {
+                table_update_by_pk_str(store, cache, table, &pk, &updates, ttl, now)?;
+            }
             let mut row = get_row(store, table, &schema, &pk, now)
                 .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
             row.sort_by(|a, b| a.0.cmp(&b.0));
