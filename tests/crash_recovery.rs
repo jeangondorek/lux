@@ -116,7 +116,6 @@ fn crash_recovery_all_types() {
 // QUARANTINED repro for ENG-1276 (un-ignore when fixing). Run with:
 //   cargo test --release --test crash_recovery -- --ignored xadd_star_id_stable_after_wal_replay
 #[test]
-#[ignore = "ENG-1276: XADD * id is non-deterministic across WAL replay until fixed"]
 fn xadd_star_id_stable_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();

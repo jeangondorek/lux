@@ -33,6 +33,45 @@ fn write_xread_result(
     }
 }
 
+fn xadd_id_arg_index(args: &[&[u8]]) -> Option<usize> {
+    let mut i = 2;
+    while i < args.len() {
+        if cmd_eq(args[i], b"MAXLEN") || cmd_eq(args[i], b"MINID") {
+            i += 1;
+            if i < args.len() && args[i] == b"~" {
+                i += 1;
+            }
+            if i < args.len() {
+                i += 1;
+            }
+        } else if cmd_eq(args[i], b"NOMKSTREAM") {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (i < args.len()).then_some(i)
+}
+
+fn log_resolved_xadd(store: &Store, args: &[&[u8]], id: StreamId, out: &mut BytesMut) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let Some(id_idx) = xadd_id_arg_index(args) else {
+        return true;
+    };
+    let mut owned: Vec<Vec<u8>> = args.iter().map(|arg| arg.to_vec()).collect();
+    owned[id_idx] = id.to_string().into_bytes();
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    match store.wal_log_command(&refs) {
+        Ok(()) => true,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            false
+        }
+    }
+}
+
 pub fn cmd_xadd(
     args: &[&[u8]],
     store: &Store,
@@ -82,6 +121,9 @@ pub fn cmd_xadd(
     }
     match store.xadd(args[1], id_input, fields, maxlen, now) {
         Ok(id) => {
+            if !log_resolved_xadd(store, args, id, out) {
+                return CmdResult::Written;
+            }
             resp::write_bulk(out, &id.to_string());
             _broker.wake_stream_waiters(arg_str(args[1]));
         }

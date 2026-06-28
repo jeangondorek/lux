@@ -1024,9 +1024,11 @@ pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"BLMOVE")
         || cmd_eq(cmd, b"BZPOPMIN")
         || cmd_eq(cmd, b"BZPOPMAX")
-        || cmd_eq(cmd, b"EVAL")
-        || cmd_eq(cmd, b"EVALSHA")
-        || cmd_eq(cmd, b"SCRIPT")
+}
+
+#[inline(always)]
+pub(crate) fn is_script_command(cmd: &[u8]) -> bool {
+    cmd_eq(cmd, b"EVAL") || cmd_eq(cmd, b"EVALSHA") || cmd_eq(cmd, b"SCRIPT")
 }
 
 #[inline(always)]
@@ -1045,6 +1047,7 @@ pub(crate) fn is_pipeline_special_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"WATCH")
         || cmd_eq(cmd, b"UNWATCH")
         || is_blocking_command(cmd)
+        || is_script_command(cmd)
         || cmd_eq(cmd, b"XREAD")
         || cmd_eq(cmd, b"XREADGROUP")
 }
@@ -1287,7 +1290,6 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
             (cmd_eq(cmd, b"XLEN") && args.len() == 2)
                 || (cmd_eq(cmd, b"XRANGE")
                     && (args.len() == 4 || (args.len() == 6 && cmd_eq(args[4], b"COUNT"))))
-                || (cmd_eq(cmd, b"XADD") && args.len() >= 5)
         }
         b'Z' => {
             (cmd_eq(cmd, b"ZCARD") && args.len() == 2)
@@ -2253,7 +2255,7 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
     let c = &up[..cmd.len()];
     matches!(
         c,
-        b"TINSERT" | b"TUPSERT" | b"TUPDATE" | b"TDELETE" | b"TCREATE" | b"TDROP"
+        b"TINSERT" | b"TUPSERT" | b"TUPDATE" | b"TDELETE" | b"TCREATE" | b"TDROP" | b"XADD"
     )
 }
 

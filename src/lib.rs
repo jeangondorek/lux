@@ -2871,6 +2871,9 @@ async fn server_main(
                 _ = shutdown_rx.changed() => {
                     break;
                 }
+                joined = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                    let _ = joined;
+                }
                 accepted = listener.accept() => {
                     let (socket, peer) = accepted?;
                     let runtime = runtime.clone();
@@ -3175,6 +3178,7 @@ fn handle_tx_cmd(
     authenticated: &mut bool,
     store: &Arc<Store>,
     broker: &Broker,
+    script_engine: &lua::ScriptEngine,
     schema_cache: &SharedSchemaCache,
     write_buf: &mut BytesMut,
     now: Instant,
@@ -3252,8 +3256,20 @@ fn handle_tx_cmd(
                                 "ERR blocking commands not allowed inside a transaction",
                             );
                         }
-                        CmdResult::Eval { .. } | CmdResult::ScriptOp => {
-                            resp::write_error(write_buf, "ERR EVAL not supported in transaction");
+                        CmdResult::Eval { script, keys, argv } => {
+                            handle_eval(
+                                write_buf,
+                                store,
+                                broker,
+                                script_engine,
+                                &script,
+                                &keys,
+                                &argv,
+                                now,
+                            );
+                        }
+                        CmdResult::ScriptOp => {
+                            handle_script_op(write_buf, script_engine, &refs);
                         }
                     }
                 }
@@ -3368,6 +3384,7 @@ fn is_blocking_cmd(cmd: &[u8]) -> bool {
 
 pub(crate) struct CommandSession {
     authenticated: bool,
+    client_name: Option<String>,
     in_multi: bool,
     tx_queue: Vec<Vec<Vec<u8>>>,
     watched: Vec<(String, usize, u64)>,
@@ -3382,6 +3399,7 @@ impl CommandSession {
     pub(crate) fn new(require_auth: bool) -> Self {
         Self {
             authenticated: !require_auth,
+            client_name: None,
             in_multi: false,
             tx_queue: Vec::new(),
             watched: Vec::new(),
@@ -3396,6 +3414,49 @@ impl CommandSession {
     fn total_subscriptions(&self) -> i64 {
         (self.subscriptions.len() + self.pattern_subs.len() + self.key_subs.len()) as i64
     }
+}
+
+fn write_client_response(args: &[&[u8]], session: &mut CommandSession, out: &mut BytesMut) {
+    if args.len() < 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'client' command");
+        return;
+    }
+
+    if args[1].eq_ignore_ascii_case(b"SETNAME") {
+        if args.len() != 3 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'client|setname' command",
+            );
+            return;
+        }
+        session.client_name = Some(String::from_utf8_lossy(args[2]).into_owned());
+        resp::write_ok(out);
+    } else if args[1].eq_ignore_ascii_case(b"GETNAME") {
+        if args.len() != 2 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'client|getname' command",
+            );
+            return;
+        }
+        match session.client_name.as_deref() {
+            Some(name) => resp::write_bulk(out, name),
+            None => resp::write_null(out),
+        }
+    } else {
+        resp::write_ok(out);
+    }
+}
+
+fn is_script_gate_bypass_command(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"PING")
+        || cmd.eq_ignore_ascii_case(b"ECHO")
+        || cmd.eq_ignore_ascii_case(b"CLIENT")
+        || cmd.eq_ignore_ascii_case(b"INFO")
+        || cmd.eq_ignore_ascii_case(b"TIME")
+        || cmd.eq_ignore_ascii_case(b"COMMAND")
+        || cmd.eq_ignore_ascii_case(b"CONFIG")
 }
 
 pub(crate) trait ArgvSlice {
@@ -3479,11 +3540,29 @@ impl CommandExecutor {
             &mut session.authenticated,
             &self.store,
             &self.broker,
+            &self.script_engine,
             &self.schema_cache,
             write_buf,
             now,
         ) {
             return None;
+        }
+
+        if args[0].eq_ignore_ascii_case(b"CLIENT") {
+            write_client_response(args, session, write_buf);
+            return None;
+        }
+
+        if is_script_gate_bypass_command(args[0]) {
+            let cmd_result = cmd::execute_with_wal(
+                &self.store,
+                &self.schema_cache,
+                &self.broker,
+                args,
+                write_buf,
+                now,
+            );
+            return self.apply_cmd_result(cmd_result, args, session, write_buf, now);
         }
 
         if !cmd::is_pipeline_special_command(args[0]) {
@@ -3550,6 +3629,36 @@ impl CommandExecutor {
             return None;
         }
 
+        if !session.in_multi
+            && session.authenticated
+            && commands.iter().all(|command| {
+                let args = command.argv();
+                !args.is_empty() && is_script_gate_bypass_command(args[0])
+            })
+        {
+            for command in commands {
+                let args = command.argv();
+                if args[0].eq_ignore_ascii_case(b"CLIENT") {
+                    write_client_response(args, session, write_buf);
+                    continue;
+                }
+                let cmd_result = cmd::execute_with_wal(
+                    &self.store,
+                    &self.schema_cache,
+                    &self.broker,
+                    args,
+                    write_buf,
+                    now,
+                );
+                if let Some(action) =
+                    self.apply_cmd_result(cmd_result, args, session, write_buf, now)
+                {
+                    return Some(action);
+                }
+            }
+            return None;
+        }
+
         let mut has_special = session.in_multi;
         let mut all_single_key_rw = true;
         let mut flags: Vec<cmd::PipelineAccess> = Vec::with_capacity(cmd_count);
@@ -3582,7 +3691,6 @@ impl CommandExecutor {
         }
 
         if has_special || !all_single_key_rw {
-            let script_guard = self.store.script_read_guard();
             for command in commands {
                 let args = command.argv();
                 if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
@@ -3598,6 +3706,7 @@ impl CommandExecutor {
                     &mut session.authenticated,
                     &self.store,
                     &self.broker,
+                    &self.script_engine,
                     &self.schema_cache,
                     write_buf,
                     now,
@@ -3605,22 +3714,23 @@ impl CommandExecutor {
                     continue;
                 }
 
-                let cmd_result = cmd::execute_with_wal(
-                    &self.store,
-                    &self.schema_cache,
-                    &self.broker,
-                    args,
-                    write_buf,
-                    now,
-                );
+                let cmd_result = {
+                    let _guard = self.store.script_read_guard();
+                    cmd::execute_with_wal(
+                        &self.store,
+                        &self.schema_cache,
+                        &self.broker,
+                        args,
+                        write_buf,
+                        now,
+                    )
+                };
                 if let Some(action) =
                     self.apply_cmd_result(cmd_result, args, session, write_buf, now)
                 {
-                    drop(script_guard);
                     return Some(action);
                 }
             }
-            drop(script_guard);
             return None;
         }
 
@@ -4252,8 +4362,9 @@ async fn handle_block_stream_read(
         .collect();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    let waiter_id = broker.next_waiter_id();
     for key in keys {
-        broker.register_stream_waiter(key, tx.clone());
+        broker.register_stream_waiter(key, tx.clone(), waiter_id);
     }
     drop(tx);
 
@@ -4286,6 +4397,8 @@ async fn handle_block_stream_read(
     } else {
         resp::write_null_array(&mut write_buf);
     }
+
+    broker.remove_stream_waiters_by_id(keys, waiter_id);
 
     socket.write_all(&write_buf).await
 }
@@ -4461,6 +4574,7 @@ mod tx_tests {
     fn pubsub_commands_are_rejected_inside_multi() {
         let store = Arc::new(Store::new());
         let broker = Broker::new();
+        let script_engine = lua::ScriptEngine::new();
         let schema_cache: SharedSchemaCache =
             Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
 
@@ -4482,6 +4596,7 @@ mod tx_tests {
                 &mut authenticated,
                 &store,
                 &broker,
+                &script_engine,
                 &schema_cache,
                 &mut out,
                 Instant::now(),

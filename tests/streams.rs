@@ -128,6 +128,71 @@ fn xread_block_woken() {
 }
 
 #[test]
+fn xread_block_timeout_removes_stream_waiter() {
+    let server = LuxServer::start();
+    let mut blocker = server.conn();
+    blocker
+        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .unwrap();
+
+    blocker
+        .write_all(&resp_cmd(&[
+            "XREAD",
+            "BLOCK",
+            "75",
+            "STREAMS",
+            "timeout-stream",
+            "$",
+        ]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(25));
+
+    let mut observer = server.conn();
+    let info = send_and_read(&mut observer, &["INFO"]);
+    assert!(
+        info.contains("blocked_stream_waiters:1"),
+        "stream waiter should be registered while XREAD is blocked: {info}"
+    );
+
+    let resp = read_all(&mut blocker);
+    assert!(
+        resp.contains("*-1"),
+        "XREAD timeout returns null array: {resp}"
+    );
+
+    let info = send_and_read(&mut observer, &["INFO"]);
+    assert!(
+        info.contains("blocked_stream_waiters:0"),
+        "timed-out XREAD waiter must be removed: {info}"
+    );
+}
+
+#[test]
+fn repeated_xread_block_timeouts_do_not_accumulate_waiters() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    conn.set_read_timeout(Some(Duration::from_millis(1000)))
+        .unwrap();
+
+    for _ in 0..5 {
+        let resp = send_and_read(
+            &mut conn,
+            &["XREAD", "BLOCK", "25", "STREAMS", "churn-stream", "$"],
+        );
+        assert!(
+            resp.contains("*-1"),
+            "XREAD timeout returns null array: {resp}"
+        );
+    }
+
+    let info = send_and_read(&mut conn, &["INFO"]);
+    assert!(
+        info.contains("blocked_stream_waiters:0"),
+        "stream waiters should not leak across timeout churn: {info}"
+    );
+}
+
+#[test]
 fn xpending_summary() {
     let server = LuxServer::start();
     let mut conn = server.conn();

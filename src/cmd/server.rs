@@ -248,6 +248,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          \r\n\
          # Clients\r\n\
          connected_clients:{}\r\n\
+         blocked_list_waiters:{}\r\n\
+         blocked_stream_waiters:{}\r\n\
          \r\n\
          # Stats\r\n\
          total_commands_processed:{}\r\n\
@@ -279,6 +281,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         store.shard_count(),
         store.uptime_seconds(),
         store.connected_clients(),
+        broker.list_waiter_count(),
+        broker.stream_waiter_count(),
         store.total_commands(),
         key_event_stats.enqueued,
         key_event_stats.dropped,

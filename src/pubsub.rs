@@ -55,6 +55,11 @@ pub struct BlockedPopRequest {
     pub waiter_id: u64,
 }
 
+pub struct StreamWaiter {
+    pub tx: mpsc::Sender<()>,
+    pub waiter_id: u64,
+}
+
 #[derive(Clone)]
 pub struct Broker {
     channels: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
@@ -71,7 +76,8 @@ pub struct Broker {
     key_event_counters: Arc<KeyEventCounters>,
     list_waiters: Arc<parking_lot::Mutex<HashMap<String, VecDeque<BlockedPopRequest>>>>,
     list_waiter_count: Arc<AtomicU64>,
-    stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>>,
+    stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<StreamWaiter>>>>,
+    stream_waiter_count: Arc<AtomicU64>,
     waiter_counter: Arc<AtomicU64>,
 }
 
@@ -118,6 +124,7 @@ impl Broker {
             list_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             list_waiter_count: Arc::new(AtomicU64::new(0)),
             stream_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            stream_waiter_count: Arc::new(AtomicU64::new(0)),
             waiter_counter: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -132,6 +139,10 @@ impl Broker {
 
     pub fn has_list_waiters(&self, _key: &str) -> bool {
         self.list_waiter_count.load(Ordering::Relaxed) > 0
+    }
+
+    pub fn list_waiter_count(&self) -> u64 {
+        self.list_waiter_count.load(Ordering::Relaxed)
     }
 
     pub fn register_list_waiter(&self, key: &str, req: BlockedPopRequest) {
@@ -197,16 +208,44 @@ impl Broker {
         }
     }
 
-    pub fn register_stream_waiter(&self, key: &str, tx: mpsc::Sender<()>) {
+    pub fn stream_waiter_count(&self) -> u64 {
+        self.stream_waiter_count.load(Ordering::Relaxed)
+    }
+
+    pub fn register_stream_waiter(&self, key: &str, tx: mpsc::Sender<()>, waiter_id: u64) {
         let mut waiters = self.stream_waiters.lock();
-        waiters.entry(key.to_string()).or_default().push(tx);
+        waiters
+            .entry(key.to_string())
+            .or_default()
+            .push(StreamWaiter { tx, waiter_id });
+        self.stream_waiter_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn remove_stream_waiters_by_id(&self, keys: &[String], id: u64) {
+        let mut waiters = self.stream_waiters.lock();
+        for key in keys {
+            if let Some(queue) = waiters.get_mut(key) {
+                let before = queue.len();
+                queue.retain(|r| r.waiter_id != id);
+                let removed = before - queue.len();
+                if removed > 0 {
+                    self.stream_waiter_count
+                        .fetch_sub(removed as u64, Ordering::Relaxed);
+                }
+                if queue.is_empty() {
+                    waiters.remove(key);
+                }
+            }
+        }
     }
 
     pub fn wake_stream_waiters(&self, key: &str) {
         let mut waiters = self.stream_waiters.lock();
         if let Some(senders) = waiters.remove(key) {
-            for tx in senders {
-                let _ = tx.try_send(());
+            self.stream_waiter_count
+                .fetch_sub(senders.len() as u64, Ordering::Relaxed);
+            for waiter in senders {
+                let _ = waiter.tx.try_send(());
             }
         }
     }

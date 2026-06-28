@@ -1,8 +1,10 @@
+use std::io::Write;
 use std::net::TcpStream;
+use std::thread;
 use std::time::Duration;
 
 mod common;
-use common::{http_request, http_request_with_headers, LuxServer};
+use common::{http_request, http_request_with_headers, read_all, resp_cmd, LuxServer};
 
 fn get(port: u16, path: &str, auth: &str) -> String {
     http_request(port, "GET", path, None, Some(auth)).1
@@ -31,6 +33,38 @@ fn http_health_check() {
     let resp = get(http, "/v1", "");
     assert!(resp.contains("\"lux\""), "health: {resp}");
     assert!(resp.contains("\"version\""), "version: {resp}");
+}
+
+#[test]
+fn http_stays_responsive_while_resp_lua_script_is_busy() {
+    let server = LuxServer::builder().http().start();
+    let http = server.http_port();
+    let mut script_conn = server.conn();
+    script_conn
+        .set_read_timeout(Some(Duration::from_millis(5000)))
+        .unwrap();
+
+    let script = "for i = 1, 100000 do redis.call('PING') end; return 1";
+    script_conn
+        .write_all(&resp_cmd(&["EVAL", script, "0"]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(25));
+
+    let (status, health) = http_request(http, "GET", "/v1", None, None);
+    assert_eq!(
+        status, 200,
+        "HTTP health should respond while Lua is busy: {health}"
+    );
+    assert!(health.contains("\"lux\""), "health body: {health}");
+
+    let (status, ping) = http_request(http, "GET", "/v1/ping", None, None);
+    assert_eq!(
+        status, 200,
+        "HTTP ping should respond while Lua is busy: {ping}"
+    );
+    assert!(ping.contains("PONG"), "HTTP ping body: {ping}");
+
+    let _ = read_all(&mut script_conn);
 }
 
 #[test]
