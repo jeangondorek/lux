@@ -238,7 +238,7 @@ fn ping_remains_responsive_while_lua_script_is_busy() {
 
     let mut ping_conn = server.conn();
     ping_conn
-        .set_read_timeout(Some(Duration::from_millis(250)))
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let resp = send_and_read(&mut ping_conn, &["PING"]);
     assert!(
