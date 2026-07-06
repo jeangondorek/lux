@@ -2303,6 +2303,11 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
         return args[3..].iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"))
             || store.kv_string_is_encrypted(args[1], now);
     }
+    if (cmd_eq(cmd, b"LPUSH") || cmd_eq(cmd, b"RPUSH")) && args.len() >= 4 {
+        // Encrypted pushes self-log ENC RAWLPUSH/RAWRPUSH with the resolved
+        // ciphertext; plaintext pushes take the normal WAL path.
+        return args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
+    }
     if (cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HMSET")) && args.len() >= 4 {
         let encrypted = args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
         let end = if encrypted {
@@ -2314,6 +2319,10 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
             let fields: Vec<&[u8]> = args[2..end].chunks(2).map(|chunk| chunk[0]).collect();
             return encrypted || store.hash_fields_need_encryption(args[1], &fields, now);
         }
+    }
+    if cmd_eq(cmd, b"VSET") {
+        // Encrypted VSET self-logs ENC RAWVSET with the sealed payload.
+        return args.iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"));
     }
     false
 }
@@ -3750,6 +3759,432 @@ mod tests {
         assert!(got.contains("hash-secret-value"), "{got}");
         let scan = exec_str(&restored, &[b"HSCAN", b"profile:1", b"0"]);
         assert!(scan.contains("hash-secret-value"), "{scan}");
+    }
+
+    #[test]
+    fn encrypted_lpush_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"RPUSH",
+                b"events",
+                b"list-secret-one",
+                b"list-secret-two",
+                b"ENCRYPTED",
+            ],
+        ))
+        .to_string();
+        assert!(out.contains(":2"), "{out}");
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(!wal
+            .windows(b"list-secret-one".len())
+            .any(|w| w == b"list-secret-one"));
+        assert!(wal.windows(b"RAWRPUSH".len()).any(|w| w == b"RAWRPUSH"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"LRANGE", b"events", b"0", b"-1"]);
+        assert!(got.contains("list-secret-one"), "{got}");
+        assert!(got.contains("list-secret-two"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_list_element_survives_lmove_across_keys() {
+        // List AAD is key-independent, so an encrypted element stays decryptable
+        // after LMOVE relocates it to a different list.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"RPUSH", b"src", b"move-me-secret", b"ENCRYPTED"]);
+        exec(&store, &[b"LMOVE", b"src", b"dst", b"LEFT", b"RIGHT"]);
+        let got = exec_str(&store, &[b"LRANGE", b"dst", b"0", b"-1"]);
+        assert!(got.contains("move-me-secret"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_xadd_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"XADD",
+                b"stream:1",
+                b"*",
+                b"payload",
+                b"stream-secret-value",
+                b"ENCRYPTED",
+            ],
+        ))
+        .to_string();
+        assert!(out.contains('-'), "{out}");
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(!wal
+            .windows(b"stream-secret-value".len())
+            .any(|w| w == b"stream-secret-value"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"XRANGE", b"stream:1", b"-", b"+"]);
+        assert!(got.contains("stream-secret-value"), "{got}");
+        assert!(got.contains("payload"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_vset_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"VSET",
+                b"emb:1",
+                b"3",
+                b"1.5",
+                b"2.5",
+                b"3.5",
+                b"ENCRYPTED",
+            ],
+        ))
+        .to_string();
+        assert!(out.contains("OK"), "{out}");
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(
+            wal.windows(b"RAWVSET".len()).any(|w| w == b"RAWVSET"),
+            "encrypted VSET must self-log ENC RAWVSET"
+        );
+        assert!(
+            !wal.windows(b"2.5".len()).any(|w| w == b"2.5"),
+            "WAL must not contain the plaintext vector components"
+        );
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"VGET", b"emb:1"]);
+        assert!(
+            got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn encrypt_vector_roundtrips_and_hides_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        store.encryption().init(Some("k1")).unwrap();
+        let v = vec![1.5f32, -2.25, 3.0, 0.125];
+        let sealed = store.encrypt_vector(b"emb:1", &v).unwrap();
+
+        let mut plain = Vec::new();
+        for f in &v {
+            plain.extend_from_slice(&f.to_le_bytes());
+        }
+        assert!(
+            !sealed.windows(plain.len()).any(|w| w == plain.as_slice()),
+            "plaintext vector bytes leaked into the envelope"
+        );
+
+        assert_eq!(store.decrypt_vector(b"emb:1", &sealed).unwrap(), v);
+        assert!(store.decrypt_vector(b"other:key", &sealed).is_err());
+    }
+
+    #[test]
+    fn rotate_rewrap_retire_preserves_list_and_stream_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store,
+            &[b"RPUSH", b"l", b"list-rotate-secret", b"ENCRYPTED"],
+        );
+        exec(
+            &store,
+            &[
+                b"XADD",
+                b"s",
+                b"*",
+                b"f",
+                b"stream-rotate-secret",
+                b"ENCRYPTED",
+            ],
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        let rewrap = exec_str(&store, &[b"ENC", b"REWRAP"]);
+        assert!(!rewrap.contains("ERR"), "rewrap: {rewrap}");
+        assert!(
+            exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"),
+            "retire k1 should succeed once list/stream are rewrapped"
+        );
+
+        let restored = Store::new_with_config(config);
+        let _ = crate::snapshot::load(&restored);
+        restored.replay_wal(&Broker::new());
+        let l = exec_str(&restored, &[b"LRANGE", b"l", b"0", b"-1"]);
+        assert!(
+            l.contains("list-rotate-secret"),
+            "list after rotate/retire/restart: {l}"
+        );
+        let s = exec_str(&restored, &[b"XRANGE", b"s", b"-", b"+"]);
+        assert!(
+            s.contains("stream-rotate-secret"),
+            "stream after rotate/retire/restart: {s}"
+        );
+    }
+
+    #[test]
+    fn rotate_rewrap_retire_preserves_vector_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store,
+            &[
+                b"VSET",
+                b"emb:1",
+                b"3",
+                b"1.5",
+                b"2.5",
+                b"3.5",
+                b"ENCRYPTED",
+            ],
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        assert!(!exec_str(&store, &[b"ENC", b"REWRAP"]).contains("ERR"));
+        assert!(exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"));
+
+        let restored = Store::new_with_config(config);
+        let _ = crate::snapshot::load(&restored);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"VGET", b"emb:1"]);
+        assert!(
+            got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
+            "vector after rotate/retire/restart: {got}"
+        );
+    }
+
+    #[test]
+    fn encrypted_string_rejects_bit_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"bk", b"topsecret", b"ENCRYPTED"]);
+        // SETBIT must be rejected and must NOT corrupt the envelope.
+        assert!(exec_str(&store, &[b"SETBIT", b"bk", b"0", b"1"]).contains("ERR"));
+        assert!(
+            exec_str(&store, &[b"GET", b"bk"]).contains("topsecret"),
+            "value must survive a rejected SETBIT"
+        );
+        // BITOP with an encrypted operand is rejected and leaves it intact.
+        exec(&store, &[b"SET", b"plain", b"AAAA"]);
+        assert!(exec_str(&store, &[b"BITOP", b"AND", b"bk", b"bk", b"plain"]).contains("ERR"));
+        assert!(
+            exec_str(&store, &[b"GET", b"bk"]).contains("topsecret"),
+            "value must survive a rejected BITOP"
+        );
+        // Reads over the envelope are refused rather than returning ciphertext-based answers.
+        assert!(exec_str(&store, &[b"GETBIT", b"bk", b"0"]).contains("ERR"));
+        assert!(exec_str(&store, &[b"BITCOUNT", b"bk"]).contains("ERR"));
+    }
+
+    #[test]
+    fn encrypted_key_relocation_is_rejected_but_data_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"a", b"rename-secret", b"ENCRYPTED"]);
+        // RENAME / COPY of an encrypted key must be refused, leaving the source intact.
+        assert!(exec_str(&store, &[b"RENAME", b"a", b"b"]).contains("ERR"));
+        assert!(
+            exec_str(&store, &[b"GET", b"a"]).contains("rename-secret"),
+            "source must survive a rejected RENAME"
+        );
+        assert!(exec_str(&store, &[b"COPY", b"a", b"c"]).contains("ERR"));
+        assert!(exec_str(&store, &[b"GET", b"a"]).contains("rename-secret"));
+        // Non-encrypted keys still rename normally (the guard must not over-block).
+        exec(&store, &[b"SET", b"plain", b"hello"]);
+        assert!(exec_str(&store, &[b"RENAME", b"plain", b"plain2"]).contains("OK"));
+        assert!(exec_str(&store, &[b"GET", b"plain2"]).contains("hello"));
+    }
+
+    #[test]
+    fn vset_encryption_is_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"VSET", b"v", b"2", b"1.0", b"2.0", b"ENCRYPTED"]);
+        // Re-set WITHOUT the flag, using a distinctive value, must stay encrypted.
+        exec(&store, &[b"VSET", b"v", b"2", b"111222.5", b"0.0"]);
+        crate::snapshot::save_and_truncate_wal_consistent(&store).unwrap();
+        let dat = std::fs::read(dir.path().join("lux.dat")).unwrap();
+        let needle = 111222.5f32.to_le_bytes();
+        assert!(
+            !dat.windows(4).any(|w| w == needle),
+            "re-set vector silently downgraded to plaintext-at-rest"
+        );
+    }
+
+    #[test]
+    fn cold_tiered_encrypted_value_survives_rotate_rewrap_retire() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"cold", b"cold-secret", b"ENCRYPTED"]);
+        // Force it onto the cold tier (where the rewrap/retire guard was blind).
+        let idx = store.shard_for_key(b"cold");
+        assert!(
+            store.evict_key(idx, b"cold"),
+            "value should evict to cold tier"
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        assert!(!exec_str(&store, &[b"ENC", b"REWRAP"]).contains("ERR"));
+        // Retire must succeed (cold value rewrapped) and the value must survive.
+        assert!(
+            exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"),
+            "retire should succeed once the cold value is rewrapped"
+        );
+        assert!(
+            exec_str(&store, &[b"GET", b"cold"]).contains("cold-secret"),
+            "cold-tiered encrypted value must survive rotate+rewrap+retire"
+        );
+    }
+
+    #[test]
+    fn snapshot_load_fails_loudly_when_encrypted_vector_cant_decrypt() {
+        // Store A: encrypt a vector and snapshot it.
+        let dir_a = tempfile::tempdir().unwrap();
+        let store_a = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir_a.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store_a, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store_a,
+            &[b"VSET", b"v", b"2", b"1.0", b"2.0", b"ENCRYPTED"],
+        );
+        crate::snapshot::save_and_truncate_wal_consistent(&store_a).unwrap();
+        let dat = std::fs::read(dir_a.path().join("lux.dat")).unwrap();
+
+        // Store B has its own (different) keyring. Drop A's snapshot in and load.
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir_b.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store_b, &[b"ENC", b"INIT", b"KEYID", b"other"]);
+        std::fs::write(dir_b.path().join("lux.dat"), &dat).unwrap();
+        // Must fail loudly (startup then refuses), not silently drop the vector
+        // and cascade — and the on-disk snapshot is left intact for recovery.
+        assert!(
+            crate::snapshot::load(&store_b).is_err(),
+            "load must error on an undecryptable encrypted vector"
+        );
+        assert_eq!(
+            std::fs::read(dir_b.path().join("lux.dat")).unwrap(),
+            dat,
+            "load must not modify the on-disk snapshot"
+        );
+    }
+
+    #[test]
+    fn encrypted_overwrite_to_expiry_does_not_resurrect_after_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec_wal(&store, &[b"SET", b"ek", b"orig-secret", b"ENCRYPTED"]);
+        // Overwrite with an already-past absolute expiry: live, the key is gone.
+        exec_wal(
+            &store,
+            &[b"SET", b"ek", b"new-secret", b"EXAT", b"1", b"ENCRYPTED"],
+        );
+        store.fsync_wal();
+
+        // Replay from WAL: the prior encrypted value must NOT come back.
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"GET", b"ek"]);
+        assert!(
+            !got.contains("orig-secret"),
+            "stale encrypted value resurrected after replay: {got}"
+        );
     }
 
     #[test]

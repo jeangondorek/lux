@@ -111,12 +111,18 @@ impl Hasher for FxHasher {
 #[allow(dead_code)]
 pub const MAX_SHARDS: usize = 1024;
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const RENAME_ENCRYPTED_ERR: &str =
+    "ERR cannot relocate an encrypted key: its ciphertext is bound to the key name and would be unrecoverable at the destination; decrypt and re-set under the new key instead";
 
 pub struct VectorData {
     #[allow(dead_code)]
     pub dims: u32,
     pub data: Vec<f32>,
     pub metadata: Option<String>,
+    /// When true this vector is encrypted at rest: the in-memory `data` stays
+    /// plaintext (HNSW/search need it), but it is sealed when written to the
+    /// snapshot and self-logged as ciphertext in the WAL.
+    pub encrypted: bool,
 }
 
 pub struct TimeSeriesData {
@@ -548,6 +554,72 @@ impl Store {
         &self.encryption
     }
 
+    /// Rewrap any encrypted values inside a cold-tier `DumpValue` under the
+    /// current keyset. Returns true if anything was re-encrypted. Mirrors the
+    /// in-memory rewrap AAD slots. Vectors never cold-tier (pinned hot).
+    fn reencrypt_cold_dump_value(&self, key: &str, value: &mut DumpValue) -> Result<bool, String> {
+        use crate::encryption::EncryptionKeyring as E;
+        let mut changed = false;
+        match value {
+            DumpValue::Str(v) => {
+                if E::is_encrypted_value(v) {
+                    *v = self.encryption().reencrypt("__lux_kv", "value", key, v)?;
+                    changed = true;
+                }
+            }
+            DumpValue::Hash(pairs) => {
+                for (field, v) in pairs.iter_mut() {
+                    if E::is_encrypted_value(v) {
+                        *v = self.encryption().reencrypt("__lux_hash", field, key, v)?;
+                        changed = true;
+                    }
+                }
+            }
+            DumpValue::List(items) => {
+                for v in items.iter_mut() {
+                    if E::is_encrypted_value(v) {
+                        *v = self
+                            .encryption()
+                            .reencrypt("__lux_list", "element", "", v)?;
+                        changed = true;
+                    }
+                }
+            }
+            DumpValue::Stream(entries, _, _) => {
+                for (_id, fields) in entries.iter_mut() {
+                    for (field, v) in fields.iter_mut() {
+                        if E::is_encrypted_value(v) {
+                            *v = self.encryption().reencrypt("__lux_stream", field, key, v)?;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(changed)
+    }
+
+    /// True if any encrypted value in a cold-tier `DumpValue` would become
+    /// undecryptable without the retiring key.
+    fn dump_value_would_orphan(value: &DumpValue, remaining: &HashSet<String>) -> bool {
+        match value {
+            DumpValue::Str(v) => encrypted_value_would_be_orphaned(v, remaining),
+            DumpValue::Hash(pairs) => pairs
+                .iter()
+                .any(|(_, v)| encrypted_value_would_be_orphaned(v, remaining)),
+            DumpValue::List(items) => items
+                .iter()
+                .any(|v| encrypted_value_would_be_orphaned(v, remaining)),
+            DumpValue::Stream(entries, _, _) => entries.iter().any(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|(_, v)| encrypted_value_would_be_orphaned(v, remaining))
+            }),
+            _ => false,
+        }
+    }
+
     pub(crate) fn enc_rewrap_all(&self) -> Result<usize, String> {
         let mut count = 0usize;
         for idx in 0..self.shards.len() {
@@ -611,6 +683,43 @@ impl Store {
                             disk_remove.push(key.clone());
                         }
                     }
+                    StoreValue::List(list) => {
+                        for elem in list.iter_mut() {
+                            if !crate::encryption::EncryptionKeyring::is_encrypted_value(elem) {
+                                continue;
+                            }
+                            let new_value =
+                                self.encryption()
+                                    .reencrypt("__lux_list", "element", "", elem)?;
+                            mem_delta += new_value.len() as isize - elem.len() as isize;
+                            *elem = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        let key_name = key_string(key);
+                        for fields in stream.entries.values_mut() {
+                            for (field, value) in fields.iter_mut() {
+                                if !crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+                                {
+                                    continue;
+                                }
+                                let new_value = self.encryption().reencrypt(
+                                    "__lux_stream",
+                                    field,
+                                    &key_name,
+                                    value,
+                                )?;
+                                mem_delta += new_value.len() as isize - value.len() as isize;
+                                *value = Bytes::from(new_value);
+                                count += 1;
+                                shard_changed = true;
+                                disk_remove.push(key.clone());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -630,6 +739,28 @@ impl Store {
                 self.remove_from_disk(&key);
             }
         }
+        // Cold-tiered encrypted values live on disk, invisible to the in-RAM
+        // pass above; rewrap them in place too so a later RETIRE can't orphan them.
+        if let Some(disk_shards) = &self.disk_shards {
+            for ds in disk_shards.iter() {
+                let mut disk = ds.lock();
+                let entries = disk
+                    .dump_all(Instant::now())
+                    .map_err(|e| format!("ERR rewrap cold read failed: {e}"))?;
+                for mut entry in entries {
+                    if self.reencrypt_cold_dump_value(&entry.key, &mut entry.value)? {
+                        disk.put(&entry.key, &entry)
+                            .map_err(|e| format!("ERR rewrap cold write failed: {e}"))?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        // Make the rewrap durable: persist re-wrapped in-memory values, re-seal
+        // encrypted vectors (plaintext in RAM) under the current keyset, and
+        // truncate the WAL so a restart can't replay pre-rewrap (old-key) bytes.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR rewrap persist failed: {e}"))?;
         Ok(count)
     }
 
@@ -665,10 +796,49 @@ impl Store {
                             }
                         }
                     }
+                    StoreValue::List(list) => {
+                        for elem in list.iter() {
+                            if encrypted_value_would_be_orphaned(elem, &remaining) {
+                                return Err(
+                                    "ERR ENC key is still required by encrypted data".to_string()
+                                );
+                            }
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        for fields in stream.entries.values() {
+                            for (_field, value) in fields {
+                                if encrypted_value_would_be_orphaned(value, &remaining) {
+                                    return Err("ERR ENC key is still required by encrypted data"
+                                        .to_string());
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+        // Cold-tiered encrypted values are invisible to the in-RAM scan above;
+        // scan the disk tier too so we never retire a key they still need.
+        if let Some(disk_shards) = &self.disk_shards {
+            for ds in disk_shards.iter() {
+                let mut disk = ds.lock();
+                let entries = disk
+                    .dump_all(Instant::now())
+                    .map_err(|e| format!("ERR retire cold scan failed: {e}"))?;
+                for entry in &entries {
+                    if Self::dump_value_would_orphan(&entry.value, &remaining) {
+                        return Err("ERR ENC key is still required by encrypted data".to_string());
+                    }
+                }
+            }
+        }
+        // Re-seal all at-rest data (in-memory values + plaintext-in-RAM vectors)
+        // under the current keyset and truncate the WAL before removing the key,
+        // so nothing persisted still references it.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR retire persist failed: {e}"))?;
         self.encryption().retire(key_id)
     }
 
@@ -1286,6 +1456,118 @@ impl Store {
         let key_name = Self::user_kv_key(key);
         self.encryption()
             .encrypt("__lux_kv", "value", &key_name, value)
+    }
+
+    /// Encrypt a list element. AAD is intentionally key-independent so an
+    /// envelope stays decryptable after LMOVE/RPOPLPUSH move it to another list
+    /// (no re-keying). Per-value random DEK + nonce still protects each element.
+    pub(crate) fn encrypt_list_element(&self, value: &[u8]) -> Result<Vec<u8>, String> {
+        self.encryption()
+            .encrypt("__lux_list", "element", "", value)
+    }
+
+    /// Decrypt a list element if it is an encryption envelope; pass plaintext
+    /// through untouched so encrypted and plaintext elements can coexist.
+    pub(crate) fn decrypt_list_element(&self, value: Bytes) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        self.encryption()
+            .decrypt("__lux_list", "element", "", &value)
+            .map(Bytes::from)
+    }
+
+    /// Encrypt a stream entry field value. AAD binds the stream key + field.
+    pub(crate) fn encrypt_stream_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .encrypt("__lux_stream", &field_name, &key_name, value)
+    }
+
+    /// Decrypt a stream entry field value if it is an envelope.
+    pub(crate) fn decrypt_stream_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: Bytes,
+    ) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .decrypt("__lux_stream", &field_name, &key_name, &value)
+            .map(Bytes::from)
+    }
+
+    /// Decrypt all field values of one stream entry for output. Plaintext (and,
+    /// defensively, undecryptable) values pass through unchanged.
+    pub(crate) fn decrypt_stream_fields(
+        &self,
+        key: &[u8],
+        fields: &[(String, Bytes)],
+    ) -> Vec<(String, Bytes)> {
+        fields
+            .iter()
+            .map(|(f, v)| {
+                let dv = self
+                    .decrypt_stream_value(key, f.as_bytes(), v.clone())
+                    .unwrap_or_else(|_| v.clone());
+                (f.clone(), dv)
+            })
+            .collect()
+    }
+
+    /// True if relocating this value to a different key would orphan encrypted
+    /// data, because its AEAD AAD is bound to the key name. Lists use a
+    /// key-independent AAD and vectors stay plaintext in RAM (re-sealed on the
+    /// next write), so both self-heal on a move and are not blocked.
+    pub(crate) fn value_has_key_bound_encryption(value: &StoreValue) -> bool {
+        use crate::encryption::EncryptionKeyring as E;
+        match value {
+            StoreValue::Str(v) => E::is_encrypted_value(v),
+            StoreValue::StrBuf(v) => E::is_encrypted_value(v),
+            StoreValue::Hash(map) => map.values().any(|v| E::is_encrypted_value(v)),
+            StoreValue::Stream(s) => s
+                .entries
+                .values()
+                .any(|fields| fields.iter().any(|(_, v)| E::is_encrypted_value(v))),
+            _ => false,
+        }
+    }
+
+    /// Seal a vector (as little-endian f32 bytes) for at-rest storage. AAD binds
+    /// the vector's storage key so envelopes can't be swapped between slots.
+    pub(crate) fn encrypt_vector(&self, key: &[u8], data: &[f32]) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for f in data {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        self.encryption()
+            .encrypt("__lux_vec", "data", &key_name, &bytes)
+    }
+
+    /// Decrypt a sealed vector back into f32 values.
+    pub(crate) fn decrypt_vector(&self, key: &[u8], envelope: &[u8]) -> Result<Vec<f32>, String> {
+        let key_name = Self::user_kv_key(key);
+        let bytes = self
+            .encryption()
+            .decrypt("__lux_vec", "data", &key_name, envelope)?;
+        if !bytes.len().is_multiple_of(4) {
+            return Err("ERR corrupt encrypted vector payload".to_string());
+        }
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
     pub(crate) fn decrypt_hash_field_value(
@@ -2293,6 +2575,16 @@ impl Store {
 
     pub fn rename(&self, key: &[u8], new_key: &[u8], now: Instant) -> Result<(), String> {
         let old_idx = self.shard_index(key);
+        {
+            // A value whose AEAD AAD is bound to the key name can't be decrypted
+            // at a new key; moving it would orphan it. Refuse rather than lose it.
+            let shard = self.shards[old_idx].read();
+            if let Some(e) = shard.data.get(key) {
+                if !e.is_expired_at(now) && Self::value_has_key_bound_encryption(&e.value) {
+                    return Err(RENAME_ENCRYPTED_ERR.to_string());
+                }
+            }
+        }
         let entry = {
             let mut shard = self.shards[old_idx].write();
             shard.version += 1;
@@ -2335,6 +2627,9 @@ impl Store {
             let ks = src;
             match shard.data.get(ks) {
                 Some(entry) if !entry.is_expired_at(now) => {
+                    if Self::value_has_key_bound_encryption(&entry.value) {
+                        return Err(RENAME_ENCRYPTED_ERR.to_string());
+                    }
                     let ttl = entry.expires_at.map(|exp| exp.duration_since(now));
                     let dv = store_value_to_dump_value(&entry.value);
                     (dv, ttl)
@@ -3210,7 +3505,7 @@ impl Store {
                     groups,
                 })
             }
-            DumpValue::Vector(data, metadata) => {
+            DumpValue::Vector(data, metadata, encrypted) => {
                 let dims = data.len() as u32;
                 let index_data = data.clone();
                 let key_clone = key.clone();
@@ -3218,6 +3513,7 @@ impl Store {
                     dims,
                     data,
                     metadata,
+                    encrypted,
                 });
                 let expires_at = ttl.map(|d| Instant::now() + d);
                 let mem = estimate_entry_memory(&key, &sv);
@@ -4716,7 +5012,7 @@ fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
                 .collect();
             DumpValue::Stream(entries, s.last_id.to_string(), groups)
         }
-        StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone()),
+        StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone(), v.encrypted),
         StoreValue::HyperLogLog(regs, cached) => DumpValue::HyperLogLog(regs.clone(), *cached),
         StoreValue::TimeSeries(ts) => {
             DumpValue::TimeSeries(ts.samples.clone(), ts.retention, ts.labels.clone())
@@ -4742,7 +5038,9 @@ pub enum DumpValue {
     Set(Vec<String>),
     SortedSet(Vec<(String, f64)>),
     Stream(Vec<StreamDumpEntry>, String, Vec<StreamGroupDump>),
-    Vector(Vec<f32>, Option<String>),
+    /// f32 data, metadata, and whether it is encrypted-at-rest (sealed in the
+    /// snapshot; the in-memory copy is plaintext).
+    Vector(Vec<f32>, Option<String>, bool),
     HyperLogLog(Vec<u8>, u64),
     TimeSeries(Vec<(i64, f64)>, u64, Vec<(String, String)>),
 }
@@ -5965,8 +6263,8 @@ mod tests {
     fn vector_search_indexes_are_dimension_scoped() {
         let store = Store::new();
         let n = now();
-        store.vset(b"two_dim", vec![1.0, 0.0], None, None, n);
-        store.vset(b"three_dim", vec![0.0, 1.0, 0.0], None, None, n);
+        store.vset(b"two_dim", vec![1.0, 0.0], None, None, false, n);
+        store.vset(b"three_dim", vec![0.0, 1.0, 0.0], None, None, false, n);
 
         let two_dim = store.vsearch(&[1.0, 0.0], 1, None, None, n);
         assert_eq!(
