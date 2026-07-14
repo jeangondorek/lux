@@ -199,7 +199,15 @@ enum MigrateAction {
         dir: PathBuf,
     },
     /// Show which local migrations are applied vs pending on the target.
-    Status(MigrateConn),
+    Status {
+        #[command(flatten)]
+        conn: MigrateConn,
+        #[arg(
+            long,
+            help = "Exit 1 if any local migration is not yet applied (for CI gates)."
+        )]
+        check: bool,
+    },
     /// Apply pending migrations (the default action for bare `lux migrate`).
     Run(MigrateConn),
     /// Fetch migrations recorded on the target into the local migration
@@ -2372,13 +2380,17 @@ pub async fn run() {
                 println!("{} {}", "Created:".green(), path.display());
             }
 
-            MigrateAction::Status(MigrateConn {
-                project,
-                dir,
-                host,
-                port,
-                password,
-            }) => {
+            MigrateAction::Status {
+                conn:
+                    MigrateConn {
+                        project,
+                        dir,
+                        host,
+                        port,
+                        password,
+                    },
+                check,
+            } => {
                 let mut target = resolve_migrate_target(
                     project.as_deref(),
                     host.as_deref(),
@@ -2410,13 +2422,19 @@ pub async fn run() {
                 }
 
                 println!("  {:<40}  {}", "MIGRATION".dimmed(), "STATUS".dimmed());
+                let mut pending = 0usize;
                 for (filename, _) in &local {
                     let status = if applied.contains(filename) {
                         "applied".green().to_string()
                     } else {
+                        pending += 1;
                         "pending".yellow().to_string()
                     };
                     println!("  {:<40}  {}", filename, status);
+                }
+                if check && pending > 0 {
+                    eprintln!("\n{} {} migration(s) not applied.", "Error:".red(), pending);
+                    std::process::exit(1);
                 }
             }
 
@@ -4459,6 +4477,22 @@ mod tests {
                 ..
             } => assert_eq!(c.project.as_deref(), Some("dialog")),
             _ => panic!("expected Migrate::Run"),
+        }
+    }
+
+    #[test]
+    fn migrate_status_check_flag() {
+        let cli = Cli::try_parse_from(["lux", "migrate", "status", "--check", "dialog"])
+            .expect("migrate status --check parses");
+        match cli.command {
+            Commands::Migrate {
+                action: Some(MigrateAction::Status { conn, check }),
+                ..
+            } => {
+                assert!(check, "--check sets the flag");
+                assert_eq!(conn.project.as_deref(), Some("dialog"));
+            }
+            _ => panic!("expected Migrate::Status"),
         }
     }
 }
