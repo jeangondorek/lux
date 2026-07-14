@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -149,9 +149,14 @@ enum Commands {
         #[command(subcommand)]
         action: EnvAction,
     },
+    /// Create, apply, and inspect migrations. Bare `lux migrate [project]`
+    /// applies pending migrations (same as `lux migrate run`).
+    #[command(args_conflicts_with_subcommands = true)]
     Migrate {
         #[command(subcommand)]
-        action: MigrateAction,
+        action: Option<MigrateAction>,
+        #[command(flatten)]
+        run: MigrateConn,
     },
     Seed {
         #[command(subcommand)]
@@ -186,50 +191,36 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum MigrateAction {
+    /// Create a new empty migration file.
     New {
         #[arg(help = "Migration name (e.g. create_users)")]
         name: String,
         #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
         dir: PathBuf,
     },
-    Status {
-        #[arg(help = "Project name, ID, or connection URL")]
-        project: Option<String>,
-        #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
-        dir: PathBuf,
-        #[arg(short = 'H', long, help = "Host for direct connection")]
-        host: Option<String>,
-        #[arg(short, long, help = "Port for direct connection")]
-        port: Option<u16>,
-        #[arg(short = 'a', long, help = "Password for direct connection")]
-        password: Option<String>,
-    },
-    Run {
-        #[arg(help = "Project name, ID, or connection URL")]
-        project: Option<String>,
-        #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
-        dir: PathBuf,
-        #[arg(short = 'H', long, help = "Host for direct connection")]
-        host: Option<String>,
-        #[arg(short, long, help = "Port for direct connection")]
-        port: Option<u16>,
-        #[arg(short = 'a', long, help = "Password for direct connection")]
-        password: Option<String>,
-    },
+    /// Show which local migrations are applied vs pending on the target.
+    Status(MigrateConn),
+    /// Apply pending migrations (the default action for bare `lux migrate`).
+    Run(MigrateConn),
     /// Fetch migrations recorded on the target into the local migration
     /// directory (e.g. ones authored in the Lux Cloud dashboard).
-    Pull {
-        #[arg(help = "Project name, ID, or connection URL")]
-        project: Option<String>,
-        #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
-        dir: PathBuf,
-        #[arg(short = 'H', long, help = "Host for direct connection")]
-        host: Option<String>,
-        #[arg(short, long, help = "Port for direct connection")]
-        port: Option<u16>,
-        #[arg(short = 'a', long, help = "Password for direct connection")]
-        password: Option<String>,
-    },
+    Pull(MigrateConn),
+}
+
+/// Shared target + directory args for `status`/`run`/`pull`. Kept flat so a
+/// bare `lux migrate [project] [flags]` works as an implicit `run`.
+#[derive(Args)]
+struct MigrateConn {
+    #[arg(help = "Project name, ID, or connection URL")]
+    project: Option<String>,
+    #[arg(long, default_value = "lux/migrations", help = "Migration directory")]
+    dir: PathBuf,
+    #[arg(short = 'H', long, help = "Host for direct connection")]
+    host: Option<String>,
+    #[arg(short, long, help = "Port for direct connection")]
+    port: Option<u16>,
+    #[arg(short = 'a', long, help = "Password for direct connection")]
+    password: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -841,7 +832,14 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
 /// count applied. Exits the process on a migration error (mirrors `migrate run`).
 async fn apply_pending_migrations(target: &mut MigrateTarget, dir: &Path) -> usize {
     ensure_migrations_table(target).await;
-    let applied = get_applied_migrations(target).await;
+    let applied = get_applied_migrations(target).await.unwrap_or_else(|e| {
+        eprintln!(
+            "{} Could not reach the target database: {}",
+            "Error:".red(),
+            e
+        );
+        std::process::exit(1);
+    });
     let local = get_local_migrations(dir);
     let pending: Vec<_> = local
         .iter()
@@ -2358,7 +2356,7 @@ pub async fn run() {
             }
         },
 
-        Commands::Migrate { action } => match action {
+        Commands::Migrate { action, run } => match action.unwrap_or(MigrateAction::Run(run)) {
             MigrateAction::New { name, dir } => {
                 std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
                     eprintln!("{} {e}", "Failed to create migration dir:".red());
@@ -2374,13 +2372,13 @@ pub async fn run() {
                 println!("{} {}", "Created:".green(), path.display());
             }
 
-            MigrateAction::Status {
+            MigrateAction::Status(MigrateConn {
                 project,
                 dir,
                 host,
                 port,
                 password,
-            } => {
+            }) => {
                 let mut target = resolve_migrate_target(
                     project.as_deref(),
                     host.as_deref(),
@@ -2390,7 +2388,16 @@ pub async fn run() {
                 )
                 .await;
 
-                let applied = get_applied_migrations(&mut target).await;
+                let applied = get_applied_migrations(&mut target)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "{} Could not reach the target database: {}",
+                            "Error:".red(),
+                            e
+                        );
+                        std::process::exit(1);
+                    });
                 let local = get_local_migrations(&dir);
 
                 if local.is_empty() {
@@ -2413,13 +2420,13 @@ pub async fn run() {
                 }
             }
 
-            MigrateAction::Run {
+            MigrateAction::Run(MigrateConn {
                 project,
                 dir,
                 host,
                 port,
                 password,
-            } => {
+            }) => {
                 let mut target = resolve_migrate_target(
                     project.as_deref(),
                     host.as_deref(),
@@ -2431,7 +2438,16 @@ pub async fn run() {
 
                 ensure_migrations_table(&mut target).await;
 
-                let applied = get_applied_migrations(&mut target).await;
+                let applied = get_applied_migrations(&mut target)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "{} Could not reach the target database: {}",
+                            "Error:".red(),
+                            e
+                        );
+                        std::process::exit(1);
+                    });
                 let local = get_local_migrations(&dir);
 
                 let pending: Vec<_> = local
@@ -2511,13 +2527,13 @@ pub async fn run() {
                 );
             }
 
-            MigrateAction::Pull {
+            MigrateAction::Pull(MigrateConn {
                 project,
                 dir,
                 host,
                 port,
                 password,
-            } => {
+            }) => {
                 let mut target = resolve_migrate_target(
                     project.as_deref(),
                     host.as_deref(),
@@ -3400,7 +3416,13 @@ async fn ensure_migrations_table(target: &mut MigrateTarget) {
     }
 }
 
-async fn get_applied_migrations(target: &mut MigrateTarget) -> HashSet<String> {
+async fn get_applied_migrations(target: &mut MigrateTarget) -> Result<HashSet<String>, String> {
+    // Probe reachability/auth first. A failing PING is fatal and must surface;
+    // errors from the TSELECT below are treated as "no __migrations table yet"
+    // (0 applied). Without this, an unreachable or unauthenticated target was
+    // silently reported as "all pending" (which masked a real control-plane bug).
+    target.exec("PING").await?;
+
     let mut applied = HashSet::new();
 
     match target {
@@ -3455,7 +3477,7 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> HashSet<String> {
             }
         }
     }
-    applied
+    Ok(applied)
 }
 
 /// Read every migration recorded on the target as (filename, checksum, body).
@@ -4400,5 +4422,43 @@ mod tests {
         assert_eq!(parsed.local_http_port, Some(9090));
         assert_eq!(parsed.local_resp_port, Some(6400));
         assert_eq!(parsed.engine_version.as_deref(), Some("0.23.0"));
+    }
+
+    #[test]
+    fn bare_migrate_defaults_to_run() {
+        let cli = Cli::try_parse_from(["lux", "migrate"]).expect("bare migrate parses");
+        match cli.command {
+            Commands::Migrate { action, run } => {
+                assert!(action.is_none(), "no explicit subcommand => implicit run");
+                assert!(run.project.is_none());
+            }
+            _ => panic!("expected Migrate"),
+        }
+    }
+
+    #[test]
+    fn migrate_project_is_implicit_run() {
+        let cli =
+            Cli::try_parse_from(["lux", "migrate", "dialog"]).expect("migrate <project> parses");
+        match cli.command {
+            Commands::Migrate { action, run } => {
+                assert!(action.is_none());
+                assert_eq!(run.project.as_deref(), Some("dialog"));
+            }
+            _ => panic!("expected Migrate"),
+        }
+    }
+
+    #[test]
+    fn explicit_migrate_run_still_parses() {
+        let cli =
+            Cli::try_parse_from(["lux", "migrate", "run", "dialog"]).expect("migrate run parses");
+        match cli.command {
+            Commands::Migrate {
+                action: Some(MigrateAction::Run(c)),
+                ..
+            } => assert_eq!(c.project.as_deref(), Some("dialog")),
+            _ => panic!("expected Migrate::Run"),
+        }
     }
 }
