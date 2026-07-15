@@ -503,7 +503,7 @@ impl Store {
         match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
-                    for ((score, member), _) in tree.iter() {
+                    for (score, member) in tree.keys() {
                         visit(member, score.0);
                     }
                     Ok(())

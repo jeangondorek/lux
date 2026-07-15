@@ -2341,10 +2341,8 @@ pub(crate) fn try_fast_aggregate(
                 result.push((agg.alias.clone(), count.to_string()));
             }
             AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {
-                let col = match &agg.col {
-                    Some(c) => c.as_str(),
-                    None => return None, // SUM(*) doesn't make sense
-                };
+                // SUM(*) etc. have no column; bail out.
+                let col = agg.col.as_ref()?.as_str();
                 let field_def = schema.iter().find(|f| f.name == col)?;
 
                 // Only works for numeric types that have a sorted index

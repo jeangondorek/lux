@@ -3616,7 +3616,7 @@ fn url_origin(value: &str) -> Option<String> {
     Some(format!(
         "{}://{}",
         scheme,
-        &rest[..host_end].to_ascii_lowercase()
+        rest[..host_end].to_ascii_lowercase()
     ))
 }
 

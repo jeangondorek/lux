@@ -4152,33 +4152,33 @@ async fn handle_connection(
                         }
                     }
 
-                    for (_ch, rx) in session.subscriptions.iter_mut() {
+                    for rx in session.subscriptions.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.pattern_subs.iter_mut() {
+                    for rx in session.pattern_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.key_subs.iter_mut() {
+                    for rx in session.key_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    for (_ch, rx) in session.subscriptions.iter_mut() {
+                    for rx in session.subscriptions.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.pattern_subs.iter_mut() {
+                    for rx in session.pattern_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.key_subs.iter_mut() {
+                    for rx in session.key_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
