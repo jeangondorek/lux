@@ -4624,6 +4624,18 @@ impl Store {
         now: Instant,
     ) -> Result<bool, String> {
         let mem_size = member.len() + 32;
+        // Validate the destination type BEFORE mutating the source. Otherwise a
+        // wrong-type destination returns WRONGTYPE only after the member has
+        // already been removed from the source, losing it permanently.
+        let dst_idx = self.shard_index(dst);
+        {
+            let shard = self.shards[dst_idx].read();
+            if let Some(entry) = shard.data.get(dst) {
+                if !entry.is_expired_at(now) && !matches!(entry.value, StoreValue::Set(_)) {
+                    return Err(WRONGTYPE.to_string());
+                }
+            }
+        }
         let src_idx = self.shard_index(src);
         let removed = {
             let mut shard = self.shards[src_idx].write();
@@ -4646,7 +4658,6 @@ impl Store {
         if !removed {
             return Ok(false);
         }
-        let dst_idx = self.shard_index(dst);
         let mut shard = self.shards[dst_idx].write();
         shard.version += 1;
         let ks = key_bytes(dst);

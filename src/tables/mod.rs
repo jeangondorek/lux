@@ -3170,7 +3170,7 @@ fn table_delete_inner(
                             let rk = row_key_for_pk(other_table, other_pk);
                             if let Ok(pairs) = store.hgetall(rk.as_bytes(), now) {
                                 pairs.iter().any(|(k, v)| {
-                                    k == &field.name && FieldType::Int.decode_value(v) == pk_value
+                                    k == &field.name && field.field_type.decode_value(v) == pk_value
                                 })
                             } else {
                                 false

@@ -918,12 +918,11 @@ fn on_delete_cascade() {
     child.wait().ok();
 }
 
-// AUDIT PROBE: ON DELETE CASCADE must work for a non-INT (UUID) foreign key. The
-// cascade scan decodes child FK bytes as FieldType::Int regardless of the column's
-// real type (tables/mod.rs:2469), so a UUID FK never matches -> cascade is a no-op
-// and children are orphaned (referential-integrity corruption).
+// REGRESSION: ON DELETE CASCADE must work for a non-INT (UUID) foreign key. The
+// cascade scan now decodes child FK bytes using the column's real field_type
+// instead of a hardcoded FieldType::Int, so UUID/FLOAT/STR FKs match and cascade
+// (previously a silent no-op that orphaned children).
 #[test]
-#[ignore = "FK cascade/restrict/set-null broken for non-INT FKs until fixed"]
 fn on_delete_cascade_uuid_fk() {
     let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -989,11 +988,10 @@ fn on_delete_cascade_uuid_fk() {
     child.wait().ok();
 }
 
-// AUDIT PROBE: SMOVE must not remove the member from the source when the
-// destination is the wrong type. The store removes from src BEFORE validating dst
-// (store/mod.rs:3858+), so a WRONGTYPE dst loses the element from src entirely.
+// REGRESSION: SMOVE must not remove the member from the source when the
+// destination is the wrong type. The store now validates the dst type before
+// mutating the src, so a WRONGTYPE dst errors with the member left intact.
 #[test]
-#[ignore = "SMOVE loses source member on wrong-type dst until fixed"]
 fn smove_wrong_type_dst_preserves_source() {
     let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
