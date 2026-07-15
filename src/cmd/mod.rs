@@ -2303,6 +2303,8 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
             | b"TDROP"
             | b"TSET"
             | b"XADD"
+            | b"TSADD"
+            | b"TSMADD"
     )
 }
 

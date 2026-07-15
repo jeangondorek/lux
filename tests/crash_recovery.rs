@@ -140,15 +140,10 @@ fn xadd_star_id_stable_after_wal_replay() {
     );
 }
 
-// AUDIT PROBE: TSADD with a `*` server-generated timestamp must keep the SAME
-// timestamp across WAL replay. Same class as XADD * -- the raw `*` is logged and
-// replay resolves it to a different wall-clock time.
-//
-// QUARANTINED repro for TSADD * WAL replay drift (un-ignore when fixing; shares
-// the fix with row TTL WAL replay drift). Run with:
-//   cargo test --release --test crash_recovery -- --ignored tsadd_star_timestamp_stable_after_wal_replay
+// REGRESSION: TSADD with a `*` server-generated timestamp must keep the SAME
+// timestamp across WAL replay. TSADD/TSMADD self-log the resolved timestamp
+// (see log_resolved_tsadd) so replay reuses it instead of re-reading the clock.
 #[test]
-#[ignore = "TSADD * timestamp is non-deterministic across WAL replay until fixed"]
 fn tsadd_star_timestamp_stable_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
