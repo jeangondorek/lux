@@ -5,8 +5,12 @@
 <h1 align="center">Lux</h1>
 
 <p align="center">
-  <strong>An open-source application database engine.</strong><br/>
-  Tables, cache, vectors, realtime, queues, time series, auth, and Redis-compatible commands in one Rust runtime. MIT licensed forever.
+  <strong>A database that works the way your app does.</strong>
+</p>
+
+<p align="center">
+  The Application Database: one engine for tables, cache, vectors, realtime, queues, time series,<br/>
+  and auth, instead of six services glued together. Written in Rust. MIT licensed forever.
 </p>
 
 <p align="center">
@@ -33,13 +37,19 @@ Use Lux when you want one database process to cover the hot path of your applica
 
 ## Why Lux?
 
-Redis is single-threaded by design. That simplicity is part of why it became foundational infrastructure. But it also creates a ceiling: once one core is saturated, the usual answer is to shard at the client or cluster level and accept the operational complexity.
+Every app has a second data layer beyond its primary rows: cache, sessions, live UI state, semantic search, jobs, metrics, queues, leaderboards. Today you assemble it from Redis + Postgres + Pinecone + Kafka-style plumbing + BullMQ + a metrics store, each its own connection string, SDK, dashboard, bill, and thing that breaks at 3am.
 
-Lux uses a **sharded concurrent architecture** that safely uses all your cores in a single process. Each key maps to one of N shards, each protected by a `parking_lot` RwLock. Reads never block reads. Writes only block the shard they touch. Tokio handles thousands of connections across cores. The result is single-digit microsecond latency at low concurrency and throughput that keeps scaling with cores and pipeline depth.
+Lux collapses that into one engine. Tables, cache, vectors, realtime, queues, time series, and auth share one runtime, one connection surface, one durability layer, and one SDK. You add primitives as the app needs them instead of standing up another service for each one.
+
+It speaks RESP, so your existing Redis clients (ioredis, redis-py, go-redis, Jedis, redis-rb, redis-cli), BullMQ, and tooling connect unchanged. That compatibility is the on-ramp, not the ceiling; reach for the Lux SDK and CLI when you want tables, migrations, gateway auth, and app-first workflows.
+
+## Performance
+
+Redis is single-threaded by design, which caps one instance at a single core. Lux uses a **sharded concurrent architecture** that safely uses all your cores in one process. Each key maps to one of N shards, each protected by a `parking_lot` RwLock. Reads never block reads. Writes only block the shard they touch. Tokio handles thousands of connections across cores. The result is single-digit microsecond latency at low concurrency and throughput that keeps scaling with cores and pipeline depth.
 
 The concurrency model is deliberately conservative. Commands acquire a shard lock, do their work, and release it. There are no cross-shard locks in normal command execution and no lock-ordering games. MULTI/EXEC uses WATCH-based optimistic concurrency with shard versioning, matching what Redis clients rely on.
 
-**Compatibility:** ioredis, redis-py, go-redis, Jedis, redis-rb, BullMQ, redis-cli, and other RESP clients can connect directly. Use the Lux SDK and CLI when you want higher-level tables, migrations, Cloud gateway auth, and app-first workflows.
+As a drop-in for Redis workloads, it's also faster on the measured single-key command set:
 
 ### Benchmarks
 
@@ -447,58 +457,58 @@ Project clients use the Cloud/self-hosted HTTP gateway and return `{ data, error
 Lux has a built-in HTTP/JSON API. Set `LUX_HTTP_PORT` to enable it alongside the RESP protocol. Every data primitive gets its own RESTful routes.
 
 ```bash
-LUX_HTTP_PORT=8080 ./target/release/lux
+LUX_HTTP_PORT=5890 ./target/release/lux
 ```
 
 **Key-Value:**
 ```bash
-curl http://localhost:8080/v1/kv/mykey                    # GET
-curl -X PUT http://localhost:8080/v1/kv/mykey \
+curl http://localhost:5890/v1/kv/mykey                    # GET
+curl -X PUT http://localhost:5890/v1/kv/mykey \
   -d '{"value":"hello","ex":3600}'                        # SET (with optional TTL)
-curl -X DELETE http://localhost:8080/v1/kv/mykey           # DEL
-curl -X POST http://localhost:8080/v1/kv/counter/incr      # INCR
-curl http://localhost:8080/v1/kv/myhash/hash               # HGETALL
-curl http://localhost:8080/v1/kv/mylist/list                # LRANGE
-curl http://localhost:8080/v1/kv/myset/set                 # SMEMBERS
-curl http://localhost:8080/v1/kv/myzset/zset               # ZRANGEBYSCORE
+curl -X DELETE http://localhost:5890/v1/kv/mykey           # DEL
+curl -X POST http://localhost:5890/v1/kv/counter/incr      # INCR
+curl http://localhost:5890/v1/kv/myhash/hash               # HGETALL
+curl http://localhost:5890/v1/kv/mylist/list                # LRANGE
+curl http://localhost:5890/v1/kv/myset/set                 # SMEMBERS
+curl http://localhost:5890/v1/kv/myzset/zset               # ZRANGEBYSCORE
 ```
 
 **Tables:**
 ```bash
-curl -X POST http://localhost:8080/v1/tables \
+curl -X POST http://localhost:5890/v1/tables \
   -d '{"name":"users","columns":["id INT PRIMARY KEY","name STR","age INT"]}'   # TCREATE
-curl http://localhost:8080/v1/tables                        # TLIST
-curl -X POST http://localhost:8080/v1/tables/users \
+curl http://localhost:5890/v1/tables                        # TLIST
+curl -X POST http://localhost:5890/v1/tables/users \
   -d '{"name":"Alice","age":"28"}'                          # TINSERT
-curl 'http://localhost:8080/v1/tables/users?where=age>25&order=name&limit=10'  # TSELECT
-curl http://localhost:8080/v1/tables/users/1                # row lookup endpoint
-curl -X PUT http://localhost:8080/v1/tables/users/1 \
+curl 'http://localhost:5890/v1/tables/users?where=age>25&order=name&limit=10'  # TSELECT
+curl http://localhost:5890/v1/tables/users/1                # row lookup endpoint
+curl -X PUT http://localhost:5890/v1/tables/users/1 \
   -d '{"name":"Alicia"}'                                    # TUPDATE ... WHERE id = 1
-curl -X DELETE http://localhost:8080/v1/tables/users/1      # TDELETE FROM ... WHERE id = 1
+curl -X DELETE http://localhost:5890/v1/tables/users/1      # TDELETE FROM ... WHERE id = 1
 ```
 
 **Time Series:**
 ```bash
-curl -X POST http://localhost:8080/v1/ts/cpu:host1 \
+curl -X POST http://localhost:5890/v1/ts/cpu:host1 \
   -d '{"value":72.5,"labels":{"host":"server1"}}'          # TSADD
-curl http://localhost:8080/v1/ts/cpu:host1/latest           # TSGET
-curl 'http://localhost:8080/v1/ts/cpu:host1?from=-&to=+&agg=avg&bucket=3600000'  # TSRANGE
-curl http://localhost:8080/v1/ts/cpu:host1/info             # TSINFO
+curl http://localhost:5890/v1/ts/cpu:host1/latest           # TSGET
+curl 'http://localhost:5890/v1/ts/cpu:host1?from=-&to=+&agg=avg&bucket=3600000'  # TSRANGE
+curl http://localhost:5890/v1/ts/cpu:host1/info             # TSINFO
 ```
 
 **Vectors:**
 ```bash
-curl -X POST http://localhost:8080/v1/vectors/doc:1 \
+curl -X POST http://localhost:5890/v1/vectors/doc:1 \
   -d '{"vector":[0.1,0.2,0.3],"metadata":{"title":"hello"}}'  # VSET
-curl http://localhost:8080/v1/vectors/doc:1                     # VGET
-curl -X POST http://localhost:8080/v1/vectors/search \
+curl http://localhost:5890/v1/vectors/doc:1                     # VGET
+curl -X POST http://localhost:5890/v1/vectors/search \
   -d '{"vector":[0.1,0.2,0.3],"k":5}'                         # VSEARCH
-curl http://localhost:8080/v1/vectors                            # VCARD
+curl http://localhost:5890/v1/vectors                            # VCARD
 ```
 
 **Exec (any command):**
 ```bash
-curl -X POST http://localhost:8080/v1/exec \
+curl -X POST http://localhost:5890/v1/exec \
   -d '{"command":["HSET","user:1","name","alice"]}'
 ```
 
@@ -514,7 +524,7 @@ Lux can also expose a Supabase-style app auth surface. This is optional and is s
 - `LUX_AUTH_SECRET_KEY` is for trusted servers and admin auth operations.
 
 ```bash
-LUX_HTTP_PORT=8080 \
+LUX_HTTP_PORT=5890 \
 LUX_AUTH_ENABLED=true \
 LUX_AUTH_PUBLISHABLE_KEY=lux_pub_local \
 LUX_AUTH_SECRET_KEY=lux_sec_local \
@@ -545,14 +555,14 @@ GET  /auth/v1/authorize?provider=google&redirect_to=http://localhost:5173/callba
 OAuth providers are configured through admin routes with a secret key:
 
 ```bash
-curl -X PUT http://localhost:8080/auth/v1/admin/providers/google \
+curl -X PUT http://localhost:5890/auth/v1/admin/providers/google \
   -H "Authorization: Bearer lux_sec_local" \
   -H "Content-Type: application/json" \
   -d '{
     "enabled": true,
     "client_id": "GOOGLE_CLIENT_ID",
     "client_secret": "GOOGLE_CLIENT_SECRET",
-    "redirect_uri": "http://localhost:8080/auth/v1/callback/google",
+    "redirect_uri": "http://localhost:5890/auth/v1/callback/google",
     "scopes": "openid email profile"
   }'
 ```
@@ -581,8 +591,8 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUX_PORT` | `6379` | TCP port |
-| `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable) |
+| `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
+| `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |
 | `LUX_PASSWORD` | (none) | Enable AUTH (applies to both RESP and HTTP) |
 | `LUX_DATA_DIR` | `.` | Snapshot directory |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
