@@ -39,7 +39,7 @@ enum Commands {
         #[arg(
             long,
             value_name = "PORT",
-            help = "Host port for the HTTP API (default 8080, auto-bumps if taken)"
+            help = "Host port for the HTTP API (default 5890, auto-bumps if taken)"
         )]
         http_port: Option<u16>,
     },
@@ -343,7 +343,7 @@ fn local_engine_env(state: &LocalState) -> Vec<String> {
         format!("LUX_AUTH_PUBLISHABLE_KEY={}", state.publishable_key),
         format!("LUX_AUTH_SECRET_KEY={}", state.secret_key),
         "LUX_PORT=6379".to_string(),
-        "LUX_HTTP_PORT=8080".to_string(),
+        "LUX_HTTP_PORT=5890".to_string(),
         "LUX_BIND_HOST=0.0.0.0".to_string(),
         "LUX_DATA_DIR=/data".to_string(),
         // Tiered (WAL) storage so local-dev data survives a crash/restart;
@@ -370,7 +370,7 @@ struct Config {
 struct LocalConfig {
     project_id: Option<String>,
     project_name: Option<String>,
-    /// Optional host port overrides for `lux start` (engine listens on 6379/8080
+    /// Optional host port overrides for `lux start` (engine listens on 6379/5890
     /// inside the container; these map to the host).
     local_http_port: Option<u16>,
     local_resp_port: Option<u16>,
@@ -392,15 +392,16 @@ fn desired_engine_image(config: Option<&LocalConfig>) -> String {
 /// release) and `lux start` does an explicit `docker pull` each run, so local
 /// dev follows the newest engine without the CLI needing a release per bump.
 const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:latest";
-const DEFAULT_HTTP_PORT: u16 = 8080;
+const DEFAULT_HTTP_PORT: u16 = 5890;
 const DEFAULT_RESP_PORT: u16 = 6379;
 
 /// Lux Studio image `lux studio` runs (tracks `:latest`, pulled each run, like
 /// the engine image). Serves the local web UI; talks to the engine from the
 /// browser over the engine's CORS-`*` HTTP API.
 const STUDIO_IMAGE: &str = "ghcr.io/lux-db/studio:latest";
-/// Default host port for Studio (Supabase Studio uses 54323; we follow suit).
-const DEFAULT_STUDIO_PORT: u16 = 54323;
+/// Default host port for Studio. Lux owns the 5890 block: 5890 = HTTP API,
+/// 5891 = Studio (RESP stays on 6379 for Redis drop-in compatibility).
+const DEFAULT_STUDIO_PORT: u16 = 5891;
 
 fn default_studio_port() -> u16 {
     DEFAULT_STUDIO_PORT
@@ -751,8 +752,9 @@ fn studio_project_name() -> String {
 /// Ensure the Lux Studio container is running against `state`'s engine, then
 /// print its URL (and optionally open a browser). Assumes the engine is up.
 /// Non-fatal: warns and returns on failure so callers like `lux start` keep
-/// going. The SPA runs in the browser, so LUX_URL is host-visible localhost;
-/// LUX_KEY is the operator secret and never leaves the machine.
+/// going. The SPA runs in the browser, so LUX_URL must be reachable from the
+/// browser: defaults to host-visible localhost, but honors an explicit LUX_URL
+/// for remote/sandbox setups. LUX_KEY is the operator secret and stays local.
 fn ensure_studio(state: &mut LocalState, open_browser: bool) {
     if docker_container_state(&state.studio_container).as_deref() == Some("running") {
         let url = format!("http://localhost:{}", state.studio_port);
@@ -777,7 +779,16 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
         .status();
 
     let port_map = format!("{studio_port}:80");
-    let e_url = format!("LUX_URL=http://localhost:{}", state.http_port);
+    // The Studio SPA runs in the browser and calls the engine directly. Normally
+    // that's the host-visible localhost, but in a remote/sandbox context (e2b,
+    // a dev container, an SSH port-forward) the browser can't reach the engine
+    // at localhost. Honor an explicit LUX_URL so Studio points at whatever URL
+    // is actually reachable from the browser; fall back to localhost otherwise.
+    let engine_url = match std::env::var("LUX_URL") {
+        Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => format!("http://localhost:{}", state.http_port),
+    };
+    let e_url = format!("LUX_URL={engine_url}");
     let e_key = format!("LUX_KEY={}", state.secret_key);
     let e_pub = format!("LUX_PUBLISHABLE_KEY={}", state.publishable_key);
     let e_direct = format!("LUX_DIRECT_URL={}", state.direct_url());
@@ -831,6 +842,7 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
 
     let url = format!("http://localhost:{studio_port}");
     println!("{} {}", "Lux Studio:".bold(), url.cyan());
+    println!("{} {}", "  → engine:".dimmed(), engine_url.dimmed());
     if open_browser {
         let _ = open::that(&url);
     }
@@ -1331,7 +1343,7 @@ pub async fn run() {
                 .status();
 
             let resp_map = format!("{}:6379", state.resp_port);
-            let http_map = format!("{}:8080", state.http_port);
+            let http_map = format!("{}:5890", state.http_port);
             let vol_map = format!("{}:/data", state.volume);
             let engine_env = local_engine_env(&state);
 
@@ -4248,7 +4260,7 @@ mod tests {
             password: "lux_sec_local_deadbeef".to_string(),
             publishable_key: "lux_pub_local_cafef00d".to_string(),
             secret_key: "lux_sec_local_deadbeef".to_string(),
-            http_port: 8080,
+            http_port: 5890,
             resp_port: 6379,
             container: "lux-sample-abc123".to_string(),
             volume: "lux-sample-abc123-data".to_string(),
@@ -4261,13 +4273,13 @@ mod tests {
     #[test]
     fn local_state_urls_and_env_lines() {
         let s = sample_state();
-        assert_eq!(s.lux_url(), "http://localhost:8080");
+        assert_eq!(s.lux_url(), "http://localhost:5890");
         assert_eq!(
             s.direct_url(),
             "lux://:lux_sec_local_deadbeef@localhost:6379"
         );
         let env = s.env_lines();
-        assert_eq!(env[0], "LUX_URL=http://localhost:8080");
+        assert_eq!(env[0], "LUX_URL=http://localhost:5890");
         assert_eq!(
             env[1],
             "LUX_DIRECT_URL=lux://:lux_sec_local_deadbeef@localhost:6379"
