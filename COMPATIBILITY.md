@@ -119,8 +119,6 @@ Current missing Redis OSS/core command groups:
   (`XGROUP CREATE`/`SETID`/`DESTROY`/`CREATECONSUMER`/`DELCONSUMER`/`HELP`)
   and `XINFO STREAM`/`GROUPS`/`CONSUMERS` are implemented.
 - Scripting/functions: `EVAL_RO`, `EVALSHA_RO`, `FCALL`, `FCALL_RO`.
-- Pub/Sub introspection/sharded Pub/Sub: `PUBSUB`, `SPUBLISH`, `SSUBSCRIBE`,
-  `SUNSUBSCRIBE`.
 - Admin/diagnostics and key migration: `ACL`, `BGREWRITEAOF`, `LOLWUT`,
   `MONITOR`, `MOVE`, `ROLE`, `SLOWLOG`.
 
@@ -145,6 +143,9 @@ Known 1.0 differences:
   instances.
 - **RESP version**: RESP2 only.
 - **Cluster**: no Redis Cluster mode.
+- **Sharded Pub/Sub**: `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE` return explicit
+  unsupported errors (they exist for Redis Cluster, which Lux does not run). Use
+  `PUBLISH`/`SUBSCRIBE`. `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT` are supported.
 - **Transactions**: `MULTI`/`EXEC` is supported with WATCH-based optimistic
   concurrency. Lux commands in an EXEC execute sequentially and may be observed
   between steps by other clients. Redis avoids this through single-threaded

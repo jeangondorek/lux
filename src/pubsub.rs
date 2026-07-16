@@ -321,6 +321,36 @@ impl Broker {
         count
     }
 
+    /// PUBSUB CHANNELS: active channels (those with at least one subscriber),
+    /// optionally filtered by a glob `pattern`.
+    pub fn pubsub_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        let channels = self.channels.read();
+        channels
+            .iter()
+            .filter(|(_, tx)| tx.receiver_count() > 0)
+            .map(|(name, _)| name.clone())
+            .filter(|name| pattern.is_none_or(|p| glob_match(p, name)))
+            .collect()
+    }
+
+    /// PUBSUB NUMSUB: number of subscribers for an exact channel name.
+    pub fn pubsub_numsub(&self, channel: &str) -> i64 {
+        let channels = self.channels.read();
+        channels
+            .get(channel)
+            .map(|tx| tx.receiver_count() as i64)
+            .unwrap_or(0)
+    }
+
+    /// PUBSUB NUMPAT: number of active pattern subscriptions.
+    pub fn pubsub_numpat(&self) -> i64 {
+        let patterns = self.pattern_subs.read();
+        patterns
+            .values()
+            .filter(|tx| tx.receiver_count() > 0)
+            .count() as i64
+    }
+
     pub fn ksubscribe(&self, pattern: &str) -> broadcast::Receiver<Message> {
         if is_glob_pattern(pattern) {
             let mut subs = self.key_glob_subs.write();

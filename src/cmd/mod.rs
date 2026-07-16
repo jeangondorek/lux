@@ -693,6 +693,22 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 3,
     },
     CommandSpec {
+        name: b"PUBSUB",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SPUBLISH",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"SSUBSCRIBE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"SUNSUBSCRIBE",
+        min_arity: 1,
+    },
+    CommandSpec {
         name: b"SUBSCRIBE",
         min_arity: 2,
     },
@@ -1994,6 +2010,9 @@ pub fn execute(
             if cmd_eq(cmd, b"PUBLISH") {
                 return pubsub::cmd_publish(args, store, out, now);
             }
+            if cmd_eq(cmd, b"PUBSUB") {
+                return pubsub::cmd_pubsub(args, broker, out);
+            }
             if cmd_eq(cmd, b"PFADD") {
                 return hll::cmd_pfadd(args, store, out, now);
             }
@@ -2130,6 +2149,16 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"SUBSCRIBE") {
                 return pubsub::cmd_subscribe(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"SPUBLISH")
+                || cmd_eq(cmd, b"SSUBSCRIBE")
+                || cmd_eq(cmd, b"SUNSUBSCRIBE")
+            {
+                resp::write_error(
+                    out,
+                    "ERR sharded pub/sub is not supported: Lux is single-node (no Redis Cluster). Use PUBLISH/SUBSCRIBE.",
+                );
+                return CmdResult::Written;
             }
             if cmd_eq(cmd, b"SCRIPT") {
                 return scripting::cmd_script(args, store, out, now);
