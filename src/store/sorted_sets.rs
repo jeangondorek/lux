@@ -621,6 +621,38 @@ impl Store {
         }
     }
 
+    /// Random members (with scores). Positive count returns up to `count`
+    /// distinct members; negative count returns `|count|` members with repeats.
+    /// Selection follows sorted-set order (mirrors the deterministic SRANDMEMBER).
+    pub fn zrandmember(
+        &self,
+        key: &[u8],
+        count: i64,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _scores) => {
+                    if count == 0 || tree.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    let members: Vec<(String, f64)> =
+                        tree.keys().map(|(s, m)| (m.clone(), s.0)).collect();
+                    let abs = count.unsigned_abs() as usize;
+                    if count > 0 {
+                        Ok(members.into_iter().take(abs).collect())
+                    } else {
+                        Ok(members.iter().cloned().cycle().take(abs).collect())
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
     /// Weighted union of the sorted sets, as a member->score map.
     fn zunion_compute(
         &self,

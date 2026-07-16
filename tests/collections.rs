@@ -351,6 +351,47 @@ fn sorted_set_direct_setops() {
 }
 
 #[test]
+fn sorted_set_zrandmember() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    assert_has(
+        &send(&mut conn, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]),
+        ":3",
+    );
+
+    // No count: a single member as a bulk string.
+    let one = send(&mut conn, &["ZRANDMEMBER", "z"]);
+    assert!(
+        one.starts_with('$'),
+        "single member is a bulk string: {one:?}"
+    );
+    assert!(
+        one.contains('a') || one.contains('b') || one.contains('c'),
+        "returns a member: {one:?}"
+    );
+    // Positive count: up to N distinct members.
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "z", "2"]), "*2");
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "z", "5"]), "*3"); // capped at set size
+                                                                    // Negative count: |N| members WITH repeats allowed.
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "z", "-5"]), "*5");
+    // WITHSCORES: flat [member, score, ...].
+    let ws = send(&mut conn, &["ZRANDMEMBER", "z", "2", "WITHSCORES"]);
+    assert_has(&ws, "*4");
+    // Missing key: nil without count, empty array with count.
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "missing"]), "$-1");
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "missing", "3"]), "*0");
+    // Zero count is an empty array.
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "z", "0"]), "*0");
+
+    // Wrong type + syntax errors.
+    assert_has(&send(&mut conn, &["SET", "str", "x"]), "+OK");
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "str"]), "-WRONGTYPE");
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "z", "2", "NOPE"]), "-ERR");
+    assert_has(&send(&mut conn, &["ZRANDMEMBER", "z", "notanint"]), "-ERR");
+}
+
+#[test]
 fn sorted_set_zmpop() {
     let server = LuxServer::start();
     let mut conn = server.conn();

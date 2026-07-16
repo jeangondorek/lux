@@ -246,7 +246,7 @@ const INVENTORY: &[CommandInventory] = &[
     supported("ZMSCORE"),
     supported("ZPOPMAX"),
     supported("ZPOPMIN"),
-    missing("ZRANDMEMBER", "compatibility gap"),
+    supported("ZRANDMEMBER"),
     supported("ZRANGE"),
     missing("ZRANGESTORE", "compatibility gap"),
     supported("ZRANGEBYLEX"),

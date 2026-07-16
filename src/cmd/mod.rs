@@ -741,6 +741,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 4,
     },
     CommandSpec {
+        name: b"ZRANDMEMBER",
+        min_arity: 2,
+    },
+    CommandSpec {
         name: b"ZSCAN",
         min_arity: 3,
     },
@@ -2272,6 +2276,9 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"ZMPOP") {
                 return sorted_sets::cmd_zmpop(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"ZRANDMEMBER") {
+                return sorted_sets::cmd_zrandmember(args, store, out, now);
             }
             if cmd_eq(cmd, b"ZREMRANGEBYRANK") {
                 return sorted_sets::cmd_zremrangebyrank(args, store, out, now);

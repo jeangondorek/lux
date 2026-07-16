@@ -1117,6 +1117,58 @@ pub fn cmd_zintercard(
     CmdResult::Written
 }
 
+pub fn cmd_zrandmember(
+    args: &[&[u8]],
+    store: &Store,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    // ZRANDMEMBER key [count [WITHSCORES]]
+    if args.len() < 2 || args.len() > 4 {
+        resp::write_error(
+            out,
+            "ERR wrong number of arguments for 'zrandmember' command",
+        );
+        return CmdResult::Written;
+    }
+    store.try_promote(args[1], now);
+
+    // No count: a single member as a bulk string (or nil).
+    if args.len() == 2 {
+        match store.zrandmember(args[1], 1, now) {
+            Ok(members) => match members.first() {
+                Some((m, _)) => resp::write_bulk(out, m),
+                None => resp::write_null(out),
+            },
+            Err(e) => resp::write_error(out, &e),
+        }
+        return CmdResult::Written;
+    }
+
+    let count = match parse_i64(args[2]) {
+        Ok(n) => n,
+        Err(_) => {
+            resp::write_error(out, "ERR value is not an integer or out of range");
+            return CmdResult::Written;
+        }
+    };
+    let with_scores = if args.len() == 4 {
+        if cmd_eq(args[3], b"WITHSCORES") {
+            true
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    } else {
+        false
+    };
+    match store.zrandmember(args[1], count, now) {
+        Ok(members) => write_zset_result(out, &members, with_scores),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_zmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     // ZMPOP numkeys key [key ...] <MIN | MAX> [COUNT count]
     if args.len() < 4 {
