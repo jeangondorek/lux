@@ -897,7 +897,8 @@ pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<(
     let type_byte: u8 = match &entry.value {
         DumpValue::Str(_) => b'S',
         DumpValue::List(_) => b'L',
-        DumpValue::Hash(_) => b'H',
+        DumpValue::Hash(_, e) if !e.is_empty() => b'h',
+        DumpValue::Hash(_, _) => b'H',
         DumpValue::Set(_) => b'T',
         DumpValue::SortedSet(_) => b'Z',
         DumpValue::Stream(..) => b'X',
@@ -918,11 +919,18 @@ pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<(
                 write_bytes(w, item)?;
             }
         }
-        DumpValue::Hash(pairs) => {
+        DumpValue::Hash(pairs, expiries) => {
             write_u32(w, pairs.len() as u32)?;
             for (k, v) in pairs {
                 write_bytes(w, k.as_bytes())?;
                 write_bytes(w, v)?;
+            }
+            if !expiries.is_empty() {
+                write_u32(w, expiries.len() as u32)?;
+                for (f, ms) in expiries {
+                    write_bytes(w, f.as_bytes())?;
+                    write_i64(w, *ms)?;
+                }
             }
         }
         DumpValue::Set(members) => {
@@ -1005,7 +1013,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
             }
             DumpValue::List(items)
         }
-        b'H' => {
+        b'H' | b'h' => {
             let len = read_u32(r)? as usize;
             let mut pairs = Vec::new();
             for _ in 0..len {
@@ -1013,7 +1021,19 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
                 let v = read_bytes(r)?;
                 pairs.push((k, v));
             }
-            DumpValue::Hash(pairs)
+            let expiries = if type_buf[0] == b'h' {
+                let elen = read_u32(r)? as usize;
+                let mut e = Vec::new();
+                for _ in 0..elen {
+                    let f = read_string(r)?;
+                    let ms = read_i64(r)?;
+                    e.push((f, ms));
+                }
+                e
+            } else {
+                Vec::new()
+            };
+            DumpValue::Hash(pairs, expiries)
         }
         b'T' => {
             let len = read_u32(r)? as usize;
@@ -1444,7 +1464,11 @@ mod tests {
         prop_oneof![
             arb_bytes().prop_map(DumpValue::Str),
             prop::collection::vec(arb_bytes(), 0..16).prop_map(DumpValue::List),
-            prop::collection::vec((arb_string(), arb_bytes()), 0..16).prop_map(DumpValue::Hash),
+            (
+                prop::collection::vec((arb_string(), arb_bytes()), 0..16),
+                prop::collection::vec((arb_string(), any::<i64>()), 0..8),
+            )
+                .prop_map(|(pairs, expiries)| DumpValue::Hash(pairs, expiries)),
             prop::collection::vec(arb_string(), 0..16).prop_map(DumpValue::Set),
             prop::collection::vec((arb_string(), (-1e10f64..1e10f64)), 0..16)
                 .prop_map(DumpValue::SortedSet),
@@ -1494,7 +1518,7 @@ mod tests {
         match (a, b) {
             (DumpValue::Str(a), DumpValue::Str(b)) => a == b,
             (DumpValue::List(a), DumpValue::List(b)) => a == b,
-            (DumpValue::Hash(a), DumpValue::Hash(b)) => a == b,
+            (DumpValue::Hash(a, ae), DumpValue::Hash(b, be)) => a == b && ae == be,
             (DumpValue::Set(a), DumpValue::Set(b)) => a == b,
             (DumpValue::SortedSet(a), DumpValue::SortedSet(b)) => a == b,
             (DumpValue::Stream(ae, al, ag), DumpValue::Stream(be, bl, bg)) => {

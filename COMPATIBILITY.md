@@ -112,9 +112,6 @@ Current partial/stub surfaces:
 
 Current missing Redis OSS/core command groups:
 
-- Hash field TTL/value helpers: `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`,
-  `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST`,
-  `HGETEX`, `HGETDEL`.
 - Streams: `XSETID` (top-level command). Consumer-group lifecycle
   (`XGROUP CREATE`/`SETID`/`DESTROY`/`CREATECONSUMER`/`DELCONSUMER`/`HELP`)
   and `XINFO STREAM`/`GROUPS`/`CONSUMERS` are implemented.
@@ -136,6 +133,11 @@ Known 1.0 differences:
 
 - **Persistence**: Lux uses snapshots plus WAL instead of Redis AOF/RDB
   semantics. See `DURABILITY.md`.
+- **Hash field TTLs**: `HEXPIRE`/`HTTL`/`HGETEX`/`HGETDEL` and the full
+  family are supported. Expired fields are hidden from reads immediately;
+  a hash whose last field expires is reclaimed on the next write that
+  touches it (or an active cycle), not necessarily at the instant of
+  expiry, so `EXISTS` may briefly report an all-expired hash.
 - **Serialization / migration**: `DUMP`/`RESTORE` use a Lux-internal value
   format that round-trips within Lux; the payload is not Redis RDB-compatible.
   `MIGRATE` (inter-node key movement) and `WAITAOF` (AOF fsync wait) return

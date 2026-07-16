@@ -302,11 +302,128 @@ impl SetData {
     }
 }
 
+/// Hash value with optional per-field TTLs (Redis 7.4 hash-field expiration).
+/// `fields` holds the data; `expiries` holds absolute unix-ms deadlines for the
+/// subset of fields that have a TTL. Derefs to `fields` so value-only access
+/// sites are unchanged; TTL-aware reads use the `*_live`/`purge_expired` helpers.
+#[derive(Default, Clone)]
+pub struct HashData {
+    pub fields: HashMap<String, Bytes>,
+    pub expiries: HashMap<String, i64>,
+}
+
+impl HashData {
+    pub fn from_fields(fields: HashMap<String, Bytes>) -> Self {
+        Self {
+            fields,
+            expiries: HashMap::new(),
+        }
+    }
+
+    /// True when `field` carries a TTL that is at or before `now_ms`.
+    pub fn field_expired(&self, field: &str, now_ms: i64) -> bool {
+        self.expiries.get(field).is_some_and(|&e| e <= now_ms)
+    }
+
+    pub fn get_live(&self, field: &str, now_ms: i64) -> Option<&Bytes> {
+        if self.field_expired(field, now_ms) {
+            None
+        } else {
+            self.fields.get(field)
+        }
+    }
+
+    pub fn contains_live(&self, field: &str, now_ms: i64) -> bool {
+        self.fields.contains_key(field) && !self.field_expired(field, now_ms)
+    }
+
+    pub fn live_iter(&self, now_ms: i64) -> impl Iterator<Item = (&String, &Bytes)> {
+        self.fields
+            .iter()
+            .filter(move |(k, _)| !self.field_expired(k, now_ms))
+    }
+
+    pub fn live_len(&self, now_ms: i64) -> usize {
+        self.fields
+            .keys()
+            .filter(|k| !self.field_expired(k, now_ms))
+            .count()
+    }
+
+    /// Drop fields whose TTL has passed. Returns (bytes freed, hash-now-empty).
+    pub fn purge_expired(&mut self, now_ms: i64) -> (usize, bool) {
+        if self.expiries.is_empty() {
+            return (0, self.fields.is_empty());
+        }
+        let expired: Vec<String> = self
+            .expiries
+            .iter()
+            .filter(|(_, &e)| e <= now_ms)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut freed = 0;
+        for f in &expired {
+            if let Some(v) = self.fields.remove(f) {
+                freed += f.len() + v.len() + 64;
+            }
+            self.expiries.remove(f);
+        }
+        (freed, self.fields.is_empty())
+    }
+}
+
+impl std::ops::Deref for HashData {
+    type Target = HashMap<String, Bytes>;
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl std::ops::DerefMut for HashData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fields
+    }
+}
+
+/// Condition flag for HEXPIRE-family commands (NX/XX/GT/LT).
+#[derive(Clone, Copy, PartialEq)]
+pub enum HExpireCond {
+    None,
+    Nx,
+    Xx,
+    Gt,
+    Lt,
+}
+
+/// Per-field result of an HTTL-family query.
+pub enum HFieldTtl {
+    Missing,
+    NoTtl,
+    ExpiresAtMs(i64),
+}
+
+/// TTL mutation requested by HGETEX for the fetched fields.
+#[derive(Clone, Copy)]
+pub enum HGetexTtl {
+    Keep,
+    Persist,
+    SetMs(i64),
+}
+
+/// Wall-clock now as unix-epoch milliseconds, used for absolute hash-field TTL
+/// deadlines (which must survive restarts, so they are stored as epoch-ms).
+pub(crate) fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub enum StoreValue {
     Str(Bytes),
     StrBuf(Vec<u8>),
     List(VecDeque<Bytes>),
-    Hash(HashMap<String, Bytes>),
+    Hash(HashData),
     Set(SetData),
     SortedSet(
         BTreeMap<(OrderedFloat<f64>, String), ()>,
@@ -668,7 +785,7 @@ impl Store {
                     changed = true;
                 }
             }
-            DumpValue::Hash(pairs) => {
+            DumpValue::Hash(pairs, _) => {
                 for (field, v) in pairs.iter_mut() {
                     if E::is_encrypted_value(v) {
                         *v = self.encryption().reencrypt("__lux_hash", field, key, v)?;
@@ -706,7 +823,7 @@ impl Store {
     fn dump_value_would_orphan(value: &DumpValue, remaining: &HashSet<String>) -> bool {
         match value {
             DumpValue::Str(v) => encrypted_value_would_be_orphaned(v, remaining),
-            DumpValue::Hash(pairs) => pairs
+            DumpValue::Hash(pairs, _) => pairs
                 .iter()
                 .any(|(_, v)| encrypted_value_would_be_orphaned(v, remaining)),
             DumpValue::List(items) => items
@@ -3691,8 +3808,12 @@ impl Store {
         let store_value = match value {
             DumpValue::Str(s) => StoreValue::Str(Bytes::from(s)),
             DumpValue::List(l) => StoreValue::List(l.into_iter().map(Bytes::from).collect()),
-            DumpValue::Hash(h) => {
-                StoreValue::Hash(h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect())
+            DumpValue::Hash(h, expiries) => {
+                let mut hd = HashData::from_fields(
+                    h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect(),
+                );
+                hd.expiries = expiries.into_iter().collect();
+                StoreValue::Hash(hd)
             }
             DumpValue::Set(s) => StoreValue::Set(SetData::from_members(s)),
             DumpValue::SortedSet(members) => {
@@ -4763,7 +4884,7 @@ impl Store {
         let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Hash(HashMap::new()),
+            value: StoreValue::Hash(HashData::default()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
@@ -4771,7 +4892,7 @@ impl Store {
             self.key_added();
         }
         if entry.is_expired_at(now) {
-            entry.value = StoreValue::Hash(HashMap::new());
+            entry.value = StoreValue::Hash(HashData::default());
             entry.expires_at = None;
         }
         match &mut entry.value {
@@ -4804,7 +4925,7 @@ impl Store {
         let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Hash(HashMap::new()),
+            value: StoreValue::Hash(HashData::default()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
@@ -4812,7 +4933,7 @@ impl Store {
             self.key_added();
         }
         if entry.is_expired_at(now) {
-            entry.value = StoreValue::Hash(HashMap::new());
+            entry.value = StoreValue::Hash(HashData::default());
             entry.expires_at = None;
         }
         match &mut entry.value {
@@ -5366,9 +5487,13 @@ fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
         StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
         StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
         StoreValue::List(l) => DumpValue::List(l.iter().map(|b| b.to_vec()).collect()),
-        StoreValue::Hash(h) => {
-            DumpValue::Hash(h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect())
-        }
+        StoreValue::Hash(h) => DumpValue::Hash(
+            h.fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_vec()))
+                .collect(),
+            h.expiries.iter().map(|(k, &ms)| (k.clone(), ms)).collect(),
+        ),
         StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
         StoreValue::SortedSet(_, scores) => {
             DumpValue::SortedSet(scores.iter().map(|(m, s)| (m.clone(), *s)).collect())
@@ -5438,7 +5563,8 @@ pub type StreamGroupDump = (
 pub enum DumpValue {
     Str(Vec<u8>),
     List(Vec<Vec<u8>>),
-    Hash(Vec<(String, Vec<u8>)>),
+    /// Hash fields plus per-field absolute-ms TTLs (empty when no field has one).
+    Hash(Vec<(String, Vec<u8>)>, Vec<(String, i64)>),
     Set(Vec<String>),
     SortedSet(Vec<(String, f64)>),
     Stream(Vec<StreamDumpEntry>, String, Vec<StreamGroupDump>),

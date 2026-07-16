@@ -611,3 +611,144 @@ fn sorted_set_zrangestore() {
         "-ERR",
     );
 }
+
+#[test]
+fn hash_field_ttl_set_query_persist() {
+    let server = LuxServer::start();
+    let mut c = server.conn();
+    send(&mut c, &["HSET", "h", "f1", "a", "f2", "b", "f3", "cc"]);
+    let future = "99999999999999"; // absolute ms, far future
+                                   // Set a TTL on f1.
+    assert_has(
+        &send(&mut c, &["HPEXPIREAT", "h", future, "FIELDS", "1", "f1"]),
+        ":1",
+    );
+    // HPEXPIRETIME echoes the absolute deadline.
+    assert_has(
+        &send(&mut c, &["HPEXPIRETIME", "h", "FIELDS", "1", "f1"]),
+        future,
+    );
+    // f2 has no TTL (-1), a missing field is -2.
+    let ttl = send(&mut c, &["HTTL", "h", "FIELDS", "2", "f2", "nope"]);
+    assert_has(&ttl, ":-1");
+    assert_has(&ttl, ":-2");
+    // Field still present/readable, counted in HLEN.
+    assert_has(&send(&mut c, &["HGET", "h", "f1"]), "a");
+    assert_has(&send(&mut c, &["HLEN", "h"]), ":3");
+    // HPERSIST drops the TTL (1), then reports -1; a missing field is -2.
+    assert_has(&send(&mut c, &["HPERSIST", "h", "FIELDS", "1", "f1"]), ":1");
+    let p = send(&mut c, &["HPERSIST", "h", "FIELDS", "2", "f1", "nope"]);
+    assert_has(&p, ":-1");
+    assert_has(&p, ":-2");
+}
+
+#[test]
+fn hash_field_ttl_expires_and_removes_key() {
+    let server = LuxServer::start();
+    let mut c = server.conn();
+    send(&mut c, &["HSET", "h", "a", "1", "b", "2"]);
+    // A past absolute deadline deletes the field immediately (returns 2).
+    assert_has(
+        &send(&mut c, &["HEXPIREAT", "h", "1", "FIELDS", "1", "a"]),
+        ":2",
+    );
+    assert!(
+        send(&mut c, &["HEXISTS", "h", "a"]).contains(":0"),
+        "a gone"
+    );
+    assert_has(&send(&mut c, &["HLEN", "h"]), ":1");
+    // A short TTL then a pause: lazy filtering hides it on read.
+    send(&mut c, &["HPEXPIRE", "h", "60", "FIELDS", "1", "b"]);
+    std::thread::sleep(std::time::Duration::from_millis(160));
+    // Field-level: the expired field is hidden from reads and from the length.
+    assert!(
+        send(&mut c, &["HGET", "h", "b"]).contains("$-1"),
+        "b expired -> nil"
+    );
+    assert_has(&send(&mut c, &["HLEN", "h"]), ":0");
+    // The emptied hash key is reclaimed on the next write that touches it
+    // (lazy, since a read holds only a shared lock).
+    send(&mut c, &["HDEL", "h", "b"]);
+    assert!(
+        send(&mut c, &["EXISTS", "h"]).contains(":0"),
+        "key reclaimed after a write"
+    );
+}
+
+#[test]
+fn hash_field_ttl_conditions_and_hset_clears() {
+    let server = LuxServer::start();
+    let mut c = server.conn();
+    send(&mut c, &["HSET", "h", "f", "v"]);
+    let future = "99999999999999";
+    assert_has(
+        &send(
+            &mut c,
+            &["HPEXPIREAT", "h", future, "NX", "FIELDS", "1", "f"],
+        ),
+        ":1",
+    );
+    // NX fails now that a TTL exists.
+    assert_has(
+        &send(
+            &mut c,
+            &["HPEXPIREAT", "h", future, "NX", "FIELDS", "1", "f"],
+        ),
+        ":0",
+    );
+    // GT with a smaller deadline is rejected.
+    assert_has(
+        &send(
+            &mut c,
+            &["HPEXPIREAT", "h", "1000", "GT", "FIELDS", "1", "f"],
+        ),
+        ":0",
+    );
+    // Overwriting the value via HSET clears the field TTL.
+    send(&mut c, &["HSET", "h", "f", "v2"]);
+    assert_has(&send(&mut c, &["HTTL", "h", "FIELDS", "1", "f"]), ":-1");
+}
+
+#[test]
+fn hash_getex_and_getdel() {
+    let server = LuxServer::start();
+    let mut c = server.conn();
+    send(&mut c, &["HSET", "h", "a", "1", "b", "2", "c", "3"]);
+    // Plain HGETEX reads without changing TTL; missing field is nil.
+    let r = send(&mut c, &["HGETEX", "h", "FIELDS", "2", "a", "missing"]);
+    assert_has(&r, "1");
+    assert_has(&r, "$-1");
+    // HGETEX EX sets a TTL.
+    send(&mut c, &["HGETEX", "h", "EX", "1000", "FIELDS", "1", "a"]);
+    assert!(!send(&mut c, &["HTTL", "h", "FIELDS", "1", "a"]).contains(":-1"));
+    // HGETEX PERSIST removes it.
+    send(&mut c, &["HGETEX", "h", "PERSIST", "FIELDS", "1", "a"]);
+    assert_has(&send(&mut c, &["HTTL", "h", "FIELDS", "1", "a"]), ":-1");
+    // HGETDEL returns values and deletes the fields.
+    let d = send(&mut c, &["HGETDEL", "h", "FIELDS", "2", "b", "c"]);
+    assert_has(&d, "2");
+    assert_has(&d, "3");
+    assert!(send(&mut c, &["HEXISTS", "h", "b"]).contains(":0"));
+    assert_has(&send(&mut c, &["HLEN", "h"]), ":1");
+}
+
+#[test]
+fn hash_field_ttl_wrongtype_and_missing_key() {
+    let server = LuxServer::start();
+    let mut c = server.conn();
+    send(&mut c, &["SET", "s", "x"]);
+    assert_has(
+        &send(&mut c, &["HEXPIRE", "s", "100", "FIELDS", "1", "f"]),
+        "WRONGTYPE",
+    );
+    assert_has(
+        &send(&mut c, &["HGETDEL", "s", "FIELDS", "1", "f"]),
+        "WRONGTYPE",
+    );
+    // Missing key: every field reports -2.
+    assert_has(&send(&mut c, &["HTTL", "nope", "FIELDS", "1", "f"]), ":-2");
+    assert_has(
+        &send(&mut c, &["HEXPIRE", "nope", "100", "FIELDS", "1", "f"]),
+        ":-2",
+    );
+}

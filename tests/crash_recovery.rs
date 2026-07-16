@@ -1333,3 +1333,49 @@ fn snapshot_ttl_expires_across_downtime() {
         "long key must still have a TTL: {resp}"
     );
 }
+
+// Hash field TTLs (ENG-1290) must survive a WAL-only restart: HPEXPIREAT is
+// self-logged with its absolute deadline and replays deterministically.
+#[test]
+fn hash_field_ttl_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(&mut c, &["HSET", "h", "f1", "v1", "f2", "v2"]);
+    send(
+        &mut c,
+        &["HPEXPIREAT", "h", "99999999999999", "FIELDS", "1", "f1"],
+    );
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    assert!(
+        send(&mut c, &["HPEXPIRETIME", "h", "FIELDS", "1", "f1"]).contains("99999999999999"),
+        "f1 field TTL survived WAL replay"
+    );
+    assert!(send(&mut c, &["HTTL", "h", "FIELDS", "1", "f2"]).contains(":-1"));
+    assert!(send(&mut c, &["HGET", "h", "f1"]).contains("v1"));
+}
+
+// Field TTLs must also survive a snapshot (BGSAVE truncates the WAL, so the
+// deadline has to be in the snapshot's 'h' hash record).
+#[test]
+fn hash_field_ttl_survives_snapshot() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(&mut c, &["HSET", "h", "f1", "v1"]);
+    send(
+        &mut c,
+        &["HPEXPIREAT", "h", "99999999999999", "FIELDS", "1", "f1"],
+    );
+    send(&mut c, &["BGSAVE"]); // snapshot + WAL truncate
+    drop(c);
+    srv.kill();
+    srv.restart(); // loads from the snapshot (WAL was truncated)
+    let mut c = srv.conn();
+    assert!(
+        send(&mut c, &["HPEXPIRETIME", "h", "FIELDS", "1", "f1"]).contains("99999999999999"),
+        "f1 field TTL survived the snapshot"
+    );
+    assert!(send(&mut c, &["HGET", "h", "f1"]).contains("v1"));
+}

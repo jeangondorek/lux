@@ -231,7 +231,9 @@ fn save_binary(
         let type_byte: u8 = match &entry.value {
             DumpValue::Str(_) => b'S',
             DumpValue::List(_) => b'L',
-            DumpValue::Hash(_) => b'H',
+            // 'h' carries a per-field TTL section; 'H' stays backward-compatible.
+            DumpValue::Hash(_, e) if !e.is_empty() => b'h',
+            DumpValue::Hash(_, _) => b'H',
             DumpValue::Set(_) => b'T',
             DumpValue::SortedSet(_) => b'Z',
             DumpValue::Stream(..) => b'X',
@@ -262,11 +264,19 @@ fn save_binary(
                     write_bytes(w, item)?;
                 }
             }
-            DumpValue::Hash(pairs) => {
+            DumpValue::Hash(pairs, expiries) => {
                 write_u32(w, pairs.len() as u32)?;
                 for (k, v) in pairs {
                     write_bytes(w, k.as_bytes())?;
                     write_bytes(w, v)?;
+                }
+                // The per-field TTL section is present only under the 'h' type byte.
+                if !expiries.is_empty() {
+                    write_u32(w, expiries.len() as u32)?;
+                    for (f, ms) in expiries {
+                        write_bytes(w, f.as_bytes())?;
+                        write_i64(w, *ms)?;
+                    }
                 }
             }
             DumpValue::Set(members) => {
@@ -447,7 +457,7 @@ fn read_dump_value(
             }
             DumpValue::List(items)
         }
-        b'H' => {
+        b'H' | b'h' => {
             let len = read_count(r, "hash field")?;
             let mut pairs = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
             for _ in 0..len {
@@ -455,7 +465,20 @@ fn read_dump_value(
                 let v = read_bytes(r)?;
                 pairs.push((k, v));
             }
-            DumpValue::Hash(pairs)
+            // 'h' appends a per-field TTL section (absolute epoch-ms deadlines).
+            let expiries = if type_byte == b'h' {
+                let elen = read_count(r, "hash field ttl")?;
+                let mut e = Vec::with_capacity(elen.min(SNAPSHOT_PREALLOC_CAP));
+                for _ in 0..elen {
+                    let f = read_string(r)?;
+                    let ms = read_i64(r)?;
+                    e.push((f, ms));
+                }
+                e
+            } else {
+                Vec::new()
+            };
+            DumpValue::Hash(pairs, expiries)
         }
         b'T' => {
             let len = read_count(r, "set member")?;
@@ -723,7 +746,7 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
                         })
                         .collect()
                 };
-                DumpValue::Hash(pairs)
+                DumpValue::Hash(pairs, Vec::new())
             }
             "T" => {
                 let members: Vec<String> = if raw_value.is_empty() {
@@ -855,7 +878,7 @@ fn save_legacy_to_path(store: &Store, path: &str) -> io::Result<usize> {
         let type_char = match &entry.value {
             DumpValue::Str(_) => 'S',
             DumpValue::List(_) => 'L',
-            DumpValue::Hash(_) => 'H',
+            DumpValue::Hash(_, _) => 'H',
             DumpValue::Set(_) => 'T',
             DumpValue::SortedSet(_) => 'Z',
             DumpValue::Stream(..) => 'X',
@@ -870,7 +893,7 @@ fn save_legacy_to_path(store: &Store, path: &str) -> io::Result<usize> {
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .collect::<Vec<_>>()
                 .join("\x1f"),
-            DumpValue::Hash(pairs) => pairs
+            DumpValue::Hash(pairs, _) => pairs
                 .iter()
                 .map(|(k, v)| format!("{}\x1e{}", k, String::from_utf8_lossy(v)))
                 .collect::<Vec<_>>()

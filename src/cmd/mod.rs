@@ -589,6 +589,50 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 2,
     },
     CommandSpec {
+        name: b"HEXPIRE",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"HPEXPIRE",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"HEXPIREAT",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"HPEXPIREAT",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"HTTL",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"HPTTL",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"HEXPIRETIME",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"HPEXPIRETIME",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"HPERSIST",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"HGETEX",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"HGETDEL",
+        min_arity: 5,
+    },
+    CommandSpec {
         name: b"HSCAN",
         min_arity: 3,
     },
@@ -1863,6 +1907,39 @@ pub fn execute(
             if cmd_eq(cmd, b"HSCAN") {
                 return hashes::cmd_hscan(args, store, out, now);
             }
+            if cmd_eq(cmd, b"HEXPIRE") {
+                return hashes::cmd_hexpire(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HPEXPIRE") {
+                return hashes::cmd_hpexpire(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HEXPIREAT") {
+                return hashes::cmd_hexpireat(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HPEXPIREAT") {
+                return hashes::cmd_hpexpireat(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HTTL") {
+                return hashes::cmd_httl(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HPTTL") {
+                return hashes::cmd_hpttl(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HEXPIRETIME") {
+                return hashes::cmd_hexpiretime(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HPEXPIRETIME") {
+                return hashes::cmd_hpexpiretime(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HPERSIST") {
+                return hashes::cmd_hpersist(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HGETEX") {
+                return hashes::cmd_hgetex(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"HGETDEL") {
+                return hashes::cmd_hgetdel(args, store, out, now);
+            }
             if cmd_eq(cmd, b"HELLO") {
                 return server::cmd_hello(args, store, out, now);
             }
@@ -2501,6 +2578,10 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
             | b"TSMADD"
             | b"ZMPOP"
             | b"LMPOP"
+            | b"HEXPIRE"
+            | b"HPEXPIRE"
+            | b"HEXPIREAT"
+            | b"HPEXPIREAT"
     )
 }
 
@@ -3112,7 +3193,9 @@ pub(crate) fn execute_on_shard_read(
     } else if cmd_eq(cmd, b"HLEN") {
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Hash(h) => resp::write_integer(out, h.len() as i64),
+                StoreValue::Hash(h) => {
+                    resp::write_integer(out, h.live_len(crate::store::epoch_ms()) as i64)
+                }
                 _ => resp::write_error(
                     out,
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -3139,10 +3222,12 @@ pub(crate) fn execute_on_shard_read(
     } else if cmd_eq(cmd, b"HGET") && args.len() >= 3 {
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Hash(map) => match map.get(arg_str(args[2])) {
-                    Some(value) => resp::write_bulk_raw(out, value),
-                    None => resp::write_null(out),
-                },
+                StoreValue::Hash(map) => {
+                    match map.get_live(arg_str(args[2]), crate::store::epoch_ms()) {
+                        Some(value) => resp::write_bulk_raw(out, value),
+                        None => resp::write_null(out),
+                    }
+                }
                 _ => resp::write_null(out),
             },
             _ => resp::write_null(out),
@@ -3152,8 +3237,12 @@ pub(crate) fn execute_on_shard_read(
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => {
+                    let now_ms = crate::store::epoch_ms();
                     for field in &args[2..] {
-                        resp::write_optional_bulk_raw(out, &map.get(arg_str(field)).cloned());
+                        resp::write_optional_bulk_raw(
+                            out,
+                            &map.get_live(arg_str(field), now_ms).cloned(),
+                        );
                     }
                 }
                 _ => {
@@ -3173,7 +3262,7 @@ pub(crate) fn execute_on_shard_read(
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => resp::write_integer(
                     out,
-                    if map.contains_key(arg_str(args[2])) {
+                    if map.contains_live(arg_str(args[2]), crate::store::epoch_ms()) {
                         1
                     } else {
                         0
@@ -3190,8 +3279,10 @@ pub(crate) fn execute_on_shard_read(
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => {
-                    resp::write_array_header(out, map.len() * 2);
-                    for (field, value) in map {
+                    let now_ms = crate::store::epoch_ms();
+                    let live: Vec<(&String, &bytes::Bytes)> = map.live_iter(now_ms).collect();
+                    resp::write_array_header(out, live.len() * 2);
+                    for (field, value) in live {
                         resp::write_bulk(out, field);
                         resp::write_bulk_raw(out, value);
                     }
