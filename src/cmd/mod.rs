@@ -721,6 +721,22 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 4,
     },
     CommandSpec {
+        name: b"ZUNION",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZINTER",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZDIFF",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZINTERCARD",
+        min_arity: 3,
+    },
+    CommandSpec {
         name: b"ZSCAN",
         min_arity: 3,
     },
@@ -2237,6 +2253,18 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"ZDIFFSTORE") {
                 return sorted_sets::cmd_zdiffstore(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"ZUNION") {
+                return sorted_sets::cmd_zunion(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"ZINTER") {
+                return sorted_sets::cmd_zinter(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"ZINTERCARD") {
+                return sorted_sets::cmd_zintercard(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"ZDIFF") {
+                return sorted_sets::cmd_zdiff(args, store, out, now);
             }
             if cmd_eq(cmd, b"ZREMRANGEBYRANK") {
                 return sorted_sets::cmd_zremrangebyrank(args, store, out, now);

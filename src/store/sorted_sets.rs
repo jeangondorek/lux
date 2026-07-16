@@ -621,70 +621,46 @@ impl Store {
         }
     }
 
-    pub fn zunionstore(
+    /// Weighted union of the sorted sets, as a member->score map.
+    fn zunion_compute(
         &self,
-        dst: &[u8],
         keys: &[&[u8]],
         weights: &[f64],
         aggregate: &str,
         now: Instant,
-    ) -> Result<i64, String> {
+    ) -> Result<HashMap<String, f64>, String> {
         let mut result: HashMap<String, f64> = HashMap::new();
         for (i, key) in keys.iter().enumerate() {
             let w = weights.get(i).copied().unwrap_or(1.0);
             let set = self.collect_sorted_set(key, now)?;
             for (member, score) in set {
                 let weighted = score * w;
-                let entry = result.entry(member).or_insert(0.0);
-                match aggregate {
-                    "MIN" => *entry = entry.min(weighted),
-                    "MAX" => *entry = entry.max(weighted),
-                    _ => *entry += weighted,
+                // First occurrence seeds the value; only then does aggregate
+                // combine. (The old code seeded with 0.0, which broke MIN/MAX.)
+                if let Some(cur) = result.get_mut(&member) {
+                    match aggregate {
+                        "MIN" => *cur = cur.min(weighted),
+                        "MAX" => *cur = cur.max(weighted),
+                        _ => *cur += weighted,
+                    }
+                } else {
+                    result.insert(member, weighted);
                 }
             }
         }
-        let count = result.len() as i64;
-        self.del(&[dst]);
-        if !result.is_empty() {
-            let idx = self.shard_index(dst);
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            let mut tree = BTreeMap::new();
-            let mut scores = HashMap::new();
-            let mut mem = key_str(dst).len() + 64;
-            for (member, score) in result {
-                mem += member.len() + 48;
-                tree.insert((OrderedFloat(score), member.clone()), ());
-                scores.insert(member, score);
-            }
-            let old = shard.data.insert(
-                key_bytes(dst),
-                Entry {
-                    value: StoreValue::SortedSet(tree, scores),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                },
-            );
-            if old.is_none() {
-                self.key_added();
-            }
-            shard.used_memory += mem;
-            self.mem_add(mem);
-        }
-        Ok(count)
+        Ok(result)
     }
 
-    pub fn zinterstore(
+    /// Weighted intersection of the sorted sets, as a member->score map.
+    fn zinter_compute(
         &self,
-        dst: &[u8],
         keys: &[&[u8]],
         weights: &[f64],
         aggregate: &str,
         now: Instant,
-    ) -> Result<i64, String> {
+    ) -> Result<HashMap<String, f64>, String> {
         if keys.is_empty() {
-            self.del(&[dst]);
-            return Ok(0);
+            return Ok(HashMap::new());
         }
         let first = self.collect_sorted_set(keys[0], now)?;
         let w0 = weights.first().copied().unwrap_or(1.0);
@@ -707,47 +683,24 @@ impl Store {
                 }
             });
         }
-        let count = result.len() as i64;
-        self.del(&[dst]);
-        if !result.is_empty() {
-            let idx = self.shard_index(dst);
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            let mut tree = BTreeMap::new();
-            let mut scores = HashMap::new();
-            let mut mem = key_str(dst).len() + 64;
-            for (member, score) in result {
-                mem += member.len() + 48;
-                tree.insert((OrderedFloat(score), member.clone()), ());
-                scores.insert(member, score);
-            }
-            let old = shard.data.insert(
-                key_bytes(dst),
-                Entry {
-                    value: StoreValue::SortedSet(tree, scores),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                },
-            );
-            if old.is_none() {
-                self.key_added();
-            }
-            shard.used_memory += mem;
-            self.mem_add(mem);
-        }
-        Ok(count)
+        Ok(result)
     }
 
-    pub fn zdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
+    /// Difference of the first sorted set minus the rest, as a member->score map.
+    fn zdiff_compute(&self, keys: &[&[u8]], now: Instant) -> Result<HashMap<String, f64>, String> {
         if keys.is_empty() {
-            self.del(&[dst]);
-            return Ok(0);
+            return Ok(HashMap::new());
         }
         let mut result = self.collect_sorted_set(keys[0], now)?;
         for key in &keys[1..] {
             let set = self.collect_sorted_set(key, now)?;
             result.retain(|m, _| !set.contains_key(m));
         }
+        Ok(result)
+    }
+
+    /// Delete `dst` and store `result` as a sorted set; returns the member count.
+    fn write_computed_zset(&self, dst: &[u8], result: HashMap<String, f64>) -> i64 {
         let count = result.len() as i64;
         self.del(&[dst]);
         if !result.is_empty() {
@@ -776,7 +729,86 @@ impl Store {
             shard.used_memory += mem;
             self.mem_add(mem);
         }
-        Ok(count)
+        count
+    }
+
+    /// Sort a member->score map into Redis order: by score ascending, ties by
+    /// member lexicographically.
+    fn sorted_zset_result(result: HashMap<String, f64>) -> Vec<(String, f64)> {
+        let mut v: Vec<(String, f64)> = result.into_iter().collect();
+        v.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        v
+    }
+
+    pub fn zunionstore(
+        &self,
+        dst: &[u8],
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let result = self.zunion_compute(keys, weights, aggregate, now)?;
+        Ok(self.write_computed_zset(dst, result))
+    }
+
+    pub fn zinterstore(
+        &self,
+        dst: &[u8],
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let result = self.zinter_compute(keys, weights, aggregate, now)?;
+        Ok(self.write_computed_zset(dst, result))
+    }
+
+    pub fn zdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
+        let result = self.zdiff_compute(keys, now)?;
+        Ok(self.write_computed_zset(dst, result))
+    }
+
+    /// Direct-return union (sorted). WITHSCORES is applied at the command layer.
+    pub fn zunion(
+        &self,
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        Ok(Self::sorted_zset_result(
+            self.zunion_compute(keys, weights, aggregate, now)?,
+        ))
+    }
+
+    /// Direct-return intersection (sorted).
+    pub fn zinter(
+        &self,
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        Ok(Self::sorted_zset_result(
+            self.zinter_compute(keys, weights, aggregate, now)?,
+        ))
+    }
+
+    /// Direct-return difference (sorted).
+    pub fn zdiff(&self, keys: &[&[u8]], now: Instant) -> Result<Vec<(String, f64)>, String> {
+        Ok(Self::sorted_zset_result(self.zdiff_compute(keys, now)?))
+    }
+
+    /// Cardinality of the intersection. `limit` of 0 means no limit.
+    pub fn zintercard(&self, keys: &[&[u8]], limit: usize, now: Instant) -> Result<i64, String> {
+        let count = self.zinter_compute(keys, &[], "SUM", now)?.len();
+        let count = if limit == 0 { count } else { count.min(limit) };
+        Ok(count as i64)
     }
 
     #[allow(clippy::too_many_arguments)]

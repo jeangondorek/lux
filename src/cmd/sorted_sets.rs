@@ -956,6 +956,167 @@ pub fn cmd_zdiffstore(
     CmdResult::Written
 }
 
+/// Parsed pieces of a direct-return sorted-set set-op (ZUNION/ZINTER/ZDIFF).
+struct ZSetSetOp<'a> {
+    keys: Vec<&'a [u8]>,
+    weights: Vec<f64>,
+    aggregate: String,
+    with_scores: bool,
+}
+
+/// Parse `numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES]` for the
+/// direct-return ZUNION/ZINTER (allow_options=true) and ZDIFF (allow_options=false).
+fn parse_zset_setop<'a>(
+    args: &[&'a [u8]],
+    out: &mut BytesMut,
+    allow_options: bool,
+) -> Option<ZSetSetOp<'a>> {
+    let numkeys = parse_zstore_numkeys(args[1], out)?;
+    if 2 + numkeys > args.len() {
+        resp::write_error(out, "ERR syntax error");
+        return None;
+    }
+    let keys: Vec<&[u8]> = args[2..2 + numkeys].to_vec();
+    let mut tail = &args[2 + numkeys..];
+    let mut with_scores = false;
+    if tail.last().is_some_and(|t| cmd_eq(t, b"WITHSCORES")) {
+        with_scores = true;
+        tail = &tail[..tail.len() - 1];
+    }
+    let (weights, aggregate) = if allow_options {
+        parse_zstore_options(tail, numkeys, out)?
+    } else {
+        if !tail.is_empty() {
+            resp::write_error(out, "ERR syntax error");
+            return None;
+        }
+        (Vec::new(), "SUM".to_string())
+    };
+    Some(ZSetSetOp {
+        keys,
+        weights,
+        aggregate,
+        with_scores,
+    })
+}
+
+pub fn cmd_zunion(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'zunion' command");
+        return CmdResult::Written;
+    }
+    let Some(ZSetSetOp {
+        keys,
+        weights,
+        aggregate,
+        with_scores,
+    }) = parse_zset_setop(args, out, true)
+    else {
+        return CmdResult::Written;
+    };
+    for key in &keys {
+        store.try_promote(key, now);
+    }
+    match store.zunion(&keys, &weights, &aggregate, now) {
+        Ok(items) => write_zset_result(out, &items, with_scores),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_zinter(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'zinter' command");
+        return CmdResult::Written;
+    }
+    let Some(ZSetSetOp {
+        keys,
+        weights,
+        aggregate,
+        with_scores,
+    }) = parse_zset_setop(args, out, true)
+    else {
+        return CmdResult::Written;
+    };
+    for key in &keys {
+        store.try_promote(key, now);
+    }
+    match store.zinter(&keys, &weights, &aggregate, now) {
+        Ok(items) => write_zset_result(out, &items, with_scores),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_zdiff(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'zdiff' command");
+        return CmdResult::Written;
+    }
+    let Some(ZSetSetOp {
+        keys, with_scores, ..
+    }) = parse_zset_setop(args, out, false)
+    else {
+        return CmdResult::Written;
+    };
+    for key in &keys {
+        store.try_promote(key, now);
+    }
+    match store.zdiff(&keys, now) {
+        Ok(items) => write_zset_result(out, &items, with_scores),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_zintercard(
+    args: &[&[u8]],
+    store: &Store,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(
+            out,
+            "ERR wrong number of arguments for 'zintercard' command",
+        );
+        return CmdResult::Written;
+    }
+    let numkeys = match parse_zstore_numkeys(args[1], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    if 2 + numkeys > args.len() {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    }
+    let keys: Vec<&[u8]> = args[2..2 + numkeys].to_vec();
+    for key in &keys {
+        store.try_promote(key, now);
+    }
+    let tail = &args[2 + numkeys..];
+    let mut limit = 0usize;
+    if !tail.is_empty() {
+        if tail.len() == 2 && cmd_eq(tail[0], b"LIMIT") {
+            match parse_u64(tail[1]) {
+                Ok(l) => limit = l as usize,
+                Err(_) => {
+                    resp::write_error(out, "ERR LIMIT can't be negative");
+                    return CmdResult::Written;
+                }
+            }
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    }
+    match store.zintercard(&keys, limit, now) {
+        Ok(n) => resp::write_integer(out, n),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_zremrangebyrank(
     args: &[&[u8]],
     store: &Store,

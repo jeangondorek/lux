@@ -263,6 +263,94 @@ fn sorted_set_command_surface() {
 }
 
 #[test]
+fn sorted_set_direct_setops() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    assert_has(
+        &send(&mut conn, &["ZADD", "za", "10", "a", "20", "b"]),
+        ":2",
+    );
+    assert_has(
+        &send(&mut conn, &["ZADD", "zb", "25", "b", "30", "c"]),
+        ":2",
+    );
+
+    // ZUNION: 3 distinct members, sorted by score ascending (a=10, c=30, b=45).
+    assert_has(&send(&mut conn, &["ZUNION", "2", "za", "zb"]), "*3");
+    assert_has(
+        &send(&mut conn, &["ZUNION", "2", "za", "zb", "WITHSCORES"]),
+        "*6",
+    );
+    // Default SUM: b = 20 + 25 = 45.
+    assert_has(
+        &send(&mut conn, &["ZUNION", "2", "za", "zb", "WITHSCORES"]),
+        "45",
+    );
+    // AGGREGATE MIN: b = min(20, 25) = 20. (The old union code seeded 0.0, which
+    // would have made every MIN score 0 -- this guards that fix.)
+    assert_has(
+        &send(
+            &mut conn,
+            &["ZUNION", "2", "za", "zb", "AGGREGATE", "MIN", "WITHSCORES"],
+        ),
+        "20",
+    );
+    // AGGREGATE MAX: b = max(20, 25) = 25.
+    assert_has(
+        &send(
+            &mut conn,
+            &["ZUNION", "2", "za", "zb", "AGGREGATE", "MAX", "WITHSCORES"],
+        ),
+        "25",
+    );
+    // WEIGHTS: b = 20*1 + 25*2 = 70.
+    assert_has(
+        &send(
+            &mut conn,
+            &["ZUNION", "2", "za", "zb", "WEIGHTS", "1", "2", "WITHSCORES"],
+        ),
+        "70",
+    );
+
+    // ZINTER: only b is in both; SUM score 45.
+    assert_has(&send(&mut conn, &["ZINTER", "2", "za", "zb"]), "*1");
+    assert_has(
+        &send(&mut conn, &["ZINTER", "2", "za", "zb", "WITHSCORES"]),
+        "45",
+    );
+
+    // ZDIFF: a is only in za.
+    assert_has(&send(&mut conn, &["ZDIFF", "2", "za", "zb"]), "a");
+    assert_has(
+        &send(&mut conn, &["ZDIFF", "2", "za", "zb", "WITHSCORES"]),
+        "10",
+    );
+
+    // ZINTERCARD: intersection size, honoring LIMIT.
+    assert_has(&send(&mut conn, &["ZINTERCARD", "2", "za", "zb"]), ":1");
+    assert_has(
+        &send(&mut conn, &["ZINTERCARD", "2", "za", "zb", "LIMIT", "5"]),
+        ":1",
+    );
+
+    // Empty / missing keys.
+    assert_has(&send(&mut conn, &["ZUNION", "1", "nope"]), "*0");
+    assert_has(&send(&mut conn, &["ZINTERCARD", "1", "nope"]), ":0");
+
+    // Direct set-ops are reads: sources are untouched, no destination created.
+    assert_has(&send(&mut conn, &["ZCARD", "za"]), ":2");
+    assert_has(&send(&mut conn, &["ZCARD", "zb"]), ":2");
+
+    // Arity / syntax errors.
+    assert_has(&send(&mut conn, &["ZUNION", "2", "za"]), "-ERR");
+    assert_has(
+        &send(&mut conn, &["ZINTERCARD", "2", "za", "zb", "BOGUS"]),
+        "-ERR",
+    );
+}
+
+#[test]
 fn sorted_set_store_rejects_invalid_arguments_without_mutating_destination() {
     let server = LuxServer::start();
     let mut conn = server.conn();
