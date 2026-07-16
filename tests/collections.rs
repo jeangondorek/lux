@@ -351,6 +351,42 @@ fn sorted_set_direct_setops() {
 }
 
 #[test]
+fn sorted_set_zmpop() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    assert_has(
+        &send(&mut conn, &["ZADD", "z1", "1", "a", "2", "b", "3", "c"]),
+        ":3",
+    );
+    assert_has(&send(&mut conn, &["ZADD", "z2", "5", "x"]), ":1");
+
+    // Pops from the first non-empty key (skips the missing one), MIN, default COUNT 1.
+    let r = send(&mut conn, &["ZMPOP", "2", "empty", "z1", "MIN"]);
+    assert_has(&r, "z1");
+    assert_has(&r, "a");
+    // MIN COUNT 2 pops the next two (b, c).
+    let r2 = send(&mut conn, &["ZMPOP", "1", "z1", "MIN", "COUNT", "2"]);
+    assert_has(&r2, "b");
+    assert_has(&r2, "c");
+    // z1 is now empty, so it falls through to z2 with MAX.
+    let r3 = send(&mut conn, &["ZMPOP", "2", "z1", "z2", "MAX"]);
+    assert_has(&r3, "z2");
+    assert_has(&r3, "x");
+    // All input keys empty -> nil array.
+    assert_has(&send(&mut conn, &["ZMPOP", "2", "z1", "z2", "MIN"]), "*-1");
+
+    // Syntax / arity errors.
+    assert_has(&send(&mut conn, &["ZMPOP", "1", "z1"]), "-ERR"); // no MIN/MAX
+    assert_has(&send(&mut conn, &["ZMPOP", "1", "z1", "SIDEWAYS"]), "-ERR");
+    assert_has(&send(&mut conn, &["ZMPOP", "0", "MIN"]), "-ERR"); // numkeys 0
+    assert_has(
+        &send(&mut conn, &["ZMPOP", "1", "z1", "MIN", "COUNT", "0"]),
+        "-ERR",
+    );
+}
+
+#[test]
 fn sorted_set_store_rejects_invalid_arguments_without_mutating_destination() {
     let server = LuxServer::start();
     let mut conn = server.conn();

@@ -1117,6 +1117,94 @@ pub fn cmd_zintercard(
     CmdResult::Written
 }
 
+pub fn cmd_zmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    // ZMPOP numkeys key [key ...] <MIN | MAX> [COUNT count]
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'zmpop' command");
+        return CmdResult::Written;
+    }
+    let numkeys = match parse_zstore_numkeys(args[1], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    // Need at least the MIN|MAX token after the keys.
+    if 2 + numkeys >= args.len() {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    }
+    let keys: Vec<&[u8]> = args[2..2 + numkeys].to_vec();
+    let dir_idx = 2 + numkeys;
+    let is_min = if cmd_eq(args[dir_idx], b"MIN") {
+        true
+    } else if cmd_eq(args[dir_idx], b"MAX") {
+        false
+    } else {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    };
+    let mut count = 1usize;
+    let rest = &args[dir_idx + 1..];
+    if !rest.is_empty() {
+        if rest.len() == 2 && cmd_eq(rest[0], b"COUNT") {
+            match parse_u64(rest[1]) {
+                Ok(n) if n >= 1 => count = n as usize,
+                _ => {
+                    resp::write_error(out, "ERR count should be greater than 0");
+                    return CmdResult::Written;
+                }
+            }
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    }
+    // Pop from the first key that yields members.
+    for key in &keys {
+        store.try_promote(key, now);
+        let popped = if is_min {
+            store.zpopmin(key, count, now)
+        } else {
+            store.zpopmax(key, count, now)
+        };
+        match popped {
+            Ok(items) if !items.is_empty() => {
+                // Self-log the effect as a keyed ZREM: the raw ZMPOP would be WAL-
+                // sharded on its numkeys arg (not the key), landing in the wrong
+                // shard and replaying out of order. ZREM is keyed on the actual
+                // key, so it shards and replays deterministically.
+                if store.wal_enabled() {
+                    let member_bytes: Vec<&[u8]> =
+                        items.iter().map(|(m, _)| m.as_bytes()).collect();
+                    let mut zrem: Vec<&[u8]> = Vec::with_capacity(member_bytes.len() + 2);
+                    zrem.push(b"ZREM");
+                    zrem.push(key);
+                    zrem.extend_from_slice(&member_bytes);
+                    if let Err(e) = store.wal_log_command(&zrem) {
+                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                        return CmdResult::Written;
+                    }
+                }
+                resp::write_array_header(out, 2);
+                resp::write_bulk(out, arg_str(key));
+                resp::write_array_header(out, items.len());
+                for (member, score) in &items {
+                    resp::write_array_header(out, 2);
+                    resp::write_bulk(out, member);
+                    resp::write_bulk(out, &format_float(*score));
+                }
+                return CmdResult::Written;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
+        }
+    }
+    resp::write_null_array(out);
+    CmdResult::Written
+}
+
 pub fn cmd_zremrangebyrank(
     args: &[&[u8]],
     store: &Store,

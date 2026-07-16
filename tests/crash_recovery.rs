@@ -168,6 +168,42 @@ fn tsadd_star_timestamp_stable_after_wal_replay() {
     );
 }
 
+// ZMPOP mutates the sorted set, so the pop must survive a WAL-only restart
+// (regression guard that ZMPOP is classified as a write and WAL-logged).
+#[test]
+fn zmpop_persists_across_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(&mut c, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    send(&mut c, &["ZMPOP", "1", "z", "MIN", "COUNT", "2"]); // pops a and b
+                                                             // Control: an established write on a second key, to isolate ZMPOP.
+    send(&mut c, &["ZADD", "zc", "1", "a", "2", "b"]);
+    send(&mut c, &["ZPOPMIN", "zc", "1"]); // pops a
+    drop(c);
+
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    let control = send(&mut c, &["ZCARD", "zc"]);
+    assert!(
+        control.contains(":1"),
+        "control ZPOPMIN must persist; ZCARD(zc)={control:?}"
+    );
+    let card = send(&mut c, &["ZCARD", "z"]);
+    assert!(
+        card.contains(":1"),
+        "ZMPOP pop must persist across WAL replay; ZCARD={card:?}"
+    );
+    assert!(
+        send(&mut c, &["ZSCORE", "z", "a"]).contains("$-1"),
+        "popped member 'a' must stay gone after replay"
+    );
+    assert!(
+        send(&mut c, &["ZSCORE", "z", "c"]).contains('3'),
+        "unpopped member 'c' must remain after replay"
+    );
+}
+
 // AUDIT PROBE: SPOP removes a RANDOM member. The raw command is WAL-logged, so
 // replay re-runs SPOP and may remove a DIFFERENT member than the client saw,
 // leaving the recovered set inconsistent with the acknowledged result.

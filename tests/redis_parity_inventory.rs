@@ -242,7 +242,7 @@ const INVENTORY: &[CommandInventory] = &[
     supported("ZINTERCARD"),
     supported("ZINTERSTORE"),
     supported("ZLEXCOUNT"),
-    missing("ZMPOP", "compatibility gap"),
+    supported("ZMPOP"),
     supported("ZMSCORE"),
     supported("ZPOPMAX"),
     supported("ZPOPMIN"),

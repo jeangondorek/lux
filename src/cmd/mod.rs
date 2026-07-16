@@ -737,6 +737,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 3,
     },
     CommandSpec {
+        name: b"ZMPOP",
+        min_arity: 4,
+    },
+    CommandSpec {
         name: b"ZSCAN",
         min_arity: 3,
     },
@@ -2266,6 +2270,9 @@ pub fn execute(
             if cmd_eq(cmd, b"ZDIFF") {
                 return sorted_sets::cmd_zdiff(args, store, out, now);
             }
+            if cmd_eq(cmd, b"ZMPOP") {
+                return sorted_sets::cmd_zmpop(args, store, out, now);
+            }
             if cmd_eq(cmd, b"ZREMRANGEBYRANK") {
                 return sorted_sets::cmd_zremrangebyrank(args, store, out, now);
             }
@@ -2341,6 +2348,7 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
             | b"XADD"
             | b"TSADD"
             | b"TSMADD"
+            | b"ZMPOP"
     )
 }
 

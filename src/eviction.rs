@@ -253,6 +253,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"ZINCRBY")
         || eq(cmd, b"ZPOPMIN")
         || eq(cmd, b"ZPOPMAX")
+        || eq(cmd, b"ZMPOP")
         || eq(cmd, b"ZUNIONSTORE")
         || eq(cmd, b"ZINTERSTORE")
         || eq(cmd, b"ZDIFFSTORE")
