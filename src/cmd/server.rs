@@ -235,17 +235,87 @@ pub fn cmd_client(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Ins
     CmdResult::Written
 }
 
-pub fn cmd_select(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    resp::write_ok(out);
+pub fn cmd_select(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    // Lux is single-database. SELECT 0 is a no-op OK; any other index is an
+    // honest out-of-range error instead of a silent fake OK.
+    let Some(idx) = args.get(1) else {
+        resp::write_error(out, "ERR wrong number of arguments for 'select' command");
+        return CmdResult::Written;
+    };
+    match arg_str(idx).parse::<i64>() {
+        Ok(0) => resp::write_ok(out),
+        Ok(_) => resp::write_error(out, "ERR DB index is out of range"),
+        Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
+    }
     CmdResult::Written
 }
 
 pub fn cmd_command(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    if args.len() > 1 && cmd_eq(args[1], b"DOCS") {
+    if args.len() > 1 && cmd_eq(args[1], b"COUNT") {
+        // Real count of registered commands, not a fake +OK.
+        resp::write_integer(out, super::command_count() as i64);
+    } else if args.len() > 1 && (cmd_eq(args[1], b"GETKEYS") || cmd_eq(args[1], b"GETKEYSANDFLAGS"))
+    {
+        resp::write_error(out, "ERR COMMAND GETKEYS is not supported");
+    } else {
+        // COMMAND / COMMAND INFO / COMMAND DOCS / COMMAND LIST: per-command
+        // metadata is not implemented yet, so return an empty array of the
+        // correct shape rather than a fake +OK.
+        resp::write_array_header(out, 0);
+    }
+    CmdResult::Written
+}
+
+/// WAIT reports how many replicas acknowledged. Lux has no replication, so the
+/// honest answer is the integer 0 (Redis WAIT returns an integer, not +OK).
+pub fn cmd_wait(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_integer(out, 0);
+    CmdResult::Written
+}
+
+/// SWAPDB requires multiple databases, which Lux does not have.
+pub fn cmd_swapdb(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_error(out, "ERR SWAPDB is not supported: Lux is a single database");
+    CmdResult::Written
+}
+
+/// LATENCY: no latency monitoring is kept. RESET clears 0 events; the reporting
+/// forms return an empty array of the right shape instead of a fake +OK.
+pub fn cmd_latency(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    if args.len() > 1 && cmd_eq(args[1], b"RESET") {
+        resp::write_integer(out, 0);
+    } else {
+        resp::write_array_header(out, 0);
+    }
+    CmdResult::Written
+}
+
+/// RESET replies with the +RESET status line (Redis-correct), not +OK.
+pub fn cmd_reset(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_simple(out, "RESET");
+    CmdResult::Written
+}
+
+/// Redis Functions are not implemented. LIST honestly reports no libraries; any
+/// other subcommand returns a clear unsupported error instead of a fake +OK.
+pub fn cmd_function(
+    args: &[&[u8]],
+    _store: &Store,
+    out: &mut BytesMut,
+    _now: Instant,
+) -> CmdResult {
+    if args.len() > 1 && cmd_eq(args[1], b"LIST") {
         resp::write_array_header(out, 0);
     } else {
-        resp::write_ok(out);
+        resp::write_error(out, "ERR FUNCTION is not supported");
     }
+    CmdResult::Written
+}
+
+/// DUMP has no serialization format in Lux; a fake +OK would hand clients a
+/// bogus payload, so return a clear unsupported error.
+pub fn cmd_dump(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_error(out, "ERR DUMP is not supported");
     CmdResult::Written
 }
 

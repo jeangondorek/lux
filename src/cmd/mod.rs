@@ -1022,6 +1022,11 @@ fn command_spec(cmd: &[u8]) -> Option<&'static CommandSpec> {
     COMMAND_SPECS.iter().find(|spec| cmd_eq(cmd, spec.name))
 }
 
+/// Number of registered RESP commands (for `COMMAND COUNT`).
+pub(crate) fn command_count() -> usize {
+    COMMAND_SPECS.len()
+}
+
 #[inline(always)]
 pub(crate) fn is_public_without_auth_command(cmd: &[u8]) -> bool {
     command_spec(cmd).is_some()
@@ -1596,7 +1601,10 @@ pub fn execute(
             if cmd_eq(cmd, b"DELIFEQ") {
                 return strings::cmd_delifeq(args, store, out, now);
             }
-            if cmd_eq(cmd, b"DEBUG") || cmd_eq(cmd, b"DUMP") {
+            if cmd_eq(cmd, b"DUMP") {
+                return server::cmd_dump(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"DEBUG") {
                 return server::cmd_noop_ok(args, store, out, now);
             }
             if cmd_eq(cmd, b"DISCARD") {
@@ -1639,7 +1647,7 @@ pub fn execute(
                 return keys::cmd_flushdb(args, store, out, now);
             }
             if cmd_eq(cmd, b"FUNCTION") {
-                return server::cmd_noop_ok(args, store, out, now);
+                return server::cmd_function(args, store, out, now);
             }
         }
         b'G' => {
@@ -1814,7 +1822,7 @@ pub fn execute(
                 return server::cmd_lastsave(args, store, out, now);
             }
             if cmd_eq(cmd, b"LATENCY") {
-                return server::cmd_noop_ok(args, store, out, now);
+                return server::cmd_latency(args, store, out, now);
             }
         }
         b'M' => {
@@ -1909,7 +1917,7 @@ pub fn execute(
                 return keys::cmd_randomkey(args, store, out, now);
             }
             if cmd_eq(cmd, b"RESET") {
-                return server::cmd_noop_ok(args, store, out, now);
+                return server::cmd_reset(args, store, out, now);
             }
             if cmd_eq(cmd, b"REVOKE") {
                 return tables::cmd_revoke(args, store, cache, out, now);
@@ -2007,7 +2015,7 @@ pub fn execute(
                 return sort::cmd_sort(args, store, out, now);
             }
             if cmd_eq(cmd, b"SWAPDB") {
-                return server::cmd_noop_ok(args, store, out, now);
+                return server::cmd_swapdb(args, store, out, now);
             }
         }
         b'T' => {
@@ -2115,7 +2123,7 @@ pub fn execute(
         }
         b'W' => {
             if cmd_eq(cmd, b"WAIT") {
-                return server::cmd_noop_ok(args, store, out, now);
+                return server::cmd_wait(args, store, out, now);
             }
             if cmd_eq(cmd, b"WATCH") {
                 resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
