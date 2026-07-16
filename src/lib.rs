@@ -1787,6 +1787,7 @@ impl EmbeddedClient {
                 CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
                 CmdResult::BlockZPop { .. } => "BZPOP*",
                 CmdResult::BlockListMPop { .. } => "BLMPOP",
+                CmdResult::BlockZMPop { .. } => "BZMPOP",
                 _ => "unsupported",
             };
             return Err(LuxError::Unsupported(format!(
@@ -2021,6 +2022,7 @@ impl EmbeddedClient {
                 CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
                 CmdResult::BlockZPop { .. } => "BZPOP*",
                 CmdResult::BlockListMPop { .. } => "BLMPOP",
+                CmdResult::BlockZMPop { .. } => "BZMPOP",
                 _ => "unsupported",
             };
             return Err(LuxError::Unsupported(format!(
@@ -3361,6 +3363,7 @@ fn handle_tx_cmd(
                         | CmdResult::BlockMove { .. }
                         | CmdResult::BlockStreamRead { .. }
                         | CmdResult::BlockListMPop { .. }
+                        | CmdResult::BlockZMPop { .. }
                         | CmdResult::BlockZPop { .. } => {
                             resp::write_error(
                                 write_buf,
@@ -3965,6 +3968,7 @@ impl CommandExecutor {
             | CmdResult::BlockMove { .. }
             | CmdResult::BlockStreamRead { .. }
             | CmdResult::BlockListMPop { .. }
+            | CmdResult::BlockZMPop { .. }
             | CmdResult::BlockZPop { .. } => Some(cmd_result),
             CmdResult::Eval { script, keys, argv } => {
                 handle_eval(
@@ -4357,6 +4361,15 @@ async fn handle_connection(
                         handle_block_lmpop(&mut socket, &store, &keys, pop_left, count, timeout)
                             .await?;
                     }
+                    CmdResult::BlockZMPop {
+                        keys,
+                        pop_min,
+                        count,
+                        timeout,
+                    } => {
+                        handle_block_zmpop(&mut socket, &store, &keys, pop_min, count, timeout)
+                            .await?;
+                    }
                     _ => {}
                 }
             }
@@ -4648,6 +4661,64 @@ async fn handle_block_lmpop(
                         .decrypt_list_element(item.clone())
                         .unwrap_or_else(|_| item.clone());
                     resp::write_bulk_raw(&mut write_buf, &decrypted);
+                }
+                return socket.write_all(&write_buf).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                resp::write_error(&mut write_buf, &e);
+                return socket.write_all(&write_buf).await;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            resp::write_null_array(&mut write_buf);
+            return socket.write_all(&write_buf).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn handle_block_zmpop(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    keys: &[String],
+    pop_min: bool,
+    count: usize,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+    let mut write_buf = BytesMut::new();
+
+    loop {
+        let now = Instant::now();
+        match store.zmpop(&key_refs, pop_min, count, now) {
+            Ok(Some((key, items))) => {
+                // Popped straight from the store outside the WAL; self-log the
+                // removal as a keyed ZREM so replay stays correct (ENG-1316/1317).
+                if store.wal_enabled() {
+                    let mut zrem: Vec<&[u8]> = Vec::with_capacity(items.len() + 2);
+                    zrem.push(b"ZREM");
+                    zrem.push(&key);
+                    for (m, _) in &items {
+                        zrem.push(m.as_bytes());
+                    }
+                    let _ = store.wal_log_command(&zrem);
+                }
+                resp::write_array_header(&mut write_buf, 2);
+                resp::write_bulk_raw(&mut write_buf, &key);
+                resp::write_array_header(&mut write_buf, items.len());
+                for (member, score) in &items {
+                    resp::write_array_header(&mut write_buf, 2);
+                    resp::write_bulk(&mut write_buf, member);
+                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                        format!("{}", *score as i64)
+                    } else {
+                        format!("{score}")
+                    };
+                    resp::write_bulk(&mut write_buf, &score_str);
                 }
                 return socket.write_all(&write_buf).await;
             }

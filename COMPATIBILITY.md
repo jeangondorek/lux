@@ -116,7 +116,6 @@ Current missing Redis OSS/core command groups:
 - Hash field TTL/value helpers: `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`,
   `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST`,
   `HGETEX`, `HGETDEL`.
-- Sorted sets: `BZMPOP`, `ZRANGESTORE`.
 - Streams: `XSETID` (top-level command). Consumer-group lifecycle
   (`XGROUP CREATE`/`SETID`/`DESTROY`/`CREATECONSUMER`/`DELCONSUMER`/`HELP`)
   and `XINFO STREAM`/`GROUPS`/`CONSUMERS` are implemented.

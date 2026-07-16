@@ -172,3 +172,36 @@ fn brpoplpush_immediate_and_woken() {
     assert!(resp.contains("moved"), "woken move: {resp}");
     assert!(send_and_read(&mut pusher, &["LRANGE", "bdst", "0", "-1"]).contains("moved"));
 }
+
+#[test]
+fn bzmpop_immediate_and_timeout() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send_and_read(&mut conn, &["ZADD", "z", "1", "a", "2", "b"]);
+    let r = send_and_read(&mut conn, &["BZMPOP", "1", "1", "z", "MIN", "COUNT", "2"]);
+    assert!(
+        r.contains('z') && r.contains('a') && r.contains('b'),
+        "bzmpop immediate: {r}"
+    );
+    let r = send_and_read(&mut conn, &["BZMPOP", "0.1", "1", "empty", "MIN"]);
+    assert!(r.contains("*-1"), "bzmpop timeout -> nil: {r}");
+}
+
+#[test]
+fn bzmpop_woken_by_zadd() {
+    let server = LuxServer::start();
+    let mut blocker = server.conn();
+    blocker
+        .set_read_timeout(Some(Duration::from_millis(5000)))
+        .unwrap();
+    blocker
+        .write_all(&resp_cmd(&["BZMPOP", "5", "2", "zk1", "zk2", "MAX"]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    let mut pusher = server.conn();
+    send_and_read(&mut pusher, &["ZADD", "zk2", "9", "top"]);
+    thread::sleep(Duration::from_millis(200));
+    let resp = read_all(&mut blocker);
+    assert!(resp.contains("zk2"), "woken key: {resp}");
+    assert!(resp.contains("top"), "woken member: {resp}");
+}

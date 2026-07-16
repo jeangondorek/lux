@@ -551,3 +551,63 @@ fn sorted_set_commands_reject_invalid_arguments_without_mutating_state() {
     assert_has(&send(&mut conn, &["ZSCORE", "z", "two"]), "2");
     assert_has(&send(&mut conn, &["ZSCORE", "z", "three"]), "3");
 }
+
+#[test]
+fn sorted_set_zrangestore() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send(
+        &mut conn,
+        &["ZADD", "src", "1", "a", "2", "b", "3", "c", "4", "d"],
+    );
+
+    // By index: store first two into dst.
+    assert_has(
+        &send(&mut conn, &["ZRANGESTORE", "dst", "src", "0", "1"]),
+        ":2",
+    );
+    let r = send(&mut conn, &["ZRANGE", "dst", "0", "-1", "WITHSCORES"]);
+    assert_has(&r, "a");
+    assert_has(&r, "b");
+    assert!(!r.contains("\nc\r"), "dst should not contain c: {r}");
+
+    // BYSCORE with LIMIT, overwrites dst.
+    assert_has(
+        &send(
+            &mut conn,
+            &["ZRANGESTORE", "dst", "src", "2", "4", "BYSCORE"],
+        ),
+        ":3",
+    );
+    let r = send(&mut conn, &["ZRANGE", "dst", "0", "-1"]);
+    assert_has(&r, "b");
+    assert_has(&r, "d");
+
+    // Scores are preserved from src.
+    assert_has(&send(&mut conn, &["ZSCORE", "dst", "c"]), "3");
+
+    // Empty result deletes dst and returns 0.
+    assert_has(
+        &send(
+            &mut conn,
+            &["ZRANGESTORE", "dst", "src", "100", "200", "BYSCORE"],
+        ),
+        ":0",
+    );
+    assert_has(&send(&mut conn, &["EXISTS", "dst"]), ":0");
+
+    // Missing src -> empty -> 0.
+    assert_has(
+        &send(&mut conn, &["ZRANGESTORE", "d2", "nosrc", "0", "-1"]),
+        ":0",
+    );
+
+    // LIMIT without BYSCORE/BYLEX is an error.
+    assert_has(
+        &send(
+            &mut conn,
+            &["ZRANGESTORE", "d3", "src", "0", "-1", "LIMIT", "0", "1"],
+        ),
+        "-ERR",
+    );
+}

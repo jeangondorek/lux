@@ -1458,6 +1458,16 @@ pub fn cmd_bzpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         if let Ok(items) = result {
             if !items.is_empty() {
                 let (member, score) = &items[0];
+                // Immediately-satisfiable BZPOPMIN/BZPOPMAX pops here without going
+                // through the blocked path, so it must self-log the removal (it
+                // isn't a write command, so execute_with_wal never logs it). Keyed
+                // ZREM replays deterministically on `key`'s shard.
+                if store.wal_enabled() {
+                    if let Err(e) = store.wal_log_command(&[b"ZREM", key, member.as_bytes()]) {
+                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                        return CmdResult::Written;
+                    }
+                }
                 resp::write_array_header(out, 3);
                 resp::write_bulk_raw(out, key);
                 resp::write_bulk(out, member);
@@ -1478,4 +1488,228 @@ pub fn cmd_bzpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         timeout,
         pop_min: is_min,
     }
+}
+
+/// Write the ZMPOP/BZMPOP success reply: `[key, [[member, score], ...]]`.
+fn write_zmpop_reply(out: &mut BytesMut, key: &[u8], items: &[(String, f64)]) {
+    resp::write_array_header(out, 2);
+    resp::write_bulk_raw(out, key);
+    resp::write_array_header(out, items.len());
+    for (member, score) in items {
+        resp::write_array_header(out, 2);
+        resp::write_bulk(out, member);
+        resp::write_bulk(out, &format_float(*score));
+    }
+}
+
+/// Self-log a ZMPOP/BZMPOP pop as a keyed ZREM so a sharded WAL replays it on the
+/// popped key's shard (the raw command shards on its numkeys arg).
+fn wal_log_zmpop(store: &Store, key: &[u8], items: &[(String, f64)], out: &mut BytesMut) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let members: Vec<&[u8]> = items.iter().map(|(m, _)| m.as_bytes()).collect();
+    let mut zrem: Vec<&[u8]> = Vec::with_capacity(members.len() + 2);
+    zrem.push(b"ZREM");
+    zrem.push(key);
+    zrem.extend_from_slice(&members);
+    if let Err(e) = store.wal_log_command(&zrem) {
+        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+        return false;
+    }
+    true
+}
+
+pub fn cmd_bzmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    // BZMPOP timeout numkeys key [key ...] <MIN|MAX> [COUNT count]
+    if args.len() < 5 {
+        resp::write_error(out, "ERR wrong number of arguments for 'bzmpop' command");
+        return CmdResult::Written;
+    }
+    let timeout_secs: f64 = arg_str(args[1]).parse().unwrap_or(-1.0);
+    if timeout_secs < 0.0 {
+        resp::write_error(out, "ERR timeout is not a float or out of range");
+        return CmdResult::Written;
+    }
+    let numkeys = match parse_zstore_numkeys(args[2], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    if 3 + numkeys >= args.len() {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    }
+    let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
+    let dir_idx = 3 + numkeys;
+    let pop_min = if cmd_eq(args[dir_idx], b"MIN") {
+        true
+    } else if cmd_eq(args[dir_idx], b"MAX") {
+        false
+    } else {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    };
+    let mut count = 1usize;
+    let rest = &args[dir_idx + 1..];
+    if !rest.is_empty() {
+        if rest.len() == 2 && cmd_eq(rest[0], b"COUNT") {
+            match parse_u64(rest[1]) {
+                Ok(n) if n >= 1 => count = n as usize,
+                _ => {
+                    resp::write_error(out, "ERR count should be greater than 0");
+                    return CmdResult::Written;
+                }
+            }
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    }
+    // Immediately satisfiable -> behave like ZMPOP and self-log the effect.
+    match store.zmpop(&keys, pop_min, count, now) {
+        Ok(Some((key, items))) => {
+            if !wal_log_zmpop(store, &key, &items, out) {
+                return CmdResult::Written;
+            }
+            write_zmpop_reply(out, &key, &items);
+            return CmdResult::Written;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    }
+    let timeout = if timeout_secs <= 0.0 {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs_f64(timeout_secs)
+    };
+    let owned_keys: Vec<String> = keys.iter().map(|k| arg_str(k).to_string()).collect();
+    CmdResult::BlockZMPop {
+        keys: owned_keys,
+        pop_min,
+        count,
+        timeout,
+    }
+}
+
+pub fn cmd_zrangestore(
+    args: &[&[u8]],
+    store: &Store,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    // ZRANGESTORE dst src min max [BYSCORE|BYLEX] [REV] [LIMIT offset count]
+    if args.len() < 5 {
+        resp::write_error(
+            out,
+            "ERR wrong number of arguments for 'zrangestore' command",
+        );
+        return CmdResult::Written;
+    }
+    let dst = args[1];
+    let src = args[2];
+    store.try_promote(src, now);
+    let mut reverse = false;
+    let mut byscore = false;
+    let mut bylex = false;
+    let mut offset: Option<usize> = None;
+    let mut count: Option<usize> = None;
+    let mut i = 5;
+    while i < args.len() {
+        if cmd_eq(args[i], b"REV") {
+            reverse = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"BYSCORE") {
+            byscore = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"BYLEX") {
+            bylex = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"LIMIT") {
+            let parsed = match parse_limit(args, i, out) {
+                Some(parsed) => parsed,
+                None => return CmdResult::Written,
+            };
+            offset = parsed.0;
+            count = parsed.1;
+            i += 3;
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    }
+    if byscore && bylex {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    }
+    if (offset.is_some() || count.is_some()) && !(byscore || bylex) {
+        resp::write_error(
+            out,
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+        );
+        return CmdResult::Written;
+    }
+    let pairs: Result<Vec<(String, f64)>, String> = if byscore {
+        let (min, min_ex) = match parse_score_bound(arg_str(args[3]), false) {
+            Ok(bound) => bound,
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
+        };
+        let (max, max_ex) = match parse_score_bound(arg_str(args[4]), true) {
+            Ok(bound) => bound,
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
+        };
+        store.zrangebyscore(
+            src, min, max, min_ex, max_ex, reverse, offset, count, true, now,
+        )
+    } else if bylex {
+        match store.zrangebylex(
+            src,
+            arg_str(args[3]),
+            arg_str(args[4]),
+            offset,
+            count,
+            reverse,
+            now,
+        ) {
+            Ok(members) => {
+                let mut v = Vec::with_capacity(members.len());
+                for m in members {
+                    let s = store
+                        .zscore(src, m.as_bytes(), now)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0.0);
+                    v.push((m, s));
+                }
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        let start = match parse_i64_arg(args[3], out) {
+            Some(v) => v,
+            None => return CmdResult::Written,
+        };
+        let stop = match parse_i64_arg(args[4], out) {
+            Some(v) => v,
+            None => return CmdResult::Written,
+        };
+        store.zrange(src, start, stop, reverse, true, now)
+    };
+    match pairs {
+        Ok(pairs) => match store.zrangestore(dst, pairs) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        },
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
 }

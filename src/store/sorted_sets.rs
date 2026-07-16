@@ -832,6 +832,43 @@ impl Store {
         self.write_computed_zset(dst, result)
     }
 
+    /// ZMPOP/BZMPOP core: pop up to `count` MIN- or MAX-scored members from the
+    /// first non-empty sorted set among `keys`. Returns the popped key and the
+    /// (member, score) pairs, or None when every key is missing/empty. WRONGTYPE
+    /// propagates from the first non-zset key scanned.
+    #[allow(clippy::type_complexity)]
+    pub fn zmpop(
+        &self,
+        keys: &[&[u8]],
+        pop_min: bool,
+        count: usize,
+        now: Instant,
+    ) -> Result<Option<(Vec<u8>, Vec<(String, f64)>)>, String> {
+        for key in keys {
+            self.try_promote(key, now);
+            let popped = if pop_min {
+                self.zpopmin(key, count, now)
+            } else {
+                self.zpopmax(key, count, now)
+            };
+            match popped {
+                Ok(items) if !items.is_empty() => return Ok(Some((key.to_vec(), items))),
+                Ok(_) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// ZRANGESTORE: store already-resolved (member, score) pairs into `dst` as a
+    /// sorted set, replacing any prior value. Reuses `write_computed_zset`, which
+    /// self-logs a keyed DEL+ZADD so a sharded WAL replays it on dst's own shard
+    /// (the raw command reads a src key that may live on another shard).
+    pub fn zrangestore(&self, dst: &[u8], pairs: Vec<(String, f64)>) -> Result<i64, String> {
+        let map: HashMap<String, f64> = pairs.into_iter().collect();
+        self.write_computed_zset(dst, map)
+    }
+
     pub fn zinterstore(
         &self,
         dst: &[u8],

@@ -54,6 +54,12 @@ pub enum CmdResult {
         count: usize,
         timeout: std::time::Duration,
     },
+    BlockZMPop {
+        keys: Vec<String>,
+        pop_min: bool,
+        count: usize,
+        timeout: std::time::Duration,
+    },
     BlockMove {
         src: String,
         dst: String,
@@ -727,6 +733,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 4,
     },
     CommandSpec {
+        name: b"ZRANGESTORE",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"BZMPOP",
+        min_arity: 4,
+    },
+    CommandSpec {
         name: b"ZINCRBY",
         min_arity: 4,
     },
@@ -1110,6 +1124,7 @@ pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"BLMPOP")
         || cmd_eq(cmd, b"BZPOPMIN")
         || cmd_eq(cmd, b"BZPOPMAX")
+        || cmd_eq(cmd, b"BZMPOP")
 }
 
 #[inline(always)]
@@ -1626,6 +1641,9 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"BZPOPMIN") || cmd_eq(cmd, b"BZPOPMAX") {
                 return sorted_sets::cmd_bzpopmin(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"BZMPOP") {
+                return sorted_sets::cmd_bzmpop(args, store, out, now);
             }
             if cmd_eq(cmd, b"BITCOUNT") {
                 return bitops::cmd_bitcount(args, store, out, now);
@@ -2312,6 +2330,9 @@ pub fn execute(
             if cmd_eq(cmd, b"ZRANGE") {
                 return sorted_sets::cmd_zrange(args, store, out, now);
             }
+            if cmd_eq(cmd, b"ZRANGESTORE") {
+                return sorted_sets::cmd_zrangestore(args, store, out, now);
+            }
             if cmd_eq(cmd, b"ZREVRANGE") {
                 return sorted_sets::cmd_zrevrange(args, store, out, now);
             }
@@ -2452,6 +2473,11 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
     // shards self-log their resolved single-key effects to the correct shard(s),
     // so they must not be raw-logged here (which would replay out of order).
     if cmd_eq(cmd, b"ZUNIONSTORE") || cmd_eq(cmd, b"ZINTERSTORE") || cmd_eq(cmd, b"ZDIFFSTORE") {
+        return true;
+    }
+    // ZRANGESTORE writes dst but reads a src key that may live on another WAL
+    // shard; it self-logs the resolved DEL+ZADD keyed on dst.
+    if cmd_eq(cmd, b"ZRANGESTORE") {
         return true;
     }
     if cmd_eq(cmd, b"SUNIONSTORE") || cmd_eq(cmd, b"SINTERSTORE") || cmd_eq(cmd, b"SDIFFSTORE") {

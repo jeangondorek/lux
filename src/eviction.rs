@@ -258,6 +258,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"ZUNIONSTORE")
         || eq(cmd, b"ZINTERSTORE")
         || eq(cmd, b"ZDIFFSTORE")
+        || eq(cmd, b"ZRANGESTORE")
         || eq(cmd, b"GEOADD")
         || eq(cmd, b"GEOSEARCHSTORE")
         || eq(cmd, b"GEORADIUS")
