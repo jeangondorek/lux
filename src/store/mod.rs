@@ -63,6 +63,107 @@ pub struct ConsumerGroup {
     pub pel: BTreeMap<StreamId, PendingEntry>,
 }
 
+/// BITFIELD overflow handling for SET/INCRBY (default WRAP).
+#[derive(Clone, Copy)]
+pub enum BitfieldOverflow {
+    Wrap,
+    Sat,
+    Fail,
+}
+
+/// A single BITFIELD/BITFIELD_RO sub-operation. `bits` is the field width,
+/// `signed` selects i<bits> vs u<bits>, `offset` is an absolute bit offset.
+pub enum BitfieldOp {
+    Get {
+        signed: bool,
+        bits: u32,
+        offset: u64,
+    },
+    Set {
+        signed: bool,
+        bits: u32,
+        offset: u64,
+        value: i64,
+        overflow: BitfieldOverflow,
+    },
+    IncrBy {
+        signed: bool,
+        bits: u32,
+        offset: u64,
+        incr: i64,
+        overflow: BitfieldOverflow,
+    },
+}
+
+/// Read `bits` bits at `offset` from the bitmap, MSB-first, interpreting the
+/// field as signed (two's complement, sign-extended) or unsigned. Bits past the
+/// end of `buf` read as zero.
+fn bf_read(buf: &[u8], offset: u64, bits: u32, signed: bool) -> i64 {
+    let mut val: u64 = 0;
+    for i in 0..bits as u64 {
+        let bit_index = offset + i;
+        let byte_index = (bit_index / 8) as usize;
+        let shift = 7 - (bit_index % 8);
+        let bit = if byte_index < buf.len() {
+            (buf[byte_index] >> shift) & 1
+        } else {
+            0
+        };
+        val = (val << 1) | bit as u64;
+    }
+    if signed && bits < 64 && (val >> (bits - 1)) & 1 == 1 {
+        (val | (!0u64 << bits)) as i64
+    } else {
+        val as i64
+    }
+}
+
+/// Write the low `bits` bits of `value` at `offset`, MSB-first, growing `buf` to
+/// fit the highest touched byte.
+fn bf_write(buf: &mut Vec<u8>, offset: u64, bits: u32, value: u64) {
+    let end_bit = offset + bits as u64;
+    let needed = end_bit.div_ceil(8) as usize;
+    if buf.len() < needed {
+        buf.resize(needed, 0);
+    }
+    for i in 0..bits as u64 {
+        let bit_index = offset + i;
+        let byte_index = (bit_index / 8) as usize;
+        let shift = 7 - (bit_index % 8);
+        let bit = ((value >> (bits as u64 - 1 - i)) & 1) as u8;
+        if bit == 1 {
+            buf[byte_index] |= 1 << shift;
+        } else {
+            buf[byte_index] &= !(1 << shift);
+        }
+    }
+}
+
+/// Apply BITFIELD overflow semantics to a candidate value for a signed/unsigned
+/// field of `bits` width. Returns None only for FAIL-on-overflow.
+fn bf_clamp(signed: bool, bits: u32, val: i128, mode: BitfieldOverflow) -> Option<i64> {
+    let (min, max): (i128, i128) = if signed {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1i128 << bits) - 1)
+    };
+    if val >= min && val <= max {
+        return Some(val as i64);
+    }
+    match mode {
+        BitfieldOverflow::Fail => None,
+        BitfieldOverflow::Sat => Some(if val < min { min as i64 } else { max as i64 }),
+        BitfieldOverflow::Wrap => {
+            let range = 1i128 << bits;
+            let mut w = val.rem_euclid(range);
+            if signed && w > max {
+                w -= range;
+            }
+            Some(w as i64)
+        }
+    }
+}
+
 pub struct StreamData {
     pub entries: BTreeMap<StreamId, Vec<(String, Bytes)>>,
     pub last_id: StreamId,
@@ -3970,6 +4071,116 @@ impl Store {
             },
             _ => Ok(0),
         }
+    }
+
+    /// BITFIELD/BITFIELD_RO: apply a batch of GET/SET/INCRBY operations against
+    /// the key's bitmap atomically (all under one shard lock). Returns one result
+    /// per op in order (None where an OVERFLOW FAIL suppressed a SET/INCRBY).
+    pub fn bitfield(
+        &self,
+        key: &[u8],
+        ops: &[BitfieldOp],
+        now: Instant,
+    ) -> Result<Vec<Option<i64>>, String> {
+        let has_write = ops.iter().any(|o| !matches!(o, BitfieldOp::Get { .. }));
+        let idx = self.shard_index(key);
+
+        if !has_write {
+            let shard = self.shards[idx].read();
+            let buf: Vec<u8> = match shard.data.get(key) {
+                Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
+                    Some(s) => s.to_vec(),
+                    None => return Err(WRONGTYPE.to_string()),
+                },
+                _ => Vec::new(),
+            };
+            let mut results = Vec::with_capacity(ops.len());
+            for op in ops {
+                if let BitfieldOp::Get {
+                    signed,
+                    bits,
+                    offset,
+                } = op
+                {
+                    results.push(Some(bf_read(&buf, *offset, *bits, *signed)));
+                }
+            }
+            return Ok(results);
+        }
+
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        let ks = key_bytes(key);
+        let existed = shard.data.contains_key(&ks);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::Str(Bytes::new()),
+            expires_at: None,
+            lru_clock: self.lru_clock(),
+        });
+        if !existed {
+            self.key_added();
+        }
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::Str(Bytes::new());
+            entry.expires_at = None;
+        }
+        let mut buf = match entry.value.string_bytes() {
+            Some(s) => s.to_vec(),
+            None => return Err(WRONGTYPE.to_string()),
+        };
+        let old_len = buf.len();
+        let mut results = Vec::with_capacity(ops.len());
+        for op in ops {
+            match op {
+                BitfieldOp::Get {
+                    signed,
+                    bits,
+                    offset,
+                } => results.push(Some(bf_read(&buf, *offset, *bits, *signed))),
+                BitfieldOp::Set {
+                    signed,
+                    bits,
+                    offset,
+                    value,
+                    overflow,
+                } => {
+                    let old = bf_read(&buf, *offset, *bits, *signed);
+                    match bf_clamp(*signed, *bits, *value as i128, *overflow) {
+                        Some(v) => {
+                            bf_write(&mut buf, *offset, *bits, v as u64);
+                            results.push(Some(old));
+                        }
+                        None => results.push(None),
+                    }
+                }
+                BitfieldOp::IncrBy {
+                    signed,
+                    bits,
+                    offset,
+                    incr,
+                    overflow,
+                } => {
+                    let old = bf_read(&buf, *offset, *bits, *signed);
+                    let new = old as i128 + *incr as i128;
+                    match bf_clamp(*signed, *bits, new, *overflow) {
+                        Some(v) => {
+                            bf_write(&mut buf, *offset, *bits, v as u64);
+                            results.push(Some(v));
+                        }
+                        None => results.push(None),
+                    }
+                }
+            }
+        }
+        let new_len = buf.len();
+        entry.value = StoreValue::StrBuf(buf);
+        if new_len > old_len {
+            let added = new_len - old_len;
+            let _ = entry;
+            shard.used_memory += added;
+            self.mem_add(added);
+        }
+        Ok(results)
     }
 
     pub fn bitcount(

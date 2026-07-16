@@ -112,7 +112,6 @@ Current partial/stub surfaces:
 
 Current missing Redis OSS/core command groups:
 
-- Bitmaps: `BITFIELD`, `BITFIELD_RO`.
 - Hash field TTL/value helpers: `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`,
   `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST`,
   `HGETEX`, `HGETDEL`.

@@ -1013,6 +1013,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 4,
     },
     CommandSpec {
+        name: b"BITFIELD",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"BITFIELD_RO",
+        min_arity: 2,
+    },
+    CommandSpec {
         name: b"KSUB",
         min_arity: 2,
     },
@@ -1653,6 +1661,12 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"BITOP") {
                 return bitops::cmd_bitop(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"BITFIELD") {
+                return bitops::cmd_bitfield(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"BITFIELD_RO") {
+                return bitops::cmd_bitfield_ro(args, store, out, now);
             }
         }
         b'C' => {
