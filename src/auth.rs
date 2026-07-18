@@ -186,6 +186,12 @@ pub(crate) fn is_reserved_auth_table(table: &str) -> bool {
     table.starts_with("auth.")
 }
 
+/// Reserved system scopes managed by the engine (auth + push). Client `T*`/raw-KV
+/// access is blocked and sensitive columns are redacted on operator reads.
+pub(crate) fn is_reserved_system_table(table: &str) -> bool {
+    table.starts_with("auth.") || table.starts_with("push.")
+}
+
 pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Option<String> {
     if store
         .wal_suppress
@@ -206,7 +212,7 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
     }
     .and_then(|raw| std::str::from_utf8(raw).ok())?;
 
-    if is_reserved_auth_table(table) {
+    if is_reserved_system_table(table) {
         Some(reserved_table_error(table))
     } else {
         None
@@ -214,7 +220,7 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
 }
 
 pub(crate) fn reserved_table_access_error(table: &str) -> Option<String> {
-    if is_reserved_auth_table(table) {
+    if is_reserved_system_table(table) {
         Some(reserved_table_error(table))
     } else {
         None
@@ -249,8 +255,8 @@ pub(crate) fn reserved_key_mutation_error(args: &[&[u8]], store: &Store) -> Opti
     }
     for raw in &args[1..] {
         if let Ok(k) = std::str::from_utf8(raw) {
-            if k.starts_with("_t:auth.") {
-                return Some("ERR access to Lux Auth internal keys is not permitted".to_string());
+            if k.starts_with("_t:auth.") || k.starts_with("_t:push.") {
+                return Some("ERR access to Lux internal keys is not permitted".to_string());
             }
         }
     }
@@ -273,7 +279,7 @@ pub(crate) fn reserved_plan_access_error(plan: &SelectPlan) -> Option<String> {
 }
 
 pub(crate) fn redact_auth_table_row(table: &str, row: &mut [(String, String)]) {
-    if !is_reserved_auth_table(table) {
+    if !is_reserved_system_table(table) {
         return;
     }
     if table == SETTINGS_TABLE {
@@ -319,15 +325,20 @@ fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
         SIGNING_KEYS_TABLE => &["private_key_encrypted"],
         PROVIDERS_TABLE => &["client_secret"],
         FLOW_TOKENS_TABLE => &["token_hash"],
+        "push.devices" => &["token"],
+        "push.credentials" => &["apns_p8_pem", "vapid_private"],
+        "push.outbox" => &["target_token"],
         _ => &[],
     }
 }
 
 fn reserved_table_error(table: &str) -> String {
-    format!(
-        "ERR table '{}' is managed by Lux Auth; use /auth/v1 APIs",
-        table
-    )
+    let scope = if table.starts_with("push.") {
+        "Lux Push"
+    } else {
+        "Lux Auth"
+    };
+    format!("ERR table '{table}' is managed by {scope}; use its API")
 }
 
 pub(crate) fn bootstrap(
@@ -2561,7 +2572,7 @@ fn admin_revoke_key(
     }
 }
 
-fn create_table_if_missing(
+pub(crate) fn create_table_if_missing(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -2574,7 +2585,7 @@ fn create_table_if_missing(
     }
 }
 
-fn durable_table_insert(
+pub(crate) fn durable_table_insert(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -2590,7 +2601,7 @@ fn durable_table_insert(
     tables::table_insert(store, cache, table, field_values, now)
 }
 
-fn durable_table_update_where(
+pub(crate) fn durable_table_update_where(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -2615,7 +2626,7 @@ fn durable_table_update_where(
     tables::table_update_where(store, cache, table, field_values, where_args, now)
 }
 
-fn durable_table_delete_where(
+pub(crate) fn durable_table_delete_where(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -4290,7 +4301,7 @@ fn app_metadata_with_provider(existing: Option<&str>, provider: &str) -> String 
     value.to_string()
 }
 
-fn find_row_by_field(
+pub(crate) fn find_row_by_field(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -5152,7 +5163,7 @@ fn random_token(bytes: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
-fn random_id(prefix: &str) -> String {
+pub(crate) fn random_id(prefix: &str) -> String {
     format!("{prefix}_{}", random_token(18))
 }
 
@@ -5160,7 +5171,7 @@ fn key_prefix(key: &str) -> String {
     key.chars().take(12).collect()
 }
 
-fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

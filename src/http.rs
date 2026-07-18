@@ -2628,6 +2628,16 @@ fn route_request_with_auth(
         // ── exec (escape hatch) ──
         ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache, script_engine)),
 
+        // ── push routes (lux push) ──
+        ("POST", ["push", "devices"]) => push_register(body, store, cache, auth),
+        ("GET", ["push", "devices"]) => push_list_devices(params, store, cache, auth),
+        ("DELETE", ["push", "devices", id]) => push_delete_device(id, store, cache, auth),
+        ("POST", ["push", "send"]) => push_send(body, store, cache),
+        ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
+        ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
+        ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
+        ("GET", ["push", "vapid"]) => push_vapid_public(params, store, cache),
+
         // ── KV routes ──
         ("GET", ["kv", key]) => ok(exec_json(
             store,
@@ -3002,11 +3012,262 @@ fn route_requires_operator(method: &str, base: &[&str]) -> bool {
             | ("GET", ["vectors", ..])
             | ("POST", ["vectors", ..])
             | ("DELETE", ["vectors", _])
+            | ("POST", ["push", "send"])
+            | ("POST", ["push", "credentials"])
+            | ("GET", ["push", "admin", "devices"])
+            | ("GET", ["push", "admin", "outbox"])
     )
 }
 
 fn ok(result: String) -> (u16, &'static str, String) {
     (200, "OK", result)
+}
+
+// ── Push handlers (lux push) ──
+
+fn push_json_error(
+    status: u16,
+    status_text: &'static str,
+    msg: &str,
+) -> (u16, &'static str, String) {
+    (
+        status,
+        status_text,
+        format!(
+            r#"{{"error":{}}}"#,
+            serde_json::Value::String(msg.to_string())
+        ),
+    )
+}
+
+/// `POST /v1/push/devices` — register a device token under a subject id.
+/// A **secret key / operator** caller supplies `subject_id` explicitly (this is
+/// the Supabase-auth-style path: your server registers on the user's behalf).
+/// A **user JWT** caller omits it; the subject is taken from `auth.uid()`.
+fn push_register(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let token = parsed["token"].as_str().unwrap_or("");
+    if token.is_empty() {
+        return push_json_error(400, "Bad Request", "token is required");
+    }
+    let subject_id = match auth {
+        HttpAuthContext::User(principal) => principal.user_id.clone(),
+        HttpAuthContext::Operator => {
+            let s = parsed["subject_id"].as_str().unwrap_or("");
+            if s.is_empty() {
+                return push_json_error(
+                    400,
+                    "Bad Request",
+                    "subject_id is required for secret-key registration",
+                );
+            }
+            s.to_string()
+        }
+        HttpAuthContext::Anonymous => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    let platform = parsed["platform"].as_str().unwrap_or("ios");
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    match crate::push::register_device(
+        store,
+        cache,
+        &subject_id,
+        token,
+        platform,
+        app_id,
+        Instant::now(),
+    ) {
+        Ok(id) => ok(format!(r#"{{"id":{}}}"#, serde_json::Value::String(id))),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/devices` — list devices. A user JWT lists its own; an operator
+/// lists a given `?subject_id=`.
+fn push_list_devices(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let subject_id = match auth {
+        HttpAuthContext::User(principal) => principal.user_id.clone(),
+        HttpAuthContext::Operator => {
+            let s = get_param(params, "subject_id").unwrap_or("");
+            if s.is_empty() {
+                return push_json_error(400, "Bad Request", "subject_id query param is required");
+            }
+            s.to_string()
+        }
+        HttpAuthContext::Anonymous => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    match crate::push::list_devices(store, cache, &subject_id, Instant::now()) {
+        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `DELETE /v1/push/devices/:id` — remove a device. A user JWT removes its own;
+/// an operator removes by id regardless of subject.
+fn push_delete_device(
+    id: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let result = match auth {
+        HttpAuthContext::User(principal) => {
+            crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now())
+        }
+        HttpAuthContext::Operator => {
+            crate::push::delete_device_by_id(store, cache, id, Instant::now())
+        }
+        HttpAuthContext::Anonymous => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    match result {
+        Ok(deleted) => ok(json!({ "deleted": deleted }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `POST /v1/push/send` (operator) — fan a notification out to a subject's
+/// devices, or to many subjects at once via `subject_ids`.
+fn push_send(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let notification = parsed
+        .get("notification")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let now = Instant::now();
+    let result = if let Some(arr) = parsed.get("subject_ids").and_then(|v| v.as_array()) {
+        let ids: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        crate::push::enqueue_send_many(store, cache, &ids, &notification, now)
+    } else if let Some(subject_id) = parsed["subject_id"].as_str().filter(|s| !s.is_empty()) {
+        crate::push::enqueue_send(store, cache, subject_id, &notification, now)
+    } else {
+        return push_json_error(400, "Bad Request", "subject_id or subject_ids is required");
+    };
+    match result {
+        Ok(n) => ok(json!({ "enqueued": n }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/devices` (operator) — every device in the project.
+fn push_admin_devices(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    match crate::push::list_all_devices(store, cache, Instant::now()) {
+        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/outbox` (operator) — dead-lettered deliveries.
+fn push_admin_outbox(store: &Arc<Store>, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    match crate::push::list_dead_letters(store, cache, Instant::now()) {
+        Ok(dead) => ok(json!({ "dead_letters": dead }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `POST /v1/push/credentials` (operator) — set an app's APNs credentials.
+fn push_set_credentials(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let now = Instant::now();
+
+    // VAPID (Web Push) credentials, distinguished by the presence of the key.
+    if let Some(vapid_private) = parsed["vapid_private"].as_str().filter(|s| !s.is_empty()) {
+        let vapid_public = parsed["vapid_public"].as_str().unwrap_or("");
+        let subject = parsed["vapid_subject"].as_str().unwrap_or("");
+        if vapid_public.is_empty() {
+            return push_json_error(400, "Bad Request", "vapid_public is required");
+        }
+        return match crate::push::set_vapid_credentials(
+            store,
+            cache,
+            app_id,
+            vapid_public,
+            vapid_private,
+            subject,
+            now,
+        ) {
+            Ok(()) => ok(json!({ "ok": true }).to_string()),
+            Err(e) => push_json_error(400, "Bad Request", &e),
+        };
+    }
+
+    // APNs credentials.
+    let team_id = parsed["team_id"].as_str().unwrap_or("");
+    let key_id = parsed["key_id"].as_str().unwrap_or("");
+    let p8_pem = parsed["p8_pem"].as_str().unwrap_or("");
+    let topic = parsed["topic"].as_str().unwrap_or("");
+    let environment = parsed["environment"].as_str().unwrap_or("sandbox");
+    if team_id.is_empty() || key_id.is_empty() || p8_pem.is_empty() || topic.is_empty() {
+        return push_json_error(
+            400,
+            "Bad Request",
+            "team_id, key_id, p8_pem, and topic are required",
+        );
+    }
+    match crate::push::set_apns_credentials(
+        store,
+        cache,
+        app_id,
+        team_id,
+        key_id,
+        p8_pem,
+        topic,
+        environment,
+        now,
+    ) {
+        Ok(()) => ok(json!({ "ok": true }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/vapid` (public) — the VAPID public key a browser needs to
+/// subscribe. Safe to expose; it's a public key.
+fn push_vapid_public(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::vapid_public_key(store, cache, app_id, Instant::now()) {
+        Ok(Some(key)) => ok(json!({ "public_key": key }).to_string()),
+        Ok(None) => push_json_error(404, "Not Found", "web push is not configured"),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
 }
 
 // ── Table handlers ──

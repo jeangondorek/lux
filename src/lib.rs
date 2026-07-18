@@ -22,6 +22,7 @@ mod http;
 mod jsonb;
 mod lua;
 mod pubsub;
+mod push;
 mod resp;
 mod shard_exec;
 mod snapshot;
@@ -3055,6 +3056,10 @@ impl Runtime {
                 ));
             }
         }
+        // lux push tables are created lazily on first use (see push::ensure_tables),
+        // so a project that never uses push carries no push.* tables. On restart,
+        // the `push.*` TCREATE/TINSERT commands are restored from the WAL like any
+        // other write, so no eager bootstrap is needed here.
         runtime
             .store
             .wal_suppress
@@ -3122,6 +3127,15 @@ impl Runtime {
             }
         }
 
+        // One-time migration of any pre-`push.*` data (PR1 stored it under
+        // `auth.*`). Runs post-replay with WAL logging on; a no-op when there is
+        // no legacy data. Best-effort: a failure here must not block startup.
+        if let Err(e) =
+            push::migrate_from_auth_scope(&runtime.store, &runtime.schema_cache, Instant::now())
+        {
+            eprintln!("push scope migration skipped: {e}");
+        }
+
         background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
 
         {
@@ -3155,6 +3169,15 @@ impl Runtime {
                     }
                 }
             });
+        }
+
+        // lux push delivery worker: drains the durable `push.outbox` and delivers
+        // to APNs/etc. Runs unconditionally — push is a standalone scope and does
+        // not depend on Lux auth.
+        {
+            let store = runtime.store.clone();
+            let cache = runtime.schema_cache.clone();
+            background_tasks.spawn(push::worker::run_delivery_worker(store, cache));
         }
 
         if runtime.config.storage.mode == StorageMode::Tiered {
