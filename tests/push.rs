@@ -375,6 +375,167 @@ fn credential_change_rebuilds_cached_sink() {
     );
 }
 
+#[test]
+fn unregister_by_token_and_admin_stats() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &mock.url());
+    let (token, uid) = anon_login(http_port);
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"tok-xyz","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(s, 200, "register: {b}");
+
+    // Admin stats endpoint (operator) reports the live device count.
+    let (s, stats) = http(
+        http_port,
+        "GET",
+        "/v1/push/admin/stats",
+        "",
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "stats: {stats}");
+    assert!(
+        stats["devices"].as_i64().unwrap_or(0) >= 1,
+        "stats: {stats}"
+    );
+
+    // Unregister by token (operator) removes the device.
+    let (s, b) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"tok-xyz"}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "delete: {b}");
+    assert_eq!(b["deleted"], true);
+
+    // The subject now has no devices, so a send enqueues to zero.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id": uid, "notification": {"title":"x","body":"y"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+    assert_eq!(b["enqueued"], 0);
+}
+
+#[test]
+fn delete_by_token_edge_cases() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &mock.url());
+    let (token, uid) = anon_login(http_port);
+    for t in ["keep-tok", "drop-tok"] {
+        let (s, b) = http(
+            http_port,
+            "POST",
+            "/v1/push/devices",
+            &json!({"token": t, "platform":"ios", "app_id":"default"}).to_string(),
+            Some(&token),
+        );
+        assert_eq!(s, 200, "register {t}: {b}");
+    }
+
+    // Missing token -> 400.
+    let (s, _) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        "{}",
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 400);
+
+    // Unknown token -> 200 with deleted:false (idempotent, not an error).
+    let (s, b) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"never-registered"}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["deleted"], false);
+
+    // Deleting one token leaves the other device intact (scoped to the token).
+    let (s, b) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"drop-tok"}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["deleted"], true);
+
+    let (s, list) = http(
+        http_port,
+        "GET",
+        &format!("/v1/push/devices?subject_id={uid}"),
+        "",
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "{list}");
+    let devices = list["devices"].as_array().expect("devices array");
+    assert_eq!(
+        devices.len(),
+        1,
+        "only the un-deleted device remains: {list}"
+    );
+}
+
+#[test]
+fn push_admin_routes_require_operator() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start(dir.path(), resp_port, http_port, false);
+    set_creds(http_port, &mock.url());
+    let (token, _uid) = anon_login(http_port);
+
+    // A signed-in user (non-operator) must not delete-by-token or read stats.
+    let (s, _) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"x"}).to_string(),
+        Some(&token),
+    );
+    assert!(s == 401 || s == 403, "user delete-by-token denied, got {s}");
+    let (s, _) = http(http_port, "GET", "/v1/push/admin/stats", "", Some(&token));
+    assert!(s == 401 || s == 403, "user stats read denied, got {s}");
+
+    // No auth at all is denied too.
+    let (s, _) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"x"}).to_string(),
+        None,
+    );
+    assert!(
+        s == 401 || s == 403,
+        "unauth delete-by-token denied, got {s}"
+    );
+}
+
 fn anon_login(http_port: u16) -> (String, String) {
     let (s, sess) = http(http_port, "POST", "/auth/v1/signin/anonymous", "{}", None);
     assert_eq!(s, 200, "anon signin: {sess}");
