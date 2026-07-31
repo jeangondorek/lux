@@ -208,6 +208,11 @@ enum Commands {
         #[command(subcommand)]
         action: EncAction,
     },
+    /// Configure auth (OAuth sign-in providers).
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Generate TypeScript types from your project schema.
     Types {
         #[arg(help = "Project name or ID (omit for the local engine)")]
@@ -222,6 +227,108 @@ enum Commands {
         out: Option<String>,
         #[arg(long, help = "Print to stdout instead of writing a file")]
         stdout: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Configure an OAuth sign-in provider on the engine.
+    Provider {
+        #[command(subcommand)]
+        action: AuthProviderAction,
+    },
+}
+
+/// How to reach the target engine's admin API. Defaults to the local
+/// `lux start` engine; pass --url/--password for any other self-hosted engine.
+#[derive(clap::Args)]
+struct EngineConn {
+    #[arg(
+        long,
+        env = "LUX_ENGINE_URL",
+        value_name = "URL",
+        help = "Engine HTTP base URL (default: local engine)"
+    )]
+    url: Option<String>,
+    #[arg(
+        short = 'a',
+        long,
+        env = "LUX_ENGINE_PASSWORD",
+        help = "Operator password / secret key (default: local engine's)"
+    )]
+    password: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum AuthProviderAction {
+    /// Sign in with Apple. Upload your .p8 once; Lux mints + rotates the client
+    /// secret from it, so there is no expiring secret to manage.
+    Apple {
+        #[arg(long, help = "Apple Team ID (web sign-in)")]
+        team_id: Option<String>,
+        #[arg(long, help = "Key ID of your .p8 (web sign-in)")]
+        key_id: Option<String>,
+        #[arg(long, help = "Services ID = web OAuth client ID (web sign-in)")]
+        services_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "BUNDLE_ID",
+            help = "App Bundle ID for native sign-in (repeatable)"
+        )]
+        bundle_id: Vec<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Path to your AuthKey_*.p8 (web sign-in)"
+        )]
+        p8: Option<PathBuf>,
+        #[arg(long, help = "OAuth scopes (default: name email)")]
+        scopes: Option<String>,
+        #[arg(long, help = "Save the config but leave the provider disabled")]
+        disable: bool,
+        #[command(flatten)]
+        conn: EngineConn,
+    },
+    /// Google OAuth sign-in.
+    Google {
+        #[arg(long)]
+        client_id: String,
+        #[arg(
+            long,
+            help = "Required for initial setup; omit later to keep the stored secret"
+        )]
+        client_secret: Option<String>,
+        #[arg(long, help = "Override the callback URL (default: engine callback)")]
+        redirect_uri: Option<String>,
+        #[arg(long)]
+        scopes: Option<String>,
+        #[arg(long, help = "Save the config but leave the provider disabled")]
+        disable: bool,
+        #[command(flatten)]
+        conn: EngineConn,
+    },
+    /// GitHub OAuth sign-in.
+    Github {
+        #[arg(long)]
+        client_id: String,
+        #[arg(
+            long,
+            help = "Required for initial setup; omit later to keep the stored secret"
+        )]
+        client_secret: Option<String>,
+        #[arg(long, help = "Override the callback URL (default: engine callback)")]
+        redirect_uri: Option<String>,
+        #[arg(long)]
+        scopes: Option<String>,
+        #[arg(long, help = "Save the config but leave the provider disabled")]
+        disable: bool,
+        #[command(flatten)]
+        conn: EngineConn,
+    },
+    /// List configured providers (secrets are never returned).
+    List {
+        #[command(flatten)]
+        conn: EngineConn,
     },
 }
 
@@ -2113,6 +2220,280 @@ fn require_project_arg(project: Option<&str>) -> String {
         })
 }
 
+/// Resolve the target engine's HTTP base URL + operator password. Defaults to
+/// the local `lux start` engine; --url/--password reach any self-hosted engine.
+fn resolve_engine(conn: &EngineConn) -> (String, String) {
+    if let Some(url) = &conn.url {
+        let parsed = reqwest::Url::parse(url).unwrap_or_else(|_| {
+            eprintln!("{}", "--url must be a valid HTTP or HTTPS URL".red());
+            std::process::exit(1);
+        });
+        let local_http = parsed.scheme() == "http"
+            && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        if parsed.scheme() != "https" && !local_http {
+            eprintln!(
+                "{}",
+                "Remote provider configuration requires HTTPS; plain HTTP is allowed only for localhost."
+                    .red()
+            );
+            std::process::exit(1);
+        }
+        let Some(password) = conn.password.clone() else {
+            eprintln!("{}", "--password is required with --url".red());
+            std::process::exit(1);
+        };
+        (url.trim_end_matches('/').to_string(), password)
+    } else {
+        let Some(state) = load_local_state() else {
+            eprintln!(
+                "{}",
+                "No local engine found. Run `lux start` first, or pass --url/--password.".red()
+            );
+            std::process::exit(1);
+        };
+        (state.lux_url(), state.password)
+    }
+}
+
+struct AppleProviderPayload {
+    team_id: Option<String>,
+    key_id: Option<String>,
+    services_id: Option<String>,
+    bundle_ids: Vec<String>,
+    private_key: Option<String>,
+    scopes: Option<String>,
+    disable: bool,
+}
+
+fn apple_provider_payload(base: &str, config: AppleProviderPayload) -> serde_json::Value {
+    let configures_web = config.team_id.is_some()
+        || config.key_id.is_some()
+        || config.services_id.is_some()
+        || config.private_key.is_some();
+    let mut body = serde_json::Map::new();
+    body.insert("enabled".into(), serde_json::json!(!config.disable));
+    if configures_web {
+        body.insert(
+            "redirect_uri".into(),
+            serde_json::json!(format!("{base}/auth/v1/callback/apple")),
+        );
+    }
+    if let Some(scopes) = config.scopes {
+        body.insert("scopes".into(), serde_json::json!(scopes));
+    }
+    if let Some(team_id) = config.team_id {
+        body.insert("apple_team_id".into(), serde_json::json!(team_id));
+    }
+    if let Some(key_id) = config.key_id {
+        body.insert("apple_key_id".into(), serde_json::json!(key_id));
+    }
+    if let Some(services_id) = config.services_id {
+        body.insert("apple_services_id".into(), serde_json::json!(services_id));
+    }
+    if !config.bundle_ids.is_empty() {
+        body.insert(
+            "apple_bundle_ids".into(),
+            serde_json::json!(config.bundle_ids.join(",")),
+        );
+    }
+    if let Some(private_key) = config.private_key {
+        body.insert("apple_private_key".into(), serde_json::json!(private_key));
+    }
+    serde_json::Value::Object(body)
+}
+
+async fn handle_auth(action: AuthAction) {
+    match action {
+        AuthAction::Provider { action } => handle_auth_provider(action).await,
+    }
+}
+
+async fn handle_auth_provider(action: AuthProviderAction) {
+    match action {
+        AuthProviderAction::List { conn } => {
+            let (base, password) = resolve_engine(&conn);
+            let res = reqwest::Client::new()
+                .get(format!("{base}/auth/v1/admin/providers"))
+                .bearer_auth(&password)
+                .send()
+                .await;
+            match res {
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        print_provider_error(status.as_u16(), &text);
+                    }
+                    let providers = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("providers").and_then(|p| p.as_array()).cloned())
+                        .unwrap_or_default();
+                    if providers.is_empty() {
+                        println!("No providers configured.");
+                    }
+                    for p in providers {
+                        let name = p.get("provider").and_then(|x| x.as_str()).unwrap_or("?");
+                        let enabled = p.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+                        let status = if enabled {
+                            "enabled".green()
+                        } else {
+                            "disabled".dimmed()
+                        };
+                        println!("  {name:<8} {status}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", "Error:".red());
+                    std::process::exit(1);
+                }
+            }
+        }
+        AuthProviderAction::Apple {
+            team_id,
+            key_id,
+            services_id,
+            bundle_id,
+            p8,
+            scopes,
+            disable,
+            conn,
+        } => {
+            let (base, password) = resolve_engine(&conn);
+            let configures_web =
+                team_id.is_some() || key_id.is_some() || services_id.is_some() || p8.is_some();
+            if configures_web && !base.starts_with("https://") {
+                eprintln!(
+                    "{}",
+                    "Apple web sign-in requires an HTTPS engine URL with a public domain. Pass --url or set LUX_ENGINE_URL."
+                        .red()
+                );
+                std::process::exit(1);
+            }
+            // Omitting apple_private_key on update keeps the stored key.
+            let private_key = p8.map(|path| {
+                std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    eprintln!("{} {}: {e}", "Failed to read .p8:".red(), path.display());
+                    std::process::exit(1);
+                })
+            });
+            let body = apple_provider_payload(
+                &base,
+                AppleProviderPayload {
+                    team_id,
+                    key_id,
+                    services_id,
+                    bundle_ids: bundle_id,
+                    private_key,
+                    scopes,
+                    disable,
+                },
+            );
+            put_provider(&base, &password, "apple", body).await;
+        }
+        AuthProviderAction::Google {
+            client_id,
+            client_secret,
+            redirect_uri,
+            scopes,
+            disable,
+            conn,
+        } => {
+            put_oauth(
+                &conn,
+                "google",
+                client_id,
+                client_secret,
+                redirect_uri,
+                scopes,
+                disable,
+            )
+            .await
+        }
+        AuthProviderAction::Github {
+            client_id,
+            client_secret,
+            redirect_uri,
+            scopes,
+            disable,
+            conn,
+        } => {
+            put_oauth(
+                &conn,
+                "github",
+                client_id,
+                client_secret,
+                redirect_uri,
+                scopes,
+                disable,
+            )
+            .await
+        }
+    }
+}
+
+async fn put_oauth(
+    conn: &EngineConn,
+    provider: &str,
+    client_id: String,
+    client_secret: Option<String>,
+    redirect_uri: Option<String>,
+    scopes: Option<String>,
+    disable: bool,
+) {
+    let (base, password) = resolve_engine(conn);
+    let redirect = redirect_uri.unwrap_or_else(|| format!("{base}/auth/v1/callback/{provider}"));
+    let mut body = serde_json::Map::new();
+    body.insert("enabled".into(), serde_json::json!(!disable));
+    body.insert("client_id".into(), serde_json::json!(client_id));
+    if let Some(client_secret) = client_secret {
+        body.insert("client_secret".into(), serde_json::json!(client_secret));
+    }
+    body.insert("redirect_uri".into(), serde_json::json!(redirect));
+    if let Some(scopes) = scopes {
+        body.insert("scopes".into(), serde_json::json!(scopes));
+    }
+    put_provider(&base, &password, provider, serde_json::Value::Object(body)).await;
+}
+
+async fn put_provider(base: &str, password: &str, provider: &str, body: serde_json::Value) {
+    let callback = body
+        .get("redirect_uri")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let res = reqwest::Client::new()
+        .put(format!("{base}/auth/v1/admin/providers/{provider}"))
+        .bearer_auth(password)
+        .json(&body)
+        .send()
+        .await;
+    match res {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                print_provider_error(status.as_u16(), &text);
+            }
+            println!("{} {provider} provider configured", "\u{2713}".green());
+            if let Some(callback) = callback {
+                println!("  callback URL: {callback}");
+            }
+        }
+        Err(e) => {
+            eprintln!("{} {e}", "Error:".red());
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_provider_error(status: u16, text: &str) -> ! {
+    let message = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| format!("HTTP {status}"));
+    eprintln!("{} {message}", "Error:".red());
+    std::process::exit(1);
+}
+
 fn get_client(api_url_override: &Option<String>) -> (reqwest::Client, String, String) {
     let config = load_config().unwrap_or_else(|| {
         eprintln!("{}", "Not logged in. Run `lux login` first.".red());
@@ -3510,6 +3891,10 @@ pub async fn run() {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::Auth { action } => {
+            handle_auth(action).await;
         }
 
         Commands::Logs { project, lines } => {
@@ -6435,6 +6820,135 @@ fn legacy_fnv1a_hash(content: &str) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_apple_provider_options() {
+        let cli = Cli::try_parse_from([
+            "lux",
+            "auth",
+            "provider",
+            "apple",
+            "--bundle-id",
+            "com.example.ios",
+            "--services-id",
+            "com.example.web",
+            "--team-id",
+            "TEAM123456",
+            "--key-id",
+            "KEY1234567",
+            "--p8",
+            "AuthKey.p8",
+            "--url",
+            "https://db.example.com",
+            "--password",
+            "operator-secret",
+        ])
+        .expect("Apple provider command parses");
+
+        let Commands::Auth {
+            action:
+                AuthAction::Provider {
+                    action:
+                        AuthProviderAction::Apple {
+                            team_id,
+                            key_id,
+                            services_id,
+                            bundle_id,
+                            p8,
+                            conn,
+                            ..
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("expected Apple provider command");
+        };
+        assert_eq!(team_id.as_deref(), Some("TEAM123456"));
+        assert_eq!(key_id.as_deref(), Some("KEY1234567"));
+        assert_eq!(services_id.as_deref(), Some("com.example.web"));
+        assert_eq!(bundle_id, vec!["com.example.ios"]);
+        assert_eq!(p8, Some(PathBuf::from("AuthKey.p8")));
+        assert_eq!(conn.url.as_deref(), Some("https://db.example.com"));
+        assert_eq!(conn.password.as_deref(), Some("operator-secret"));
+    }
+
+    #[test]
+    fn provider_secret_is_optional_for_google_updates() {
+        let cli = Cli::try_parse_from([
+            "lux",
+            "auth",
+            "provider",
+            "google",
+            "--client-id",
+            "google-client",
+        ])
+        .expect("Google provider update parses without re-entering the secret");
+
+        let Commands::Auth {
+            action:
+                AuthAction::Provider {
+                    action:
+                        AuthProviderAction::Google {
+                            client_id,
+                            client_secret,
+                            ..
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("expected Google provider command");
+        };
+        assert_eq!(client_id, "google-client");
+        assert_eq!(client_secret, None);
+    }
+
+    #[test]
+    fn builds_native_and_web_apple_provider_payloads() {
+        let native = apple_provider_payload(
+            "http://localhost:5890",
+            AppleProviderPayload {
+                team_id: None,
+                key_id: None,
+                services_id: None,
+                bundle_ids: vec!["com.example.ios".into(), "com.example.macos".into()],
+                private_key: None,
+                scopes: None,
+                disable: false,
+            },
+        );
+        assert_eq!(
+            native,
+            serde_json::json!({
+                "enabled": true,
+                "apple_bundle_ids": "com.example.ios,com.example.macos"
+            })
+        );
+
+        let web = apple_provider_payload(
+            "https://db.example.com",
+            AppleProviderPayload {
+                team_id: Some("TEAM123456".into()),
+                key_id: Some("KEY1234567".into()),
+                services_id: Some("com.example.web".into()),
+                bundle_ids: Vec::new(),
+                private_key: Some("private-key".into()),
+                scopes: Some("name email".into()),
+                disable: true,
+            },
+        );
+        assert_eq!(
+            web,
+            serde_json::json!({
+                "enabled": false,
+                "redirect_uri": "https://db.example.com/auth/v1/callback/apple",
+                "scopes": "name email",
+                "apple_team_id": "TEAM123456",
+                "apple_key_id": "KEY1234567",
+                "apple_services_id": "com.example.web",
+                "apple_private_key": "private-key"
+            })
+        );
+    }
 
     #[test]
     fn resp_array_strips_index_prefixes() {
