@@ -1842,7 +1842,9 @@ impl Store {
             return Err("ERR corrupt encrypted vector payload".to_string());
         }
         Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     }
@@ -2816,6 +2818,21 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         if let Some(entry) = shard.data.get_mut(key) {
+            if !entry.is_expired_at(now) {
+                entry.expires_at = Some(now + Duration::from_secs(seconds));
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn expire_on_shard(
+        data: &mut ShardData,
+        key: &[u8],
+        seconds: u64,
+        now: Instant,
+    ) -> bool {
+        if let Some(entry) = data.get_mut(key) {
             if !entry.is_expired_at(now) {
                 entry.expires_at = Some(now + Duration::from_secs(seconds));
                 return true;

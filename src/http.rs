@@ -259,22 +259,33 @@ async fn handle_request(
         ""
     };
 
-    let auth_context = match crate::auth::resolve_credential(
+    let credential = match crate::auth::resolve_credential(
         presented,
         user_token,
         crate::auth::Surface::Http,
         store,
         cache,
     ) {
-        Ok(crate::auth::Credential::Operator) => HttpAuthContext::Operator,
-        Ok(crate::auth::Credential::Secret) => HttpAuthContext::Secret,
-        Ok(crate::auth::Credential::Publishable) => HttpAuthContext::Publishable,
-        Ok(crate::auth::Credential::User(principal)) => HttpAuthContext::User(principal),
-        Ok(crate::auth::Credential::Anonymous) => HttpAuthContext::Anonymous,
+        Ok(credential) => credential,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
             return send_json(socket, 401, "Unauthorized", &body).await;
         }
+    };
+    let live_user_credential = if path == "/live" {
+        match &credential {
+            crate::auth::Credential::User(credential) => Some((**credential).clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let auth_context = match credential {
+        crate::auth::Credential::Operator => HttpAuthContext::Operator,
+        crate::auth::Credential::Secret => HttpAuthContext::Secret,
+        crate::auth::Credential::Publishable => HttpAuthContext::Publishable,
+        crate::auth::Credential::User(credential) => HttpAuthContext::User(credential.principal),
+        crate::auth::Credential::Anonymous => HttpAuthContext::Anonymous,
     };
 
     // An engine is credential-gated once it has either a password or project
@@ -302,11 +313,11 @@ async fn handle_request(
         return handle_live_upgrade(
             socket,
             &headers,
-            &params,
             store.clone(),
             broker.clone(),
             cache.clone(),
             live_auth_principal(&auth_context),
+            live_user_credential,
         )
         .await;
     }
@@ -1165,11 +1176,11 @@ fn live_broker_event_from_message(message: &crate::pubsub::Message) -> Option<Li
 async fn handle_live_upgrade(
     socket: &mut tokio::net::TcpStream,
     headers: &[(String, String)],
-    _params: &[(String, String)],
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
     principal: Option<crate::auth::AuthPrincipal>,
+    user_credential: Option<crate::auth::UserCredential>,
 ) -> std::io::Result<bool> {
     let Some(key) = header_value(headers, "sec-websocket-key") else {
         return send_json(
@@ -1191,7 +1202,7 @@ async fn handle_live_upgrade(
     socket.write_all(response.as_bytes()).await?;
 
     let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-    run_live_socket(ws, store, broker, cache, principal).await?;
+    run_live_socket(ws, store, broker, cache, principal, user_credential).await?;
     Ok(false)
 }
 
@@ -1201,6 +1212,7 @@ async fn run_live_socket<S>(
     broker: Broker,
     cache: SharedSchemaCache,
     principal: Option<crate::auth::AuthPrincipal>,
+    user_credential: Option<crate::auth::UserCredential>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1208,6 +1220,10 @@ where
     let mut subscriptions: HashMap<String, LiveSubscription> = HashMap::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Session revocation is bounded to one second. This remains separate from
+    // the 1 ms event-drain timer so expensive state checks never run per event.
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -1239,6 +1255,15 @@ where
             _ = tick.tick() => {
                 drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
                 drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
+            }
+            _ = auth_tick.tick(), if user_credential.is_some() => {
+                if let Some(credential) = user_credential.as_ref() {
+                    if crate::auth::revalidate_user_credential(credential, &store, &cache).is_err() {
+                        send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}})).await?;
+                        let _ = ws.send(WsMessage::Close(None)).await;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1428,16 +1453,28 @@ async fn build_live_subscription(
             live_table_dependencies(&table_spec)
         };
         let receivers = key_tables
-            .into_iter()
+            .iter()
             .flat_map(|table| {
                 [
-                    broker.ksubscribe(&table),
+                    broker.ksubscribe(table),
                     broker.ksubscribe(&format!("_t:{table}:row:*")),
                 ]
             })
             .collect();
         let delta_rx = ivm.then(|| broker.subscribe_row_deltas(&table_spec.table));
-        let rows = fetch_live_table_rows(store, cache, &table_spec)?;
+        let rows = match fetch_live_table_rows(store, cache, &table_spec) {
+            Ok(rows) => rows,
+            Err(error) => {
+                rollback_live_table_receivers(
+                    broker,
+                    receivers,
+                    delta_rx,
+                    &key_tables,
+                    &table_spec.table,
+                );
+                return Err(error);
+            }
+        };
         let query = json!({"type":"table","table":table_spec.table});
         let state = LiveQueryState {
             query: query.clone(),
@@ -1622,27 +1659,42 @@ fn stop_live_subscription(
         LiveSubscription::Key { pattern, .. } => broker.kunsub(&pattern),
         LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
         LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
-        LiveSubscription::Table { spec, delta_rx, .. } => {
-            // Drop this receiver first so the row-delta channel's receiver_count
-            // reflects reality when unsubscribe decides whether to reclaim it.
-            let was_ivm = delta_rx.is_some();
-            drop(delta_rx);
+        LiveSubscription::Table {
+            spec,
+            receivers,
+            delta_rx,
+            ..
+        } => {
             // Mirror the subscribe set: IVM subs watch only auth-dependency tables
             // via key-events (plus their own row-delta channel); others watch all.
-            let key_tables = if was_ivm {
+            let key_tables = if delta_rx.is_some() {
                 spec.auth_dependencies.clone()
             } else {
                 live_table_dependencies(&spec)
             };
-            for table in key_tables {
-                broker.kunsub(&table);
-                broker.kunsub(&format!("_t:{table}:row:*"));
-            }
-            if was_ivm {
-                broker.unsubscribe_row_deltas(&spec.table);
-            }
+            rollback_live_table_receivers(broker, receivers, delta_rx, &key_tables, &spec.table);
         }
         LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
+    }
+}
+
+fn rollback_live_table_receivers(
+    broker: &Broker,
+    receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+    delta_rx: Option<broadcast::Receiver<crate::pubsub::RowDelta>>,
+    key_tables: &[String],
+    table: &str,
+) {
+    // Broker bookkeeping relies on receiver_count, so release each receiver first.
+    drop(receivers);
+    for key_table in key_tables {
+        broker.kunsub(key_table);
+        broker.kunsub(&format!("_t:{key_table}:row:*"));
+    }
+    let has_row_deltas = delta_rx.is_some();
+    drop(delta_rx);
+    if has_row_deltas {
+        broker.unsubscribe_row_deltas(table);
     }
 }
 
@@ -3176,12 +3228,6 @@ fn execute_migration_command(
     cache: &SharedSchemaCache,
     script_engine: &Arc<lua::ScriptEngine>,
 ) -> Result<(), String> {
-    if command
-        .first()
-        .is_some_and(|value| value.eq_ignore_ascii_case("LUX"))
-    {
-        return Err("nested LUX commands are not allowed in migrations".to_string());
-    }
     let args: Vec<&str> = command.iter().map(String::as_str).collect();
     let response =
         exec_resp(store, broker, cache, script_engine, &args).map_err(|error| error.to_string())?;
@@ -4878,6 +4924,32 @@ mod tests {
     use super::*;
     use crate::tables::JoinType;
 
+    #[tokio::test]
+    async fn failed_ivm_live_snapshot_reclaims_receivers() {
+        let (store, broker, cache) = membership_fixture();
+        let principal = match user_ctx("alice") {
+            HttpAuthContext::User(principal) => principal,
+            _ => unreachable!(),
+        };
+
+        let result = build_live_subscription(
+            // This is IVM-eligible and has an auth dependency, so setup allocates
+            // both key receivers for `members` and a typed delta receiver for
+            // `messages` before the malformed filter fails during the snapshot.
+            &json!({"kind":"table","table":"messages","select":"id","where":[{"field":"id","op":">>","value":1}]}),
+            &broker,
+            &store,
+            &cache,
+            Some(&principal),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(broker.key_event_loop_started());
+        assert!(!broker.has_key_subs());
+        assert!(!broker.has_any_row_delta_subs());
+    }
+
     #[test]
     fn json_columns_emit_raw_str_columns_quoted() {
         let rows = vec![vec![
@@ -5232,6 +5304,26 @@ mod tests {
         assert_eq!(status, 200, "{response}");
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["already_applied"], true);
+    }
+
+    #[test]
+    fn migration_http_rejects_unsuitable_commands_before_any_statement_runs() {
+        let (store, broker, cache, script_engine) = encrypted_http_fixture();
+        let body = json!({
+            "filename": "002_rejected.lux",
+            "body": "SET denied value; SUBSCRIBE events;"
+        })
+        .to_string();
+
+        let (status, _, response) = migration_apply(&body, &store, &broker, &cache, &script_engine);
+        assert_eq!(status, 400, "{response}");
+        assert!(response.contains("SUBSCRIBE"), "{response}");
+        assert!(store.get(b"denied", Instant::now()).is_none());
+        assert!(
+            crate::migrations::list(&store, &cache, 100, 0, Instant::now())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
