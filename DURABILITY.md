@@ -11,7 +11,7 @@ envelope and operators can test recovery procedures.
 Lux persists state through:
 
 - `lux.dat`: point-in-time snapshot of the in-memory database.
-- Per-shard WAL files: command log replayed after the snapshot.
+- One ordered mutation journal: committed effects replayed after the snapshot.
 - Tiered storage files: cold entries evicted from memory when tiered mode is
   enabled.
 
@@ -22,9 +22,10 @@ Storage layout and durability are independent:
 - `tiered` adds disk-backed cold storage. Its WAL remains in the tiered storage
   directory so existing deployments keep their current recovery files.
 
-Persistent startup loads the snapshot, replays valid WAL frames, and rebuilds
-tiered indexes as needed. Lux refuses to start when a layout change would hide
-known WAL or tiered shard state.
+Persistent startup loads the snapshot, replays valid legacy per-shard WAL files
+from pre-1.0 versions, then replays the ordered journal and rebuilds tiered
+indexes as needed. New writes use only the ordered journal. Lux refuses to start
+when a layout change would hide known journal or tiered shard state.
 
 ## Durability Policies
 
@@ -34,29 +35,47 @@ known WAL or tiered shard state.
   by default. The interval can be lowered to 1 ms.
 - `always_sync` appends and synchronizes before applying each mutation.
 
-`every_second` is the default for both the standalone binary and
+`always_sync` is the default for both the standalone binary and
 `ServerConfig`. `LUX_STORAGE_MODE` never changes the durability policy.
 `INFO`, `GET /v1`, and `GET /v1/version` report the effective layout, policy,
 sync interval, and whether the journal is enabled.
 
-## Default Data-Loss Envelope
+## Acknowledgement Guarantee
 
-By default, Lux fsyncs WAL data on an interval comparable to Redis
-`appendfsync everysec`.
+By default, Lux appends and synchronizes each journal frame before applying the
+mutation or acknowledging success. Once a client receives a successful reply,
+that mutation must recover after a process crash, operating-system crash, or
+power loss, subject to the persistence guarantees provided by the filesystem
+and storage hardware.
 
-Expected power-loss behavior:
+`every_second` is an explicit performance tradeoff comparable to Redis
+`appendfsync everysec`. Under that policy:
 
 - Successfully fsynced WAL frames must recover.
 - Writes acknowledged after the last fsync may be lost on sudden power failure.
-- The default maximum expected power-loss window is approximately one second of
-  writes.
+- The maximum expected power-loss window is approximately the configured sync
+  interval (1,000 ms unless changed).
+- A failed periodic fsync emits a critical runtime error, increments the
+  `persistence_err_wal_fsync` counter, and fences subsequent mutations until
+  restart. The configured loss bound cannot be promised for writes accepted
+  since the last successful sync when the storage device fails.
 - `ServerHandle::shutdown_and_wait` flushes pending WAL data before returning.
 
 Process crash behavior:
 
 - Valid WAL frames before the crash must replay.
 - Partial WAL frames at the end of a file must be ignored safely.
-- Corrupt WAL frames must be skipped or rejected without panicking.
+- A single logical mutation whose resolved recovery form contains multiple
+  commands is stored in one checksummed frame, so a torn frame replays every
+  effect or none of them. This applies to commands such as cross-key moves and
+  replacements; it does not make a `MULTI`/`EXEC` queue one crash-atomic
+  mutation.
+- Any complete WAL frame with a corrupt boundary marker, length guard,
+  checksum, argument encoding, or batch encoding rejects startup. Lux never
+  skips a complete damaged mutation and continues with a partial history.
+- Only an incomplete final LXW3 frame is treated as an uncommitted append and
+  ignored. Truncation inside a legacy WAL is rejected because the older formats
+  cannot prove that the suffix was never acknowledged.
 
 ## Snapshots
 
@@ -64,8 +83,8 @@ Snapshots are complete point-in-time images of the logical database.
 
 Snapshot behavior:
 
-- Manual `SAVE` writes a consistent snapshot and truncates WAL only after the
-  snapshot succeeds.
+- Manual `SAVE` writes a consistent snapshot and rotates WAL generations only
+  after the snapshot succeeds.
 - `BGSAVE` currently uses the same synchronous save path as `SAVE`; it does not
   yet provide Redis-compatible background execution.
 - Snapshot files use a binary format with explicit type tags and length fields.
@@ -74,6 +93,9 @@ Snapshot behavior:
 - Snapshot loading must never turn malformed input into a process panic or OOM.
 - Key TTLs are stored as absolute deadlines so remaining time is honored across
   restarts rather than rebased to load time.
+- Each snapshot records the generation and exact included offset of every WAL
+  stream. Recovery skips that prefix if an old generation survived a crash, or
+  replays the complete replacement generation after a successful rotation.
 
 ## WAL Replay
 
@@ -85,11 +107,14 @@ so replay is deterministic and reproduces exactly the state clients observed.
 Replay behavior:
 
 - All write commands that mutate durable state are WAL logged.
+- New writes share one journal order across shards and command surfaces.
 - Logged commands carry resolved values, so replaying them never regenerates a
   different primary key, timestamp, or default.
 - Table writes log their own resolved command from the table layer (so HTTP
   table writes, which bypass the RESP command path, are still durable).
-- Transaction replay preserves the committed command sequence.
+- `MULTI`/`EXEC` commands cross individual durability boundaries in queue order.
+  A complete `EXEC` response means every successful queued mutation is durable;
+  a crash before that response may recover a completed prefix.
 - Commands denied by restricted mode or the script sandbox never execute, so
   they create no replay gaps.
 
@@ -113,20 +138,26 @@ content.
   persistence or event-loop hazards.
 
 Known limitation: a script's effects are logged per write, not as one atomic
-batch. A crash in the middle of a multi-write script can leave the earlier
-writes durable and the later ones lost. The effects that survive are always
-individually correct; the script is not all-or-nothing across a crash boundary.
+batch. A crash before the script response can recover a completed prefix. Once
+the client receives a successful script response, every effect is durable. The
+effects that recover are individually correct; the script is not all-or-nothing
+across a crash boundary.
 
 ## Restore
 
 Restore behavior:
 
-- Restore accepts any valid Lux snapshot header (current and older versions).
+- Restore fully validates Lux snapshots in the current and older binary formats
+  before committing them for installation.
 - Restore writes a new `lux.dat` snapshot atomically.
-- Restore purges only Lux-owned `shard_*` storage directories, never the whole
-  storage parent or unrelated files.
+- A durable restore marker makes startup finish snapshot installation and stale
+  persistence cleanup before opening any WAL or tiered shard after a crash.
+- Restore purges only Lux-owned legacy `shard_*` and current `global` journal or
+  tiered-storage directories, never the storage parent or unrelated files.
 - After restore, stale WAL or cold tiered data must not overwrite restored
   state on restart.
+- Once a restore is accepted, writes and snapshots are rejected until the
+  process restarts into the restored state.
 - Operators should restart the process after restore so startup rebuilds state
   from the restored snapshot.
 
@@ -137,7 +168,12 @@ Tiered mode expectations:
 - Cold entries must be included in snapshots.
 - Cold entries must survive restart.
 - Mutations to cold entries must be WAL logged.
-- Tiered data corruption must not crash startup.
+- Tiered files are a live placement cache, not an independent durability
+  authority. Persistent startup discards this derived cache before the verified
+  snapshot plus WAL reconstruct the logical database, preventing cached values
+  from being applied twice or carrying process-relative TTLs across restart.
+  Corruption encountered by a running command is an explicit error and fences
+  later mutations until restart.
 - Rebuilt tiered indexes must describe only valid entries.
 
 ## Failure Modes That Must Be Bounded

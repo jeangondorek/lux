@@ -15,7 +15,7 @@ pub(crate) struct ShardPipelineCommand<'argv, 'data> {
 #[derive(Debug)]
 pub(crate) enum ShardExecutionError {
     Command(String),
-    Eviction(&'static str),
+    Eviction(String),
     Wal(String),
 }
 
@@ -53,8 +53,7 @@ impl ShardExecutor {
         {
             self.execute_write_batch(shard_idx, commands, out, now)
         } else {
-            self.execute_read_batch(shard_idx, commands, out, now);
-            Ok(())
+            self.execute_read_batch(shard_idx, commands, out, now)
         }
     }
 
@@ -70,26 +69,7 @@ impl ShardExecutor {
         if access.contains(&PipelineAccess::Write) {
             self.execute_argv_write_batch(shard_idx, commands, access, out, now)
         } else {
-            self.execute_argv_read_batch(shard_idx, commands, out, now);
-            Ok(())
-        }
-    }
-
-    pub(crate) fn apply_mset_batches<'data>(
-        &self,
-        pairs_by_shard: Vec<Vec<(&'data [u8], &'data [u8])>>,
-        now: Instant,
-    ) {
-        for (shard_idx, pairs) in pairs_by_shard.into_iter().enumerate() {
-            if pairs.is_empty() {
-                continue;
-            }
-            let mut shard = self.store.lock_write_shard(shard_idx);
-            shard.version += 1;
-            for (key, value) in pairs {
-                self.store
-                    .set_on_shard(&mut shard.data, key, value, None, now);
-            }
+            self.execute_argv_read_batch(shard_idx, commands, out, now)
         }
     }
 
@@ -104,21 +84,16 @@ impl ShardExecutor {
         let tiered = self.store.is_tiered();
         let wal_enabled = self.store.wal_enabled();
         let mut wal_commands: Vec<&[&[u8]]> = Vec::new();
-        let bare_set_batch = commands
-            .iter()
-            .all(|command| command.args.len() == 3 && command.args[0].eq_ignore_ascii_case(b"SET"));
-
         for command in commands {
             let args = command.args;
             if tiered {
-                self.store.try_promote(args[1], now);
+                self.store
+                    .try_promote(args[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
-            if bare_set_batch || crate::eviction::is_write_command(args[0]) {
-                if !bare_set_batch {
-                    if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store)
-                    {
-                        return Err(ShardExecutionError::Command(err));
-                    }
+            if crate::eviction::is_write_command(args[0]) {
+                if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store) {
+                    return Err(ShardExecutionError::Command(err));
                 }
                 if eviction_enabled {
                     crate::eviction::evict_if_needed(&self.store)
@@ -130,28 +105,10 @@ impl ShardExecutor {
             }
         }
 
-        if wal_enabled {
-            self.store
-                .wal_log_command_batch(&wal_commands)
-                .map_err(|err| ShardExecutionError::Wal(err.to_string()))?;
-        }
-        {
-            let mut shard = self.store.lock_write_shard(shard_idx);
-            shard.version += 1;
-            if bare_set_batch {
-                out.reserve(commands.len() * crate::resp::OK.len());
-                let mut stats = crate::store::StoreBatchStats::default();
-                for command in commands {
-                    self.store.set_on_shard_batched(
-                        &mut shard.data,
-                        command.args[1],
-                        command.args[2],
-                        &mut stats,
-                    );
-                    crate::resp::write_ok(out);
-                }
-                self.store.apply_batch_stats(stats);
-            } else {
+        self.store
+            .commit_journaled_batch(&wal_commands, || {
+                let mut shard = self.store.lock_write_shard(shard_idx);
+                shard.version += 1;
                 for command in commands {
                     cmd::execute_on_shard(
                         &mut shard,
@@ -162,8 +119,8 @@ impl ShardExecutor {
                         now,
                     );
                 }
-            }
-        }
+            })
+            .map_err(|err| ShardExecutionError::Wal(err.to_string()))?;
 
         if self.broker.has_key_subs() {
             for command in commands {
@@ -189,22 +146,16 @@ impl ShardExecutor {
         let tiered = self.store.is_tiered();
         let wal_enabled = self.store.wal_enabled();
         let mut wal_commands: Vec<&[&[u8]]> = Vec::new();
-        let bare_set_batch = commands.iter().all(|command| {
-            let args = command.argv();
-            args.len() == 3 && args[0].eq_ignore_ascii_case(b"SET")
-        });
-
         for command in commands {
             let args = command.argv();
             if tiered {
-                self.store.try_promote(args[1], now);
+                self.store
+                    .try_promote(args[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
-            if bare_set_batch || crate::eviction::is_write_command(args[0]) {
-                if !bare_set_batch {
-                    if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store)
-                    {
-                        return Err(ShardExecutionError::Command(err));
-                    }
+            if crate::eviction::is_write_command(args[0]) {
+                if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store) {
+                    return Err(ShardExecutionError::Command(err));
                 }
                 if eviction_enabled {
                     crate::eviction::evict_if_needed(&self.store)
@@ -216,25 +167,10 @@ impl ShardExecutor {
             }
         }
 
-        if wal_enabled {
-            self.store
-                .wal_log_command_batch(&wal_commands)
-                .map_err(|err| ShardExecutionError::Wal(err.to_string()))?;
-        }
-        {
-            let mut shard = self.store.lock_write_shard(shard_idx);
-            shard.version += 1;
-            if bare_set_batch {
-                out.reserve(commands.len() * crate::resp::OK.len());
-                let mut stats = crate::store::StoreBatchStats::default();
-                for command in commands {
-                    let args = command.argv();
-                    self.store
-                        .set_on_shard_batched(&mut shard.data, args[1], args[2], &mut stats);
-                    crate::resp::write_ok(out);
-                }
-                self.store.apply_batch_stats(stats);
-            } else {
+        self.store
+            .commit_journaled_batch(&wal_commands, || {
+                let mut shard = self.store.lock_write_shard(shard_idx);
+                shard.version += 1;
                 for command in commands {
                     cmd::execute_on_shard(
                         &mut shard,
@@ -245,8 +181,8 @@ impl ShardExecutor {
                         now,
                     );
                 }
-            }
-        }
+            })
+            .map_err(|err| ShardExecutionError::Wal(err.to_string()))?;
 
         if self.broker.has_key_subs() {
             for (command, access) in commands.iter().zip(access) {
@@ -266,10 +202,12 @@ impl ShardExecutor {
         commands: &[ShardPipelineCommand<'argv, 'data>],
         out: &mut BytesMut,
         now: Instant,
-    ) {
+    ) -> Result<(), ShardExecutionError> {
         if self.store.is_tiered() {
             for command in commands {
-                self.store.try_promote(command.args[1], now);
+                self.store
+                    .try_promote(command.args[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
         }
         let shard = self.store.lock_read_shard(shard_idx);
@@ -287,10 +225,11 @@ impl ShardExecutor {
                     self.store
                         .get_kv_and_write_from_shard(&shard.data, command.args[1], now, out);
                 } else {
-                    cmd::execute_on_shard_read(&shard.data, command.args, out, now);
+                    cmd::execute_on_shard_read(&shard.data, &self.store, command.args, out, now);
                 }
             }
         }
+        Ok(())
     }
 
     fn execute_argv_read_batch<A: ArgvSlice>(
@@ -299,10 +238,12 @@ impl ShardExecutor {
         commands: &[A],
         out: &mut BytesMut,
         now: Instant,
-    ) {
+    ) -> Result<(), ShardExecutionError> {
         if self.store.is_tiered() {
             for command in commands {
-                self.store.try_promote(command.argv()[1], now);
+                self.store
+                    .try_promote(command.argv()[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
         }
         let shard = self.store.lock_read_shard(shard_idx);
@@ -321,10 +262,11 @@ impl ShardExecutor {
                     self.store
                         .get_kv_and_write_from_shard(&shard.data, args[1], now, out);
                 } else {
-                    cmd::execute_on_shard_read(&shard.data, args, out, now);
+                    cmd::execute_on_shard_read(&shard.data, &self.store, args, out, now);
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -459,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_set_batch_updates_key_accounting_once_per_new_key() {
+    fn set_batch_updates_key_accounting_once_per_new_key() {
         let store = Arc::new(Store::new());
         let broker = Broker::new();
         let executor = ShardExecutor::new(store.clone(), broker);
@@ -489,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn argv_bare_set_batch_updates_key_accounting_once_per_new_key() {
+    fn argv_set_batch_updates_key_accounting_once_per_new_key() {
         let store = Arc::new(Store::new());
         let broker = Broker::new();
         let executor = ShardExecutor::new(store.clone(), broker);
@@ -509,27 +451,5 @@ mod tests {
         assert_eq!(&out[..], b"+OK\r\n+OK\r\n");
         assert_eq!(store.dbsize(now), 1);
         assert_eq!(store.get(b"k", now).unwrap().as_ref(), b"v2");
-    }
-
-    #[test]
-    fn mset_batches_apply_to_target_shards() {
-        let store = Arc::new(Store::new());
-        let broker = Broker::new();
-        let executor = ShardExecutor::new(store.clone(), broker);
-        let now = Instant::now();
-        let mut pairs_by_shard = vec![Vec::new(); store.shard_count()];
-        for (key, value) in [(b"a".as_slice(), b"one".as_slice()), (b"b", b"two")] {
-            let idx = store.shard_for_key(key);
-            pairs_by_shard[idx].push((key, value));
-        }
-
-        executor.apply_mset_batches(pairs_by_shard, now);
-
-        for (key, expected) in [(b"a".as_slice(), b"one".as_slice()), (b"b", b"two")] {
-            let idx = store.shard_for_key(key);
-            let shard = store.lock_read_shard(idx);
-            let actual = Store::get_from_shard(&shard.data, key, now).unwrap();
-            assert_eq!(actual.as_ref(), expected);
-        }
     }
 }

@@ -33,14 +33,14 @@ mod tables;
 
 use bytes::BytesMut;
 use cmd::CmdResult;
-use command::{Command, CommandKind, CommandOutput, PubSubCommand, SetOption};
+use command::{Command, CommandKind, CommandOutput, PubSubCommand};
 use pubsub::Broker;
 use resp::Parser;
 use shard_exec::{ShardExecutionError, ShardExecutor, ShardPipelineCommand};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use store::{Store, StreamId};
+use store::Store;
 use tables::SharedSchemaCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -334,18 +334,10 @@ pub enum ServerInfoEvent {
 
 /// Warning runtime events emitted through `ServerConfig::on_warn`.
 ///
-/// Warnings are conditions Lux recovered from, such as skipping corrupted
-/// persisted data or dropping a single failed client connection.
+/// Warnings are conditions Lux recovered from without rejecting startup or a
+/// database mutation.
 #[derive(Clone, Debug)]
 pub enum ServerWarnEvent {
-    /// One checksummed WAL frame failed CRC validation and was skipped.
-    WalCorruptedFrameSkipped {
-        shard: usize,
-        stored_crc: u32,
-        computed_crc: u32,
-    },
-    /// Summary count for corrupted WAL frames skipped during replay.
-    WalCorruptedFramesSkipped { shard: usize, frames: usize },
     /// One checksummed disk entry failed CRC validation during index rebuild.
     DiskCorruptedEntrySkipped { shard: usize, offset: u64 },
     /// One disk entry failed to deserialize during index rebuild.
@@ -379,6 +371,8 @@ pub enum ServerErrorEvent {
     WalTruncateFailed { error: String },
     /// Eviction-to-disk failed; the key remains in memory.
     DiskEvictionWriteFailed { key: String, error: String },
+    /// Promoting a cold key failed; the disk index retains the entry.
+    DiskPromotionReadFailed { key: String, error: String },
     /// Opportunistic compaction on the eviction path failed.
     InlineCompactionFailed { error: String },
     /// Background disk compaction failed.
@@ -523,7 +517,7 @@ fn absolute_config_path(raw: &str, field: &str) -> std::io::Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-fn has_shard_state(dir: &std::path::Path) -> std::io::Result<bool> {
+fn has_persistence_state(dir: &std::path::Path) -> std::io::Result<bool> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -531,12 +525,16 @@ fn has_shard_state(dir: &std::path::Path) -> std::io::Result<bool> {
     };
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_dir()
-            || !entry.file_name().to_string_lossy().starts_with("shard_")
-        {
+        if !entry.file_type()?.is_dir() {
             continue;
         }
-        if entry.path().join("wal.lux").exists() || entry.path().join("data.lux").exists() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_journal = name == "global" || name.starts_with("shard_");
+        let is_tiered_shard = name.starts_with("shard_");
+        if (is_journal && entry.path().join("wal.lux").exists())
+            || (is_tiered_shard && entry.path().join("data.lux").exists())
+        {
             return Ok(true);
         }
     }
@@ -617,13 +615,15 @@ fn resolve_and_validate_persistence(config: &mut ServerConfig) -> std::io::Resul
     let data_dir = std::path::Path::new(&config.data_dir);
     let memory_journal_dir = data_dir.join("journal");
     let conventional_tiered_dir = data_dir.join("storage");
-    if config.storage.mode == StorageMode::Memory && has_shard_state(&conventional_tiered_dir)? {
+    if config.storage.mode == StorageMode::Memory
+        && has_persistence_state(&conventional_tiered_dir)?
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "tiered shard state exists; refusing an implicit switch to memory layout",
         ));
     }
-    if config.storage.mode == StorageMode::Tiered && has_shard_state(&memory_journal_dir)? {
+    if config.storage.mode == StorageMode::Tiered && has_persistence_state(&memory_journal_dir)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "memory-layout journal state exists; refusing an implicit switch to tiered layout",
@@ -719,7 +719,6 @@ enum EmbeddedSubscriptionKind {
 struct Runtime {
     store: Arc<Store>,
     broker: Broker,
-    shard_executor: ShardExecutor,
     schema_cache: SharedSchemaCache,
     script_engine: Arc<lua::ScriptEngine>,
     config: Arc<ServerConfig>,
@@ -907,23 +906,6 @@ impl EmbeddedClient {
         let mut i = 0usize;
 
         while i < commands.len() {
-            if matches!(commands[i], Command::MSet { .. }) {
-                let mut batch_end = i + 1;
-                while batch_end < commands.len()
-                    && matches!(commands[batch_end], Command::MSet { .. })
-                {
-                    batch_end += 1;
-                }
-                let batch = &commands[i..batch_end];
-                self.execute_mset_pipeline_batch(batch, now)?;
-                if collect_outputs {
-                    outputs.extend((i..batch_end).map(|_| CommandOutput::Simple("OK")));
-                }
-                self.runtime.store.add_total_commands(batch.len());
-                i = batch_end;
-                continue;
-            }
-
             let Some((key, access)) = native_pipeline_access(&commands[i]) else {
                 if !collect_outputs {
                     if let Command::Publish { channel, message } = &commands[i] {
@@ -944,61 +926,37 @@ impl EmbeddedClient {
                 continue;
             };
 
+            // A typed write must cross its own command-layer journal boundary.
+            // Pre-journaling a whole native batch is unsafe because an earlier
+            // command can fail and prevent later commands from executing even
+            // though their frames are already durable. Read-only runs remain
+            // eligible for same-shard batching.
+            if access == NativePipelineAccess::Write {
+                let out = self.execute_command_output(commands[i].clone()).await?;
+                if collect_outputs {
+                    outputs.push(out);
+                }
+                i += 1;
+                continue;
+            }
+
             let shard_idx = self.runtime.store.shard_for_key(key);
-            let mut has_write = access == NativePipelineAccess::Write;
             let mut batch_end = i + 1;
             while batch_end < commands.len() {
                 let Some((next_key, next_access)) = native_pipeline_access(&commands[batch_end])
                 else {
                     break;
                 };
-                if self.runtime.store.shard_for_key(next_key) != shard_idx {
+                if next_access == NativePipelineAccess::Write
+                    || self.runtime.store.shard_for_key(next_key) != shard_idx
+                {
                     break;
                 }
-                has_write |= next_access == NativePipelineAccess::Write;
                 batch_end += 1;
             }
 
             let batch = &commands[i..batch_end];
-            let emit_key_events = self.runtime.broker.has_key_subs();
-            let mut write_argvs = Vec::new();
-            if has_write {
-                if emit_key_events {
-                    write_argvs.reserve(batch.len());
-                }
-                for command in batch {
-                    if command_is_fast_path_write(command) {
-                        ensure_write_allowed(&self.runtime.store)?;
-                        if emit_key_events {
-                            let argv = command.to_owned_argv();
-                            if !matches!(command, Command::XAdd { .. })
-                                && !typed_command_has_relative_ttl(command)
-                            {
-                                let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                                self.runtime
-                                    .store
-                                    .wal_log_command(&refs)
-                                    .map_err(wal_lux_error)?;
-                            }
-                            write_argvs.push(argv);
-                        } else if !matches!(command, Command::XAdd { .. })
-                            && !typed_command_has_relative_ttl(command)
-                        {
-                            wal_log_native_command(&self.runtime.store, command)?;
-                        }
-                    }
-                }
-
-                let mut shard = self.runtime.store.lock_write_shard(shard_idx);
-                shard.version += 1;
-                for command in batch {
-                    let output = self.execute_native_write_on_shard(command, &mut shard, now)?;
-                    wal_log_resolved_typed_ttl(&self.runtime.store, command, &output)?;
-                    if collect_outputs {
-                        outputs.push(output);
-                    }
-                }
-            } else if collect_outputs {
+            if collect_outputs {
                 let shard = self.runtime.store.lock_read_shard(shard_idx);
                 for command in batch {
                     outputs.push(self.execute_native_read_on_shard(command, &shard, now)?);
@@ -1010,60 +968,11 @@ impl EmbeddedClient {
             }
 
             self.runtime.store.add_total_commands(batch.len());
-            if emit_key_events {
-                for argv in &write_argvs {
-                    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                    fire_key_events(&self.runtime.broker, &refs);
-                }
-            }
 
             i = batch_end;
         }
 
         Ok(outputs)
-    }
-
-    fn execute_mset_pipeline_batch(
-        &self,
-        commands: &[Command<'_>],
-        now: Instant,
-    ) -> Result<(), LuxError> {
-        let emit_key_events = self.runtime.broker.has_key_subs();
-        let store = &self.runtime.store;
-        let mut pairs_by_shard: Vec<Vec<(&[u8], &[u8])>> = vec![Vec::new(); store.shard_count()];
-        let mut event_keys = Vec::new();
-
-        for command in commands {
-            ensure_write_allowed(store)?;
-            wal_log_native_command(store, command)?;
-            let Command::MSet { pairs } = command else {
-                return Err(LuxError::InvalidCommand(
-                    "MSET batch contained non-MSET command".to_string(),
-                ));
-            };
-            if emit_key_events {
-                event_keys.reserve(pairs.len());
-            }
-            for &(key, value) in pairs {
-                let idx = store.shard_for_key(key);
-                pairs_by_shard[idx].push((key, value));
-                if emit_key_events {
-                    event_keys.push(key);
-                }
-            }
-        }
-
-        self.runtime
-            .shard_executor
-            .apply_mset_batches(pairs_by_shard, now);
-
-        if emit_key_events {
-            for key in event_keys {
-                self.runtime.broker.enqueue_key_event(key, b"MSET");
-            }
-        }
-
-        Ok(())
     }
 
     fn execute_native_read_on_shard(
@@ -1073,25 +982,28 @@ impl EmbeddedClient {
         now: Instant,
     ) -> Result<CommandOutput, LuxError> {
         match command {
-            Command::Get { key } => Ok(optional_bulk_output(Store::get_from_shard(
-                &shard.data,
-                key,
-                now,
-            ))),
-            Command::StrLen { key } => Ok(CommandOutput::Int(Store::strlen_from_shard(
-                &shard.data,
-                key,
-                now,
-            ))),
+            Command::Get { key } => Ok(optional_bulk_output(
+                Store::get_from_shard(&shard.data, key, now)
+                    .map(|raw| self.runtime.store.decrypt_kv_string_value(key, raw))
+                    .transpose()
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::StrLen { key } => Ok(CommandOutput::Int(
+                Store::get_from_shard(&shard.data, key, now)
+                    .map(|raw| self.runtime.store.decrypt_kv_string_value(key, raw))
+                    .transpose()
+                    .map_err(LuxError::Command)?
+                    .map_or(0, |value| value.len() as i64),
+            )),
             Command::Exists { keys } if keys.len() == 1 => Ok(CommandOutput::Int(i64::from(
                 Store::exists_on_shard(&shard.data, keys[0], now),
             ))),
-            Command::HGet { key, field } => Ok(optional_bulk_output(Store::hget_from_shard(
-                &shard.data,
-                key,
-                field,
-                now,
-            ))),
+            Command::HGet { key, field } => Ok(optional_bulk_output(
+                Store::hget_from_shard(&shard.data, key, field, now)
+                    .map(|raw| self.runtime.store.decrypt_hash_field_value(key, field, raw))
+                    .transpose()
+                    .map_err(LuxError::Command)?,
+            )),
             Command::GeoPos { key, members } => {
                 geopos_output_from_shard(&shard.data, key, members, now)
             }
@@ -1102,296 +1014,6 @@ impl EmbeddedClient {
                 unit,
             } => geodist_output_from_shard(&shard.data, key, member_a, member_b, unit, now),
             _ => unreachable!("native pipeline read command was classified before dispatch"),
-        }
-    }
-
-    fn execute_native_write_on_shard(
-        &self,
-        command: &Command<'_>,
-        shard: &mut store::Shard,
-        now: Instant,
-    ) -> Result<CommandOutput, LuxError> {
-        match command {
-            Command::Get { key } => Ok(optional_bulk_output(Store::get_from_shard(
-                &shard.data,
-                key,
-                now,
-            ))),
-            Command::StrLen { key } => Ok(CommandOutput::Int(Store::strlen_from_shard(
-                &shard.data,
-                key,
-                now,
-            ))),
-            Command::Exists { keys } if keys.len() == 1 => Ok(CommandOutput::Int(i64::from(
-                Store::exists_on_shard(&shard.data, keys[0], now),
-            ))),
-            Command::HGet { key, field } => Ok(optional_bulk_output(Store::hget_from_shard(
-                &shard.data,
-                key,
-                field,
-                now,
-            ))),
-            Command::GeoPos { key, members } => {
-                geopos_output_from_shard(&shard.data, key, members, now)
-            }
-            Command::GeoDist {
-                key,
-                member_a,
-                member_b,
-                unit,
-            } => geodist_output_from_shard(&shard.data, key, member_a, member_b, unit, now),
-            Command::Set {
-                key,
-                value,
-                options,
-            } if can_fast_path_set(options) => {
-                validate_fast_path_set_ttl(options)?;
-                self.runtime
-                    .store
-                    .set_on_shard(&mut shard.data, key, value, set_ttl(options), now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Simple("OK"))
-            }
-            Command::GetSet { key, value } => {
-                let old = self
-                    .runtime
-                    .store
-                    .get_set_on_shard(&mut shard.data, key, value, now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(optional_bulk_output(old))
-            }
-            Command::SetNx { key, value } => {
-                let changed = self
-                    .runtime
-                    .store
-                    .set_nx_on_shard(&mut shard.data, key, value, now);
-                if changed {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(CommandOutput::Int(i64::from(changed)))
-            }
-            Command::SetEx {
-                key,
-                seconds,
-                value,
-            } => {
-                if *seconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'setex' command".to_string(),
-                    ));
-                }
-                self.runtime.store.set_on_shard(
-                    &mut shard.data,
-                    key,
-                    value,
-                    Some(Duration::from_secs(*seconds)),
-                    now,
-                );
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Simple("OK"))
-            }
-            Command::PSetEx {
-                key,
-                milliseconds,
-                value,
-            } => {
-                if *milliseconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'psetex' command".to_string(),
-                    ));
-                }
-                let millis = u64::try_from(*milliseconds).map_err(|_| {
-                    LuxError::Command("ERR value is not an integer or out of range".to_string())
-                })?;
-                self.runtime.store.set_on_shard(
-                    &mut shard.data,
-                    key,
-                    value,
-                    Some(Duration::from_millis(millis)),
-                    now,
-                );
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Simple("OK"))
-            }
-            Command::Expire { key, seconds } => Ok(CommandOutput::Int(i64::from(
-                Store::expire_on_shard(&mut shard.data, key, *seconds, now),
-            ))),
-            Command::Append { key, value } => {
-                let len = self.runtime.store.append_on_shard(shard, key, value, now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Int(len))
-            }
-            Command::Incr { key } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, 1, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::Decr { key } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, -1, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::IncrBy { key, increment } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, *increment, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::DecrBy { key, decrement } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, -*decrement, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => Ok(
-                CommandOutput::Int(self.runtime.store.del_on_shard(shard, keys[0], now)),
-            ),
-            Command::LPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .lpush_on_shard(shard, key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.store.remove_from_disk(key);
-                self.drain_list_waiters_on_shard(key, shard, now);
-                Ok(CommandOutput::Int(n))
-            }
-            Command::RPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .rpush_on_shard(shard, key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.store.remove_from_disk(key);
-                self.drain_list_waiters_on_shard(key, shard, now);
-                Ok(CommandOutput::Int(n))
-            }
-            Command::LPop { key } => {
-                let value = self.runtime.store.lpop_on_shard(shard, key, now);
-                if value.is_some() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(optional_bulk_output(value))
-            }
-            Command::RPop { key } => {
-                let value = self.runtime.store.rpop_on_shard(shard, key, now);
-                if value.is_some() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(optional_bulk_output(value))
-            }
-            Command::HSet { key, field, value } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hset_on_shard(shard, key, &[(*field, *value)], now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::HIncrBy {
-                key,
-                field,
-                increment,
-            } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hincrby_on_shard(shard, key, field, *increment, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::SAdd { key, members } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .sadd_on_shard(shard, key, members, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::SPop { key } => {
-                let mut values = self
-                    .runtime
-                    .store
-                    .spop_on_shard(shard, key, 1, now)
-                    .map_err(LuxError::Command)?;
-                if !values.is_empty() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(match values.pop() {
-                    Some(value) => CommandOutput::Bulk(bytes::Bytes::from(value)),
-                    None => CommandOutput::Nil,
-                })
-            }
-            Command::ZAdd { key, score, member } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .zadd_on_shard(
-                        shard,
-                        key,
-                        &[(*member, *score)],
-                        false,
-                        false,
-                        false,
-                        false,
-                        false,
-                        now,
-                    )
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::ZIncrBy {
-                key,
-                increment,
-                member,
-            } => Ok(score_output(
-                self.runtime
-                    .store
-                    .zincrby_on_shard(shard, key, member, *increment, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::GeoAdd { key, members } => {
-                if let [member] = members.as_slice() {
-                    crate::geo::validate_coords(member.longitude, member.latitude)
-                        .map_err(LuxError::Command)?;
-                    let scored = [(
-                        member.member,
-                        crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                    )];
-                    Ok(CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd_on_shard(
-                                shard, key, &scored, false, false, false, false, false, now,
-                            )
-                            .map_err(LuxError::Command)?,
-                    ))
-                } else {
-                    let mut scored = Vec::with_capacity(members.len());
-                    for member in members {
-                        crate::geo::validate_coords(member.longitude, member.latitude)
-                            .map_err(LuxError::Command)?;
-                        scored.push((
-                            member.member,
-                            crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                        ));
-                    }
-                    Ok(CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd_on_shard(
-                                shard, key, &scored, false, false, false, false, false, now,
-                            )
-                            .map_err(LuxError::Command)?,
-                    ))
-                }
-            }
-            Command::XAdd { key, id, fields } => {
-                require_xadd_fields(fields)?;
-                let id = self
-                    .runtime
-                    .store
-                    .xadd_on_shard(shard, key, arg_str(id), xadd_fields(fields), None, now)
-                    .map_err(LuxError::Command)?;
-                wal_log_resolved_xadd(&self.runtime.store, key, id, fields)?;
-                self.runtime.broker.wake_stream_waiters(arg_str(key));
-                Ok(CommandOutput::Bulk(bytes::Bytes::from(id.to_string())))
-            }
-            _ => unreachable!("native pipeline write command was classified before dispatch"),
         }
     }
 
@@ -1411,34 +1033,18 @@ impl EmbeddedClient {
         &self,
         command: &Command<'_>,
     ) -> Result<Option<CommandOutput>, LuxError> {
-        if matches!(command, Command::Raw { .. })
-            || matches!(command, Command::Set { options, .. } if !can_fast_path_set(options))
+        // Mutations use the command layer's authoritative, state-aware journal
+        // boundary. This fast path is deliberately a read-only whitelist plus
+        // PING/PUBLISH; unknown or newly added variants fall back to the shared
+        // command implementation by default.
+        if self.runtime.store.is_tiered()
+            || matches!(command, Command::Keys { .. } | Command::RandomKey)
+            || command_touches_reserved_internal_key(command)
         {
             return Ok(None);
         }
 
         let now = Instant::now();
-        if command_is_fast_path_write(command) {
-            ensure_write_allowed(&self.runtime.store)?;
-        }
-        let mut write_argv = if command_is_fast_path_write(command)
-            && (self.runtime.store.wal_enabled() || self.runtime.broker.has_key_subs())
-            && !matches!(command, Command::MSet { .. })
-        {
-            Some(command.to_owned_argv())
-        } else {
-            None
-        };
-        if !matches!(command, Command::XAdd { .. }) && !typed_command_has_relative_ttl(command) {
-            if let Some(argv) = &write_argv {
-                let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                self.runtime
-                    .store
-                    .wal_log_command(&refs)
-                    .map_err(wal_lux_error)?;
-            }
-        }
-
         let output = match command {
             Command::Ping => CommandOutput::Simple("PONG"),
             Command::Publish { channel, message } => {
@@ -1450,157 +1056,41 @@ impl EmbeddedClient {
                 )
             }
             Command::DbSize => CommandOutput::Int(self.runtime.store.dbsize(now)),
-            Command::FlushDb | Command::FlushAll => {
-                self.runtime.store.flushdb();
-                CommandOutput::Simple("OK")
-            }
-            Command::Keys { pattern } => string_array(self.runtime.store.keys(pattern, now)),
-            Command::RandomKey => random_key_output(&self.runtime.store, now),
-            Command::Get { key } => optional_bulk_output(self.runtime.store.get(key, now)),
-            Command::Set {
-                key,
-                value,
-                options,
-            } if can_fast_path_set(options) => {
-                validate_fast_path_set_ttl(options)?;
-                let ttl = set_ttl(options);
-                self.runtime.store.set(key, value, ttl, now);
-                CommandOutput::Simple("OK")
-            }
-            Command::GetSet { key, value } => {
-                optional_bulk_output(self.runtime.store.get_set(key, value, now))
-            }
-            Command::SetNx { key, value } => {
-                CommandOutput::Int(i64::from(self.runtime.store.set_nx(key, value, now)))
-            }
-            Command::SetEx {
-                key,
-                seconds,
-                value,
-            } => {
-                if *seconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'setex' command".to_string(),
-                    ));
-                }
+            Command::Get { key } => optional_bulk_output(
                 self.runtime
                     .store
-                    .set(key, value, Some(Duration::from_secs(*seconds)), now);
-                CommandOutput::Simple("OK")
-            }
-            Command::PSetEx {
-                key,
-                milliseconds,
-                value,
-            } => {
-                if *milliseconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'psetex' command".to_string(),
-                    ));
-                }
-                let millis = u64::try_from(*milliseconds).map_err(|_| {
-                    LuxError::Command("ERR value is not an integer or out of range".to_string())
-                })?;
-                self.runtime
-                    .store
-                    .set(key, value, Some(Duration::from_millis(millis)), now);
-                CommandOutput::Simple("OK")
-            }
-            Command::MGet { keys } => CommandOutput::Array(
-                keys.iter()
-                    .map(|key| optional_bulk_output(self.runtime.store.get(key, now)))
-                    .collect(),
-            ),
-            Command::MSet { .. } => {
-                self.execute_mset_pipeline_batch(std::slice::from_ref(command), now)?;
-                CommandOutput::Simple("OK")
-            }
-            Command::MSetNx { pairs } => {
-                CommandOutput::Int(i64::from(self.runtime.store.msetnx(pairs, now)))
-            }
-            Command::Append { key, value } => {
-                CommandOutput::Int(self.runtime.store.append(key, value, now))
-            }
-            Command::StrLen { key } => CommandOutput::Int(self.runtime.store.strlen(key, now)),
-            Command::Incr { key } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr(key, 1, now)
+                    .get_kv_string(key, now)
                     .map_err(LuxError::Command)?,
             ),
-            Command::Decr { key } => CommandOutput::Int(
+            Command::MGet { keys } => {
+                let values = keys
+                    .iter()
+                    .map(|key| {
+                        self.runtime
+                            .store
+                            .get_kv_string(key, now)
+                            .map(optional_bulk_output)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(LuxError::Command)?;
+                CommandOutput::Array(values)
+            }
+            Command::StrLen { key } => CommandOutput::Int(
                 self.runtime
                     .store
-                    .incr(key, -1, now)
-                    .map_err(LuxError::Command)?,
+                    .get_kv_string(key, now)
+                    .map_err(LuxError::Command)?
+                    .map_or(0, |value| value.len() as i64),
             ),
-            Command::IncrBy { key, increment } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr(key, *increment, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::DecrBy { key, decrement } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr(key, -*decrement, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::Del { keys } => CommandOutput::Int(self.runtime.store.del(keys)),
-            Command::Unlink { keys } => CommandOutput::Int(self.runtime.store.unlink(keys)),
             Command::Exists { keys } => CommandOutput::Int(self.runtime.store.exists(keys, now)),
-            Command::Expire { key, seconds } => {
-                CommandOutput::Int(i64::from(self.runtime.store.expire(key, *seconds, now)))
-            }
             Command::Ttl { key } => CommandOutput::Int(self.runtime.store.ttl(key, now)),
             Command::PTtl { key } => CommandOutput::Int(self.runtime.store.pttl(key, now)),
-            Command::Persist { key } => {
-                CommandOutput::Int(i64::from(self.runtime.store.persist(key, now)))
-            }
             Command::Type { key } => CommandOutput::Simple(
                 self.runtime
                     .store
                     .get_entry_type(key, now)
                     .unwrap_or("none"),
             ),
-            Command::Rename { key, new_key } => {
-                self.runtime
-                    .store
-                    .rename(key, new_key, now)
-                    .map_err(LuxError::Command)?;
-                CommandOutput::Simple("OK")
-            }
-            Command::RenameNx { key, new_key } => {
-                if self.runtime.store.get(new_key, now).is_some() {
-                    CommandOutput::Int(0)
-                } else {
-                    self.runtime
-                        .store
-                        .rename(key, new_key, now)
-                        .map_err(LuxError::Command)?;
-                    CommandOutput::Int(1)
-                }
-            }
-            Command::LPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .lpush(key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.drain_list_waiters(key, now);
-                CommandOutput::Int(n)
-            }
-            Command::RPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .rpush(key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.drain_list_waiters(key, now);
-                CommandOutput::Int(n)
-            }
-            Command::LPop { key } => optional_bulk_output(self.runtime.store.lpop(key, now)),
-            Command::RPop { key } => optional_bulk_output(self.runtime.store.rpop(key, now)),
             Command::LLen { key } => CommandOutput::Int(
                 self.runtime
                     .store
@@ -1608,29 +1098,26 @@ impl EmbeddedClient {
                     .map_err(LuxError::Command)?,
             ),
             Command::LIndex { key, index } => {
-                optional_bulk_output(self.runtime.store.lindex(key, *index, now))
+                optional_bulk_output(self.runtime.store.lindex(key, *index, now).map(|raw| {
+                    self.runtime
+                        .store
+                        .decrypt_list_element(raw.clone())
+                        .unwrap_or(raw)
+                }))
             }
             Command::LRange { key, start, stop } => bytes_array(
                 self.runtime
                     .store
                     .lrange(key, *start, *stop, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::HSet { key, field, value } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hset(key, &[(*field, *value)], now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::HIncrBy {
-                key,
-                field,
-                increment,
-            } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hincrby(key, field, *increment, now)
-                    .map_err(LuxError::Command)?,
+                    .map_err(LuxError::Command)?
+                    .into_iter()
+                    .map(|raw| {
+                        self.runtime
+                            .store
+                            .decrypt_list_element(raw.clone())
+                            .unwrap_or(raw)
+                    })
+                    .collect(),
             ),
             Command::HGet { key, field } => {
                 optional_bulk_output(self.runtime.store.hget(key, field, now))
@@ -1642,12 +1129,6 @@ impl EmbeddedClient {
                     .into_iter()
                     .map(optional_bulk_output)
                     .collect(),
-            ),
-            Command::HDel { key, fields } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hdel(key, fields, now)
-                    .map_err(LuxError::Command)?,
             ),
             Command::HExists { key, field } => CommandOutput::Int(i64::from(
                 self.runtime
@@ -1674,18 +1155,6 @@ impl EmbeddedClient {
                 }
                 CommandOutput::Array(values)
             }
-            Command::SAdd { key, members } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .sadd(key, members, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::SRem { key, members } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .srem(key, members, now)
-                    .map_err(LuxError::Command)?,
-            ),
             Command::SMembers { key } => string_array(
                 self.runtime
                     .store
@@ -1704,17 +1173,6 @@ impl EmbeddedClient {
                     .scard(key, now)
                     .map_err(LuxError::Command)?,
             ),
-            Command::SPop { key } => {
-                let mut values = self
-                    .runtime
-                    .store
-                    .spop(key, 1, now)
-                    .map_err(LuxError::Command)?;
-                match values.pop() {
-                    Some(value) => CommandOutput::Bulk(bytes::Bytes::from(value)),
-                    None => CommandOutput::Nil,
-                }
-            }
             Command::SUnion { keys } => string_array(
                 self.runtime
                     .store
@@ -1733,27 +1191,6 @@ impl EmbeddedClient {
                     .sdiff(keys, now)
                     .map_err(LuxError::Command)?,
             ),
-            Command::ZAdd { key, score, member } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .zadd(
-                        key,
-                        &[(*member, *score)],
-                        false,
-                        false,
-                        false,
-                        false,
-                        false,
-                        now,
-                    )
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::ZRem { key, members } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .zrem(key, members, now)
-                    .map_err(LuxError::Command)?,
-            ),
             Command::ZCard { key } => CommandOutput::Int(
                 self.runtime
                     .store
@@ -1764,16 +1201,6 @@ impl EmbeddedClient {
                 self.runtime
                     .store
                     .zscore(key, member, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::ZIncrBy {
-                key,
-                increment,
-                member,
-            } => score_output(
-                self.runtime
-                    .store
-                    .zincrby(key, member, *increment, now)
                     .map_err(LuxError::Command)?,
             ),
             Command::ZCount { key, min, max } => {
@@ -1798,38 +1225,6 @@ impl EmbeddedClient {
                     .map_err(LuxError::Command)?,
                 *with_scores,
             ),
-            Command::GeoAdd { key, members } => {
-                if let [member] = members.as_slice() {
-                    crate::geo::validate_coords(member.longitude, member.latitude)
-                        .map_err(LuxError::Command)?;
-                    let scored = [(
-                        member.member,
-                        crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                    )];
-                    CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd(key, &scored, false, false, false, false, false, now)
-                            .map_err(LuxError::Command)?,
-                    )
-                } else {
-                    let mut scored = Vec::with_capacity(members.len());
-                    for member in members {
-                        crate::geo::validate_coords(member.longitude, member.latitude)
-                            .map_err(LuxError::Command)?;
-                        scored.push((
-                            member.member,
-                            crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                        ));
-                    }
-                    CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd(key, &scored, false, false, false, false, false, now)
-                            .map_err(LuxError::Command)?,
-                    )
-                }
-            }
             Command::GeoPos { key, members } => {
                 let mut values = Vec::with_capacity(members.len());
                 for member in members {
@@ -1865,75 +1260,32 @@ impl EmbeddedClient {
                             "ERR unsupported unit provided. please use M, KM, FT, MI".to_string(),
                         )
                     })?;
-                let Some(score_a) = self
+                let score_a = self
                     .runtime
                     .store
                     .zscore(key, member_a, now)
-                    .map_err(LuxError::Command)?
-                else {
-                    return Ok(Some(CommandOutput::Nil));
-                };
-                let Some(score_b) = self
+                    .map_err(LuxError::Command)?;
+                let score_b = self
                     .runtime
                     .store
                     .zscore(key, member_b, now)
-                    .map_err(LuxError::Command)?
-                else {
-                    return Ok(Some(CommandOutput::Nil));
-                };
-                let (lon_a, lat_a) = crate::geo::geohash_decode(score_a as u64);
-                let (lon_b, lat_b) = crate::geo::geohash_decode(score_b as u64);
-                let distance = unit.from_meters(crate::geo::haversine(lon_a, lat_a, lon_b, lat_b));
-                CommandOutput::Bulk(bytes::Bytes::from(format!("{distance:.4}")))
-            }
-            Command::XAdd { key, id, fields } => {
-                require_xadd_fields(fields)?;
-                let id = self
-                    .runtime
-                    .store
-                    .xadd(key, arg_str(id), xadd_fields(fields), None, now)
                     .map_err(LuxError::Command)?;
-                wal_log_resolved_xadd(&self.runtime.store, key, id, fields)?;
-                self.runtime.broker.wake_stream_waiters(arg_str(key));
-                CommandOutput::Bulk(bytes::Bytes::from(id.to_string()))
+                match (score_a, score_b) {
+                    (Some(score_a), Some(score_b)) => {
+                        let (lon_a, lat_a) = crate::geo::geohash_decode(score_a as u64);
+                        let (lon_b, lat_b) = crate::geo::geohash_decode(score_b as u64);
+                        let distance =
+                            unit.from_meters(crate::geo::haversine(lon_a, lat_a, lon_b, lat_b));
+                        CommandOutput::Bulk(bytes::Bytes::from(format!("{distance:.4}")))
+                    }
+                    _ => CommandOutput::Nil,
+                }
             }
-            Command::Set { .. } | Command::Raw { .. } => unreachable!("handled before fast path"),
+            _ => return Ok(None),
         };
 
-        wal_log_resolved_typed_ttl(&self.runtime.store, command, &output)?;
         self.runtime.store.add_total_commands(1);
-        if let Some(argv) = write_argv.take() {
-            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            fire_key_events(&self.runtime.broker, &refs);
-        }
         Ok(Some(output))
-    }
-
-    fn drain_list_waiters(&self, key: &[u8], now: Instant) {
-        if !self.runtime.broker.has_list_waiters("") {
-            return;
-        }
-        let key_s = std::str::from_utf8(key).unwrap_or("");
-        if self.runtime.broker.has_list_waiters(key_s) {
-            let shard_idx = self.runtime.store.shard_for_key(key);
-            let mut shard = self.runtime.store.lock_write_shard(shard_idx);
-            self.drain_list_waiters_on_shard(key, &mut shard, now);
-        }
-    }
-
-    fn drain_list_waiters_on_shard(&self, key: &[u8], shard: &mut store::Shard, now: Instant) {
-        if !self.runtime.broker.has_list_waiters("") {
-            return;
-        }
-        let key_s = std::str::from_utf8(key).unwrap_or("");
-        if self.runtime.broker.has_list_waiters(key_s) {
-            self.runtime.broker.drain_list_waiters(
-                key_s,
-                &mut shard.data,
-                &self.runtime.store,
-                now,
-            );
-        }
     }
 
     /// Executes a raw Redis command pipeline and returns raw RESP bytes for all replies.
@@ -2247,7 +1599,7 @@ fn embedded_value_to_command_output(value: EmbeddedValue) -> Result<CommandOutpu
     match value {
         EmbeddedValue::Nil => Ok(CommandOutput::Nil),
         EmbeddedValue::Int(n) => Ok(CommandOutput::Int(n)),
-        EmbeddedValue::Simple(s) => Ok(CommandOutput::Bulk(bytes::Bytes::from(s))),
+        EmbeddedValue::Simple(s) => Ok(CommandOutput::SimpleOwned(s)),
         EmbeddedValue::Bulk(bytes) => Ok(CommandOutput::Bulk(bytes)),
         EmbeddedValue::Array(items) => Ok(CommandOutput::Array(
             items
@@ -2367,108 +1719,6 @@ fn zrange_output(items: Vec<(String, f64)>, with_scores: bool) -> CommandOutput 
     CommandOutput::Array(values)
 }
 
-fn random_key_output(store: &Store, now: Instant) -> CommandOutput {
-    for i in 0..store.shard_count() {
-        let shard = store.lock_read_shard(i);
-        if let Some((key, _)) = shard
-            .data
-            .iter()
-            .find(|(_, entry)| !entry.is_expired_at(now))
-        {
-            return CommandOutput::Bulk(bytes::Bytes::from(key.clone()));
-        }
-    }
-    CommandOutput::Nil
-}
-
-fn arg_str(arg: &[u8]) -> &str {
-    std::str::from_utf8(arg).unwrap_or("")
-}
-
-fn xadd_fields(fields: &[(&[u8], &[u8])]) -> Vec<(String, bytes::Bytes)> {
-    fields
-        .iter()
-        .map(|(field, value)| {
-            (
-                arg_str(field).to_string(),
-                bytes::Bytes::copy_from_slice(value),
-            )
-        })
-        .collect()
-}
-
-fn wal_log_resolved_xadd(
-    store: &Store,
-    key: &[u8],
-    id: StreamId,
-    fields: &[(&[u8], &[u8])],
-) -> Result<(), LuxError> {
-    if !store.wal_enabled() {
-        return Ok(());
-    }
-
-    let id = id.to_string();
-    let mut args = Vec::with_capacity(fields.len() * 2 + 3);
-    args.push(b"XADD".as_slice());
-    args.push(key);
-    args.push(id.as_bytes());
-    for (field, value) in fields {
-        args.push(*field);
-        args.push(*value);
-    }
-    store.wal_log_command(&args).map_err(wal_lux_error)
-}
-
-fn require_xadd_fields(fields: &[(&[u8], &[u8])]) -> Result<(), LuxError> {
-    if fields.is_empty() {
-        return Err(LuxError::Command(
-            "ERR wrong number of arguments for 'xadd' command".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn command_is_fast_path_write(command: &Command<'_>) -> bool {
-    matches!(
-        command,
-        Command::FlushDb
-            | Command::FlushAll
-            | Command::Set { .. }
-            | Command::GetSet { .. }
-            | Command::SetNx { .. }
-            | Command::SetEx { .. }
-            | Command::PSetEx { .. }
-            | Command::MSet { .. }
-            | Command::MSetNx { .. }
-            | Command::Append { .. }
-            | Command::Incr { .. }
-            | Command::Decr { .. }
-            | Command::IncrBy { .. }
-            | Command::DecrBy { .. }
-            | Command::Del { .. }
-            | Command::Unlink { .. }
-            | Command::Expire { .. }
-            | Command::Persist { .. }
-            | Command::Rename { .. }
-            | Command::RenameNx { .. }
-            | Command::LPush { .. }
-            | Command::RPush { .. }
-            | Command::LPop { .. }
-            | Command::RPop { .. }
-            | Command::HSet { .. }
-            | Command::HIncrBy { .. }
-            | Command::HDel { .. }
-            | Command::SAdd { .. }
-            | Command::SRem { .. }
-            | Command::SPop { .. }
-            | Command::ZAdd { .. }
-            | Command::ZRem { .. }
-            | Command::ZIncrBy { .. }
-            | Command::GeoAdd { .. }
-            | Command::XAdd { .. }
-    )
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativePipelineAccess {
     Read,
@@ -2486,36 +1736,25 @@ fn native_pipeline_access<'a>(command: &Command<'a>) -> Option<(&'a [u8], Native
         Command::GeoPos { key, .. } => (*key, b"GEOPOS".as_slice()),
         Command::GeoDist { key, .. } => (*key, b"GEODIST".as_slice()),
         Command::Exists { keys } if keys.len() == 1 => (keys[0], b"EXISTS".as_slice()),
-        Command::Set { key, options, .. } if can_fast_path_set(options) => {
-            (*key, b"SET".as_slice())
-        }
-        Command::SetEx { key, .. } => (*key, b"SETEX".as_slice()),
-        Command::PSetEx { key, .. } => (*key, b"PSETEX".as_slice()),
-        Command::Expire { key, .. } => (*key, b"EXPIRE".as_slice()),
-        Command::GetSet { key, .. } => (*key, b"GETSET".as_slice()),
-        Command::SetNx { key, .. } => (*key, b"SETNX".as_slice()),
-        Command::Append { key, .. } => (*key, b"APPEND".as_slice()),
-        Command::Incr { key } => (*key, b"INCR".as_slice()),
-        Command::Decr { key } => (*key, b"DECR".as_slice()),
-        Command::IncrBy { key, .. } => (*key, b"INCRBY".as_slice()),
-        Command::DecrBy { key, .. } => (*key, b"DECRBY".as_slice()),
         Command::LPush { key, .. } => (*key, b"LPUSH".as_slice()),
         Command::RPush { key, .. } => (*key, b"RPUSH".as_slice()),
         Command::LPop { key } => (*key, b"LPOP".as_slice()),
         Command::RPop { key } => (*key, b"RPOP".as_slice()),
-        Command::HSet { key, .. } => (*key, b"HSET".as_slice()),
         Command::HIncrBy { key, .. } => (*key, b"HINCRBY".as_slice()),
         Command::SAdd { key, .. } => (*key, b"SADD".as_slice()),
-        Command::SPop { key } => (*key, b"SPOP".as_slice()),
         Command::ZAdd { key, .. } => (*key, b"ZADD".as_slice()),
         Command::ZIncrBy { key, .. } => (*key, b"ZINCRBY".as_slice()),
         Command::GeoAdd { key, .. } => (*key, b"GEOADD".as_slice()),
-        Command::XAdd { key, .. } => (*key, b"XADD".as_slice()),
+        Command::SPop { .. } | Command::XAdd { .. } => return None,
         Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => {
             (keys[0], b"DEL".as_slice())
         }
         _ => return None,
     };
+
+    if cmd::is_reserved_internal_argument(key) {
+        return None;
+    }
 
     match cmd::pipeline_access(op) {
         cmd::PipelineAccess::Read => Some((key, NativePipelineAccess::Read)),
@@ -2524,284 +1763,38 @@ fn native_pipeline_access<'a>(command: &Command<'a>) -> Option<(&'a [u8], Native
     }
 }
 
-fn wal_log_native_command(store: &Store, command: &Command<'_>) -> Result<(), LuxError> {
-    if !store.wal_enabled() {
-        return Ok(());
-    }
-
-    // Borrowed-argv WAL fast path. Each arm must encode the exact argv that
-    // `Command::to_owned_argv` would produce so crash replay sees identical
-    // command semantics without allocating owned argument vectors.
+fn command_touches_reserved_internal_key(command: &Command<'_>) -> bool {
+    let reserved = cmd::is_reserved_internal_argument;
     match command {
-        Command::Set {
-            key,
-            value,
-            options,
-        } => match options.as_slice() {
-            [] => {
-                let args = [b"SET".as_slice(), *key, *value];
-                store.wal_log_command(&args).map_err(wal_lux_error)?;
-            }
-            [SetOption::Ex(seconds)] => {
-                let seconds = seconds.to_string();
-                let args = [
-                    b"SET".as_slice(),
-                    *key,
-                    *value,
-                    b"EX".as_slice(),
-                    seconds.as_bytes(),
-                ];
-                store.wal_log_command(&args).map_err(wal_lux_error)?;
-            }
-            [SetOption::Px(milliseconds)] => {
-                let milliseconds = milliseconds.to_string();
-                let args = [
-                    b"SET".as_slice(),
-                    *key,
-                    *value,
-                    b"PX".as_slice(),
-                    milliseconds.as_bytes(),
-                ];
-                store.wal_log_command(&args).map_err(wal_lux_error)?;
-            }
-            _ => wal_log_owned_command(store, command)?,
-        },
-        Command::GetSet { key, value } => {
-            let args = [b"GETSET".as_slice(), *key, *value];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::SetNx { key, value } => {
-            let args = [b"SETNX".as_slice(), *key, *value];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::SetEx {
-            key,
-            seconds,
-            value,
-        } => {
-            let seconds = seconds.to_string();
-            let args = [b"SETEX".as_slice(), *key, seconds.as_bytes(), *value];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::PSetEx {
-            key,
-            milliseconds,
-            value,
-        } => {
-            let milliseconds = milliseconds.to_string();
-            let args = [b"PSETEX".as_slice(), *key, milliseconds.as_bytes(), *value];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::MSet { pairs } => {
-            let mut args = Vec::with_capacity(1 + pairs.len() * 2);
-            args.push(b"MSET".as_slice());
-            for (key, value) in pairs {
-                args.push(*key);
-                args.push(*value);
-            }
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::Append { key, value } => {
-            let args = [b"APPEND".as_slice(), *key, *value];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::Incr { key } => {
-            let args = [b"INCR".as_slice(), *key];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::Decr { key } => {
-            let args = [b"DECR".as_slice(), *key];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::IncrBy { key, increment } => {
-            let increment = increment.to_string();
-            let args = [b"INCRBY".as_slice(), *key, increment.as_bytes()];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::DecrBy { key, decrement } => {
-            let decrement = decrement.to_string();
-            let args = [b"DECRBY".as_slice(), *key, decrement.as_bytes()];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::Del { keys } if keys.len() == 1 => {
-            let args = [b"DEL".as_slice(), keys[0]];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::Unlink { keys } if keys.len() == 1 => {
-            let args = [b"UNLINK".as_slice(), keys[0]];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::LPush { key, values } => {
-            let mut args = Vec::with_capacity(values.len() + 2);
-            args.push(b"LPUSH".as_slice());
-            args.push(*key);
-            args.extend(values.iter().copied());
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::RPush { key, values } => {
-            let mut args = Vec::with_capacity(values.len() + 2);
-            args.push(b"RPUSH".as_slice());
-            args.push(*key);
-            args.extend(values.iter().copied());
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::LPop { key } => {
-            let args = [b"LPOP".as_slice(), *key];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::RPop { key } => {
-            let args = [b"RPOP".as_slice(), *key];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::HSet { key, field, value } => {
-            let args = [b"HSET".as_slice(), *key, *field, *value];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::HIncrBy {
-            key,
-            field,
-            increment,
-        } => {
-            let increment = increment.to_string();
-            let args = [b"HINCRBY".as_slice(), *key, *field, increment.as_bytes()];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::SAdd { key, members } => {
-            let mut args = Vec::with_capacity(members.len() + 2);
-            args.push(b"SADD".as_slice());
-            args.push(*key);
-            args.extend(members.iter().copied());
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::SPop { key } => {
-            let args = [b"SPOP".as_slice(), *key];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::ZAdd { key, score, member } => {
-            let score = score.to_string();
-            let args = [b"ZADD".as_slice(), *key, score.as_bytes(), *member];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::ZIncrBy {
-            key,
-            increment,
-            member,
-        } => {
-            let increment = increment.to_string();
-            let args = [b"ZINCRBY".as_slice(), *key, increment.as_bytes(), *member];
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        Command::XAdd { key, id, fields } => {
-            let mut args = Vec::with_capacity(fields.len() * 2 + 3);
-            args.push(b"XADD".as_slice());
-            args.push(*key);
-            args.push(*id);
-            for (field, value) in fields {
-                args.push(*field);
-                args.push(*value);
-            }
-            store.wal_log_command(&args).map_err(wal_lux_error)?;
-        }
-        _ => wal_log_owned_command(store, command)?,
-    }
-    Ok(())
-}
-
-fn wal_lux_error(error: std::io::Error) -> LuxError {
-    LuxError::Command(format!("ERR WAL append failed: {error}"))
-}
-
-fn ensure_write_allowed(store: &Store) -> Result<(), LuxError> {
-    crate::eviction::evict_if_needed(store).map_err(|e| LuxError::Command(e.to_string()))
-}
-
-fn wal_log_owned_command(store: &Store, command: &Command<'_>) -> Result<(), LuxError> {
-    let argv = command.to_owned_argv();
-    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    store.wal_log_command(&refs).map_err(wal_lux_error)?;
-    Ok(())
-}
-
-fn can_fast_path_set(options: &[SetOption]) -> bool {
-    options
-        .iter()
-        .all(|option| matches!(option, SetOption::Ex(_) | SetOption::Px(_)))
-}
-
-fn set_ttl(options: &[SetOption]) -> Option<Duration> {
-    options.iter().find_map(|option| match option {
-        SetOption::Ex(seconds) => Some(Duration::from_secs(*seconds)),
-        SetOption::Px(milliseconds) => u64::try_from(*milliseconds).ok().map(Duration::from_millis),
-        SetOption::Nx | SetOption::Xx | SetOption::KeepTtl => None,
-    })
-}
-
-fn validate_fast_path_set_ttl(options: &[SetOption]) -> Result<(), LuxError> {
-    for option in options {
-        match option {
-            SetOption::Ex(0) | SetOption::Px(0) => {
-                return Err(LuxError::Command(
-                    "ERR invalid expire time in 'set' command".to_string(),
-                ));
-            }
-            SetOption::Px(milliseconds) if *milliseconds > u64::MAX as u128 => {
-                return Err(LuxError::Command(
-                    "ERR value is not an integer or out of range".to_string(),
-                ));
-            }
-            SetOption::Ex(_)
-            | SetOption::Px(_)
-            | SetOption::Nx
-            | SetOption::Xx
-            | SetOption::KeepTtl => {}
-        }
-    }
-    Ok(())
-}
-
-fn typed_command_has_relative_ttl(command: &Command<'_>) -> bool {
-    match command {
-        Command::Set { options, .. } => options
-            .iter()
-            .any(|option| matches!(option, SetOption::Ex(_) | SetOption::Px(_))),
-        Command::SetEx { .. } | Command::PSetEx { .. } | Command::Expire { .. } => true,
+        Command::Get { key }
+        | Command::StrLen { key }
+        | Command::Ttl { key }
+        | Command::PTtl { key }
+        | Command::Type { key }
+        | Command::LLen { key }
+        | Command::LIndex { key, .. }
+        | Command::LRange { key, .. }
+        | Command::HGet { key, .. }
+        | Command::HMGet { key, .. }
+        | Command::HExists { key, .. }
+        | Command::HLen { key }
+        | Command::HGetAll { key }
+        | Command::SMembers { key }
+        | Command::SIsMember { key, .. }
+        | Command::SCard { key }
+        | Command::ZCard { key }
+        | Command::ZScore { key, .. }
+        | Command::ZCount { key, .. }
+        | Command::ZRange { key, .. }
+        | Command::GeoPos { key, .. }
+        | Command::GeoDist { key, .. } => reserved(key),
+        Command::MGet { keys }
+        | Command::Exists { keys }
+        | Command::SUnion { keys }
+        | Command::SInter { keys }
+        | Command::SDiff { keys } => keys.iter().any(|key| reserved(key)),
         _ => false,
     }
-}
-
-fn wal_log_resolved_typed_ttl(
-    store: &Store,
-    command: &Command<'_>,
-    output: &CommandOutput,
-) -> Result<(), LuxError> {
-    if !store.wal_enabled() || !typed_command_has_relative_ttl(command) {
-        return Ok(());
-    }
-    if matches!(command, Command::Expire { .. }) && !matches!(output, CommandOutput::Int(1)) {
-        return Ok(());
-    }
-
-    let ttl_ms = match command {
-        Command::Set { options, .. } => {
-            set_ttl(options).map(|ttl| ttl.as_millis().min(i64::MAX as u128) as i64)
-        }
-        Command::SetEx { seconds, .. } | Command::Expire { seconds, .. } => {
-            Some(seconds.saturating_mul(1000).min(i64::MAX as u64) as i64)
-        }
-        Command::PSetEx { milliseconds, .. } => Some((*milliseconds).min(i64::MAX as u128) as i64),
-        _ => None,
-    };
-    let Some(ttl_ms) = ttl_ms else {
-        return Ok(());
-    };
-    let argv = command.to_owned_argv();
-    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    crate::cmd::wal_log_resolved_ttl_command(
-        store,
-        &refs,
-        crate::store::epoch_ms().saturating_add(ttl_ms),
-    )
-    .map_err(wal_lux_error)
 }
 
 fn parse_score_bound_bytes(input: &[u8], is_max: bool) -> (f64, bool) {
@@ -2977,7 +1970,7 @@ fn parse_blocking_pop_value(buf: &[u8]) -> Result<Option<(String, bytes::Bytes)>
 }
 
 async fn wait_for_blocking_pop(
-    store: &Store,
+    _store: &Store,
     broker: &Broker,
     keys: &[String],
     timeout: Duration,
@@ -2992,6 +1985,7 @@ async fn wait_for_blocking_pop(
             pubsub::BlockedPopRequest {
                 tx: tx.clone(),
                 pop_left,
+                destination: None,
                 waiter_id,
             },
         );
@@ -3002,10 +1996,6 @@ async fn wait_for_blocking_pop(
         val = rx.recv() => val,
         _ = tokio::time::sleep(timeout) => None,
     };
-
-    if let Some((key, _)) = &result {
-        wal_log_blocked_pop(store, key.as_bytes(), pop_left);
-    }
 
     broker.remove_list_waiters_by_id(keys, waiter_id);
     Ok(result)
@@ -3291,6 +2281,14 @@ impl Runtime {
         config: ServerConfig,
         background_tasks: &mut JoinSet<()>,
     ) -> std::io::Result<Arc<Self>> {
+        snapshot::complete_pending_restore(&config)?;
+        if config.storage.mode == StorageMode::Tiered && config.durability.policy.is_persistent() {
+            // Tiered files are a derived placement cache. Recovery is driven
+            // solely by the verified snapshot and ordered journal; retaining
+            // the cache would duplicate snapshot keys and replay relative
+            // mutations on top of their already-applied cold values.
+            disk::discard_tiered_cache(std::path::Path::new(&config.storage.dir))?;
+        }
         let config = Arc::new(config);
         let store = Arc::new(Store::try_new_with_config(config.clone())?);
         let schema_cache: SharedSchemaCache =
@@ -3298,13 +2296,11 @@ impl Runtime {
         let broker = Broker::new();
         // Wire the row-delta sink so table writes feed reactive live queries.
         store.set_row_delta_broker(broker.clone());
-        let shard_executor = ShardExecutor::new(store.clone(), broker.clone());
         let script_engine = Arc::new(lua::ScriptEngine::new());
 
         let runtime = Arc::new(Self {
             store,
             broker,
-            shard_executor,
             schema_cache,
             script_engine,
             config,
@@ -3357,7 +2353,8 @@ impl Runtime {
             .wal_suppress
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if runtime.config.durability.policy.is_persistent() {
-            match snapshot::load(&runtime.store) {
+            runtime.store.begin_recovery();
+            match snapshot::load_for_recovery(&runtime.store) {
                 Ok(0) => emit_info(&runtime.config, ServerInfoEvent::NoSnapshotFound),
                 Ok(n) => emit_info(&runtime.config, ServerInfoEvent::SnapshotLoaded { keys: n }),
                 Err(e) => {
@@ -3406,7 +2403,8 @@ impl Runtime {
             .wal_suppress
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if runtime.config.durability.policy.is_persistent() {
-            runtime.store.replay_wal(&runtime.broker);
+            runtime.store.replay_wal(&runtime.broker)?;
+            runtime.store.finish_recovery();
         }
         if runtime.config.auth.enabled {
             runtime
@@ -3478,8 +2476,15 @@ impl Runtime {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     let now = Instant::now();
-                    for table in tables::expire_due_rows(&store, &cache, now) {
-                        broker.enqueue_key_event(table.as_bytes(), b"TEXPIRE");
+                    match tables::expire_due_rows(&store, &cache, now) {
+                        Ok(tables) => {
+                            for table in tables {
+                                broker.enqueue_key_event(table.as_bytes(), b"TEXPIRE");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("table TTL sweep failed; rows retained for retry: {error}");
+                        }
                     }
                 }
             });
@@ -3993,15 +2998,12 @@ impl CommandExecutor {
             return None;
         }
 
-        // Reserve the internal table-storage namespace ("_t:") from direct command
-        // access. This is the universal entry for both the read fast-path below
-        // and the slow path (cmd::execute), so the guard must live here -- the
-        // cmd::execute guard alone misses fast-path reads like GET. KEYS/SCAN take
-        // a pattern and are filtered in their handlers instead.
+        // Reserve internal table/auth storage from direct command access. This
+        // universal entry also covers fast-path reads; KEYS/SCAN filter results.
         if !args[0].eq_ignore_ascii_case(b"KEYS") && !args[0].eq_ignore_ascii_case(b"SCAN") {
             for arg in &args[1..] {
-                if arg.starts_with(b"_t:") {
-                    resp::write_error(write_buf, "ERR '_t:' is a reserved internal namespace");
+                if cmd::is_reserved_internal_argument(arg) {
+                    resp::write_error(write_buf, "ERR reserved internal namespace");
                     return None;
                 }
             }
@@ -4152,19 +3154,22 @@ impl CommandExecutor {
                 has_special = true;
                 break;
             }
-            // Force commands touching the reserved "_t:" namespace onto the slow
-            // path, where cmd::execute's guard rejects them. The fast batch path
-            // below bypasses that guard. KEYS/SCAN take a pattern and are handled
-            // (filtered) on the slow path.
+            // Force commands touching an internal namespace onto the guarded
+            // slow path. KEYS/SCAN are filtered there.
             if !cmd.eq_ignore_ascii_case(b"KEYS")
                 && !cmd.eq_ignore_ascii_case(b"SCAN")
-                && args[1..].iter().any(|a| a.starts_with(b"_t:"))
+                && args[1..]
+                    .iter()
+                    .any(|arg| cmd::is_reserved_internal_argument(arg))
             {
                 all_single_key_rw = false;
             }
             let access = cmd::pipeline_access_for_args(args);
             flags.push(access);
-            if access == cmd::PipelineAccess::General {
+            // Writes must cross their per-command authoritative journal
+            // boundary so a rejected command cannot leave a durable frame in a
+            // pre-journaled batch. Only read-only runs use shard batching.
+            if access != cmd::PipelineAccess::Read {
                 all_single_key_rw = false;
             }
         }
@@ -4362,7 +3367,7 @@ impl CommandExecutor {
 fn write_shard_execution_error(write_buf: &mut BytesMut, err: ShardExecutionError) {
     match err {
         ShardExecutionError::Command(message) => resp::write_error(write_buf, &message),
-        ShardExecutionError::Eviction(message) => resp::write_error(write_buf, message),
+        ShardExecutionError::Eviction(message) => resp::write_error(write_buf, &message),
         ShardExecutionError::Wal(message) => {
             resp::write_error(write_buf, &format!("ERR WAL append failed: {message}"))
         }
@@ -4751,23 +3756,9 @@ async fn handle_connection(
     }
 }
 
-/// Log the pop that satisfied a blocked BLPOP/BRPOP/BLMOVE. The element was
-/// already removed from `key` in memory by the pushing side's drain, and the
-/// push that satisfied us was WAL-logged before we woke, so appending the
-/// matching pop here keeps WAL replay from resurrecting the element.
-/// Runs in the woken task with no shard locks held, so there is no
-/// memory->WAL lock nesting.
-fn wal_log_blocked_pop(store: &Store, key: &[u8], pop_left: bool) {
-    if !store.wal_enabled() {
-        return;
-    }
-    let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
-    let _ = store.wal_log_command(&[pop, key]);
-}
-
 async fn handle_block_pop(
     socket: &mut tokio::net::TcpStream,
-    store: &Arc<Store>,
+    _store: &Arc<Store>,
     broker: &Broker,
     keys: &[String],
     timeout: std::time::Duration,
@@ -4782,6 +3773,7 @@ async fn handle_block_pop(
             pubsub::BlockedPopRequest {
                 tx: tx.clone(),
                 pop_left,
+                destination: None,
                 waiter_id,
             },
         );
@@ -4796,7 +3788,6 @@ async fn handle_block_pop(
 
     match result {
         Some((key, val)) => {
-            wal_log_blocked_pop(store, key.as_bytes(), pop_left);
             resp::write_array_header(&mut write_buf, 2);
             resp::write_bulk(&mut write_buf, &key);
             resp::write_bulk_raw(&mut write_buf, &val);
@@ -4814,7 +3805,7 @@ async fn handle_block_pop(
 #[allow(clippy::too_many_arguments)]
 async fn handle_block_move(
     socket: &mut tokio::net::TcpStream,
-    store: &Arc<Store>,
+    _store: &Arc<Store>,
     broker: &Broker,
     src: &str,
     dst: &str,
@@ -4830,6 +3821,7 @@ async fn handle_block_move(
         pubsub::BlockedPopRequest {
             tx: tx.clone(),
             pop_left: src_left,
+            destination: Some((dst.to_string(), dst_left)),
             waiter_id,
         },
     );
@@ -4843,27 +3835,6 @@ async fn handle_block_move(
 
     match result {
         Some((_key, val)) => {
-            let now = Instant::now();
-            let vals: &[&[u8]] = &[val.as_ref()];
-            if dst_left {
-                let _ = store.lpush(dst.as_bytes(), vals, now);
-            } else {
-                let _ = store.rpush(dst.as_bytes(), vals, now);
-            }
-            // Log both effects of the completed move: the src pop (done in the
-            // pushing side's drain) and the dst push (done just above). Neither
-            // went through the WAL yet; the satisfying push to src was logged
-            // before we woke, so replay order is push(src), pop(src), push(dst)
-            // -> element ends up only in dst. Batched so a same-shard
-            // move is one atomic frame; a cross-shard move splits per shard.
-            if store.wal_enabled() {
-                let pop: &[u8] = if src_left { b"LPOP" } else { b"RPOP" };
-                let push: &[u8] = if dst_left { b"LPUSH" } else { b"RPUSH" };
-                let pop_cmd: [&[u8]; 2] = [pop, src.as_bytes()];
-                let push_cmd: [&[u8]; 3] = [push, dst.as_bytes(), val.as_ref()];
-                let batch: [&[&[u8]]; 2] = [&pop_cmd, &push_cmd];
-                let _ = store.wal_log_command_batch(&batch);
-            }
             resp::write_bulk_raw(&mut write_buf, &val);
         }
         None => {
@@ -4889,6 +3860,13 @@ async fn handle_block_stream_read(
     timeout: std::time::Duration,
 ) -> std::io::Result<()> {
     let now_pre = Instant::now();
+    for key in keys {
+        if let Err(error) = store.try_promote(key.as_bytes(), now_pre) {
+            let mut out = BytesMut::new();
+            resp::write_error(&mut out, &error);
+            return socket.write_all(&out).await;
+        }
+    }
     let resolved_ids: Vec<String> = id_strs
         .iter()
         .enumerate()
@@ -4933,9 +3911,10 @@ async fn handle_block_stream_read(
             Ok(r) if !r.is_empty() => {
                 write_xread_response(&mut write_buf, &r);
             }
-            _ => {
+            Ok(_) => {
                 resp::write_null_array(&mut write_buf);
             }
+            Err(error) => resp::write_error(&mut write_buf, &error),
         }
     } else {
         resp::write_null_array(&mut write_buf);
@@ -5017,16 +3996,8 @@ async fn handle_block_lmpop(
 
     loop {
         let now = Instant::now();
-        match store.lmpop(&key_refs, pop_left, count, now) {
+        match cmd::journaled_lmpop(store, &key_refs, pop_left, count, now) {
             Ok(Some((key, items))) => {
-                // Popped straight from the store outside the WAL; log the
-                // compensating LPOP/RPOP keyed on the popped key so replay stays
-                // correct. No shard locks held here.
-                if store.wal_enabled() {
-                    let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
-                    let n = items.len().to_string();
-                    let _ = store.wal_log_command(&[pop, &key, n.as_bytes()]);
-                }
                 resp::write_array_header(&mut write_buf, 2);
                 resp::write_bulk_raw(&mut write_buf, &key);
                 resp::write_array_header(&mut write_buf, items.len());
@@ -5068,19 +4039,8 @@ async fn handle_block_zmpop(
 
     loop {
         let now = Instant::now();
-        match store.zmpop(&key_refs, pop_min, count, now) {
+        match cmd::journaled_zmpop(store, &key_refs, pop_min, count, now) {
             Ok(Some((key, items))) => {
-                // Popped straight from the store outside the WAL; self-log the
-                // removal as a keyed ZREM so replay stays correct.
-                if store.wal_enabled() {
-                    let mut zrem: Vec<&[u8]> = Vec::with_capacity(items.len() + 2);
-                    zrem.push(b"ZREM");
-                    zrem.push(&key);
-                    for (m, _) in &items {
-                        zrem.push(m.as_bytes());
-                    }
-                    let _ = store.wal_log_command(&zrem);
-                }
                 resp::write_array_header(&mut write_buf, 2);
                 resp::write_bulk_raw(&mut write_buf, &key);
                 resp::write_array_header(&mut write_buf, items.len());
@@ -5124,34 +4084,19 @@ async fn handle_block_zpop(
 
     loop {
         let now = Instant::now();
-        for key in keys {
-            let result = if pop_min {
-                store.zpopmin(key.as_bytes(), 1, now)
-            } else {
-                store.zpopmax(key.as_bytes(), 1, now)
-            };
-            if let Ok(items) = result {
-                if !items.is_empty() {
-                    let (member, score) = &items[0];
-                    // BZPOPMIN/BZPOPMAX pop straight from the store here, outside
-                    // the WAL; log the removal of the exact member so replay
-                    // doesn't resurrect it. Keyed on `key` -> correct
-                    // shard; no shard locks held at this point.
-                    if store.wal_enabled() {
-                        let _ =
-                            store.wal_log_command(&[b"ZREM", key.as_bytes(), member.as_bytes()]);
-                    }
-                    resp::write_array_header(&mut write_buf, 3);
-                    resp::write_bulk(&mut write_buf, key);
-                    resp::write_bulk(&mut write_buf, member);
-                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
-                        format!("{}", *score as i64)
-                    } else {
-                        format!("{}", score)
-                    };
-                    resp::write_bulk(&mut write_buf, &score_str);
-                    return socket.write_all(&write_buf).await;
-                }
+        let key_refs: Vec<&[u8]> = keys.iter().map(|key| key.as_bytes()).collect();
+        if let Ok(Some((key, items))) = cmd::journaled_zmpop(store, &key_refs, pop_min, 1, now) {
+            if let Some((member, score)) = items.first() {
+                resp::write_array_header(&mut write_buf, 3);
+                resp::write_bulk_raw(&mut write_buf, &key);
+                resp::write_bulk(&mut write_buf, member);
+                let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                    format!("{}", *score as i64)
+                } else {
+                    format!("{}", score)
+                };
+                resp::write_bulk(&mut write_buf, &score_str);
+                return socket.write_all(&write_buf).await;
             }
         }
 
@@ -5292,9 +4237,9 @@ mod persistence_config_tests {
     }
 
     #[test]
-    fn default_policy_preserves_persistent_server_behavior() {
+    fn default_policy_durably_acknowledges_each_write() {
         let config = ServerConfig::default();
-        assert_eq!(config.durability.policy, DurabilityPolicy::EverySecond);
+        assert_eq!(config.durability.policy, DurabilityPolicy::AlwaysSync);
         assert_eq!(config.durability.sync_interval, Duration::from_secs(1));
     }
 
@@ -5315,6 +4260,7 @@ mod persistence_config_tests {
         let root = tempfile::tempdir().unwrap();
         for interval in [Duration::ZERO, Duration::from_millis(1_001)] {
             let mut config = persistent_config(root.path(), StorageMode::Memory);
+            config.durability.policy = DurabilityPolicy::EverySecond;
             config.durability.sync_interval = interval;
             let error = resolve_and_validate_persistence(&mut config).unwrap_err();
             assert!(error.to_string().contains("1 to 1000 ms"), "{error}");
@@ -5332,10 +4278,18 @@ mod persistence_config_tests {
         assert!(error.to_string().contains("switch to memory"), "{error}");
 
         let memory_root = tempfile::tempdir().unwrap();
-        let memory_shard = memory_root.path().join("journal/shard_0");
-        std::fs::create_dir_all(&memory_shard).unwrap();
-        std::fs::write(memory_shard.join("wal.lux"), b"state").unwrap();
+        let memory_journal = memory_root.path().join("journal/global");
+        std::fs::create_dir_all(&memory_journal).unwrap();
+        std::fs::write(memory_journal.join("wal.lux"), b"state").unwrap();
         let mut tiered = persistent_config(memory_root.path(), StorageMode::Tiered);
+        let error = resolve_and_validate_persistence(&mut tiered).unwrap_err();
+        assert!(error.to_string().contains("switch to tiered"), "{error}");
+
+        let legacy_root = tempfile::tempdir().unwrap();
+        let legacy_journal = legacy_root.path().join("journal/shard_0");
+        std::fs::create_dir_all(&legacy_journal).unwrap();
+        std::fs::write(legacy_journal.join("wal.lux"), b"state").unwrap();
+        let mut tiered = persistent_config(legacy_root.path(), StorageMode::Tiered);
         let error = resolve_and_validate_persistence(&mut tiered).unwrap_err();
         assert!(error.to_string().contains("switch to tiered"), "{error}");
     }

@@ -6,8 +6,10 @@
 //! restarts, snapshot + WAL interaction, and concurrent data type recovery.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -136,12 +138,105 @@ fn crash_recovery_all_types() {
     assert!(resp.contains("42.5"), "timeseries recovery: {resp}");
 }
 
-// AUDIT PROBE: XADD with a `*` server-generated ID must keep the SAME id across a
-// WAL-only recovery. execute_with_wal logs the RAW command (literal `*`), so replay
-// regenerates a new time-based id and the entry's identity changes.
-//
-// QUARANTINED repro for row TTL WAL replay drift (un-ignore when fixing). Run with:
-//   cargo test --release --test crash_recovery -- --ignored xadd_star_id_stable_after_wal_replay
+#[test]
+fn acknowledged_table_ddl_survives_wal_only_recovery() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+
+    assert!(send(
+        &mut c,
+        &[
+            "TCREATE",
+            "docs",
+            "name STR,",
+            "profile JSON,",
+            "legacy STR"
+        ]
+    )
+    .starts_with("+OK"));
+    assert!(send(
+        &mut c,
+        &[
+            "TINSERT",
+            "docs",
+            "name",
+            "alpha",
+            "profile",
+            "{\"age\":42}",
+            "legacy",
+            "remove-me"
+        ]
+    )
+    .starts_with(':'));
+    assert!(send(&mut c, &["TINDEX", "docs", "profile.age", "INT"]).starts_with("+OK"));
+    assert!(send(
+        &mut c,
+        &["TALTER", "docs", "ADD", "active BOOL DEFAULT true"]
+    )
+    .starts_with("+OK"));
+    assert!(send(&mut c, &["TALTER", "docs", "DROP", "legacy"]).starts_with("+OK"));
+    drop(c);
+
+    srv.kill();
+    // Exercise the journal as the sole recovery source. No snapshot or cold
+    // placement file may conceal a missing DDL frame.
+    remove_non_wal_files(srv.data_dir());
+    srv.restart();
+
+    let mut c = srv.conn();
+    let schema = send(&mut c, &["TSCHEMA", "docs"]);
+    assert!(
+        schema.contains("active"),
+        "added column must recover: {schema:?}"
+    );
+    assert!(
+        !schema.contains("legacy"),
+        "dropped column must stay absent: {schema:?}"
+    );
+    let rows = send(
+        &mut c,
+        &[
+            "TSELECT",
+            "*",
+            "FROM",
+            "docs",
+            "WHERE",
+            "profile.age",
+            "=",
+            "42",
+        ],
+    );
+    assert!(rows.contains("alpha"), "path index must recover: {rows:?}");
+    assert!(
+        rows.contains("true"),
+        "column backfill must recover: {rows:?}"
+    );
+
+    assert!(send(&mut c, &["TDROPINDEX", "docs", "profile.age"]).starts_with("+OK"));
+    drop(c);
+    srv.kill();
+    remove_non_wal_files(srv.data_dir());
+    srv.restart();
+    let mut c = srv.conn();
+    let rows = send(
+        &mut c,
+        &[
+            "TSELECT",
+            "*",
+            "FROM",
+            "docs",
+            "WHERE",
+            "profile.age",
+            "=",
+            "42",
+        ],
+    );
+    assert!(
+        rows.contains("alpha"),
+        "dropping the path index must recover without losing table data: {rows:?}"
+    );
+}
+
 #[test]
 fn xadd_star_id_stable_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
@@ -660,9 +755,6 @@ fn zmpop_persists_across_wal_replay() {
     );
 }
 
-// AUDIT PROBE: SPOP removes a RANDOM member. The raw command is WAL-logged, so
-// replay re-runs SPOP and may remove a DIFFERENT member than the client saw,
-// leaving the recovered set inconsistent with the acknowledged result.
 #[test]
 fn spop_deterministic_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
@@ -771,7 +863,7 @@ fn crash_after_snapshot_before_wal_truncate() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Crash during MULTI/EXEC -- partial transaction should not corrupt
+// Test: a completed MULTI/EXEC response makes every queued write durable
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_during_multi_exec() {
@@ -781,16 +873,15 @@ fn crash_during_multi_exec() {
     // Write some baseline data.
     send(&mut c, &["SET", "before_tx", "safe"]);
 
-    // Start a MULTI but kill before EXEC completes all commands.
-    // Since each command in MULTI is individually WAL'd on EXEC,
-    // a crash mid-EXEC means some commands are in WAL and some aren't.
+    // Each command crosses its own durability boundary during EXEC. Waiting for
+    // the complete EXEC response therefore acknowledges every queued write.
     send(&mut c, &["MULTI"]);
     send(&mut c, &["SET", "tx_key1", "tx_val1"]);
     send(&mut c, &["SET", "tx_key2", "tx_val2"]);
     send(&mut c, &["SET", "tx_key3", "tx_val3"]);
     send(&mut c, &["EXEC"]);
 
-    // Immediately kill (some WAL writes may not have been fsync'd).
+    // Immediately kill after the acknowledged EXEC response.
     drop(c);
     srv.kill();
     srv.restart();
@@ -801,20 +892,15 @@ fn crash_during_multi_exec() {
     let resp = send(&mut c, &["GET", "before_tx"]);
     assert!(resp.contains("safe"), "pre-tx data recovery: {resp}");
 
-    // Transaction keys: they may or may not all survive depending on
-    // fsync timing, but the database should NOT be corrupted. Whatever
-    // keys exist should have correct values, and missing keys should
-    // return nil (not garbage).
     for (key, expected) in [
         ("tx_key1", "tx_val1"),
         ("tx_key2", "tx_val2"),
         ("tx_key3", "tx_val3"),
     ] {
         let resp = send(&mut c, &["GET", key]);
-        // Either the key exists with the right value, or it's nil.
         assert!(
-            resp.contains(expected) || resp.contains("$-1"),
-            "tx key '{key}' should be correct or nil, got: {resp}"
+            resp.contains(expected),
+            "acknowledged EXEC write '{key}' was lost: {resp}"
         );
     }
 }
@@ -944,21 +1030,18 @@ fn crash_after_flushdb() {
 // ---------------------------------------------------------------------------
 #[test]
 fn rapid_writes_then_crash() {
-    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut srv = LuxServer::builder()
+        .tiered()
+        .maxmemory("100kb")
+        .env("LUX_DURABILITY", "always_sync")
+        .start();
     let mut c = srv.conn();
 
-    // Pipeline 100 writes as fast as possible.
-    let mut batch = Vec::new();
+    // Every response proves the matching frame crossed the AlwaysSync boundary.
     for i in 0..100 {
-        batch.extend_from_slice(&resp_cmd(&[
-            "SET",
-            &format!("rapid:{i}"),
-            &format!("val:{i}"),
-        ]));
+        let response = send(&mut c, &["SET", &format!("rapid:{i}"), &format!("val:{i}")]);
+        assert_eq!(response, "+OK\r\n", "write {i} was not acknowledged");
     }
-    c.write_all(&batch).unwrap();
-    thread::sleep(Duration::from_millis(200));
-    read_all(&mut c); // drain responses
     drop(c);
 
     srv.kill();
@@ -966,43 +1049,100 @@ fn rapid_writes_then_crash() {
 
     let mut c = srv.conn();
 
-    // Due to the 1s fsync window, some of the last writes may be lost.
-    // But whatever survived should have correct values (no corruption).
-    let mut recovered = 0;
     for i in 0..100 {
         let resp = send(&mut c, &["GET", &format!("rapid:{i}")]);
-        if resp.contains(&format!("val:{i}")) {
-            recovered += 1;
-        } else {
-            // Should be nil, not garbage.
-            assert!(
-                resp.contains("$-1"),
-                "key rapid:{i} should be nil or correct, got: {resp}"
-            );
-        }
+        assert!(
+            resp.contains(&format!("val:{i}")),
+            "acknowledged key rapid:{i} was lost after crash: {resp}"
+        );
     }
-    // At least some writes should have survived (WAL was flushed to OS buffer).
-    assert!(
-        recovered > 0,
-        "at least some rapid writes should survive crash"
-    );
+}
+
+#[test]
+fn always_sync_mid_command_kills_never_lose_acknowledged_increments() {
+    let mut srv = LuxServer::builder()
+        .tiered()
+        .env("LUX_DURABILITY", "always_sync")
+        .start();
+    let mut baseline = 0usize;
+
+    // Vary the kill delay so repeated runs cut through different append, fsync,
+    // apply, and response windows. Only one command is ever in flight.
+    for delay_ms in [2, 3, 5, 8, 13, 21, 4, 11] {
+        let acked = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(Barrier::new(2));
+        let writer_acked = acked.clone();
+        let writer_ready = ready.clone();
+        let port = srv.port();
+        let writer = thread::spawn(move || {
+            let conn = crate::common::connect(port);
+            conn.set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            let mut conn = BufReader::new(conn);
+            writer_ready.wait();
+            loop {
+                if conn
+                    .get_mut()
+                    .write_all(&resp_cmd(&["INCR", "kill-counter"]))
+                    .is_err()
+                {
+                    break;
+                }
+                let mut response = String::new();
+                match conn.read_line(&mut response) {
+                    Ok(n) if n > 0 && response.starts_with(':') => {
+                        writer_acked.fetch_add(1, Ordering::Release);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        ready.wait();
+        thread::sleep(Duration::from_millis(delay_ms));
+        srv.kill();
+        writer.join().unwrap();
+        let acknowledged = acked.load(Ordering::Acquire);
+
+        srv.restart();
+        let mut conn = srv.conn();
+        let response = send(&mut conn, &["GET", "kill-counter"]);
+        let recovered = response
+            .lines()
+            .nth(1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        assert!(
+            recovered >= baseline + acknowledged,
+            "lost an acknowledged increment: baseline={baseline}, acknowledged={acknowledged}, recovered={recovered}"
+        );
+        assert!(
+            recovered <= baseline + acknowledged + 1,
+            "more than the one in-flight increment was ambiguous: baseline={baseline}, acknowledged={acknowledged}, recovered={recovered}"
+        );
+        baseline = recovered;
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Test: WAL file with corrupted frames -- server should start and skip them
+// Test: a partial final WAL frame is an uncommitted append and is ignored
 // ---------------------------------------------------------------------------
 #[test]
-fn corrupted_wal_frames_skipped_on_startup() {
-    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+fn partial_final_wal_frame_is_ignored_on_startup() {
+    let mut srv = LuxServer::builder()
+        .tiered()
+        .maxmemory("100kb")
+        .env("LUX_DURABILITY", "always_sync")
+        .start();
     let mut c = srv.conn();
 
     send(&mut c, &["SET", "good_key", "good_value"]);
-    // Wait for WAL flush.
-    thread::sleep(Duration::from_secs(2));
     drop(c);
     srv.kill();
 
-    // Corrupt the WAL files by appending garbage.
+    // Model a process dying after only part of the next frame-length field was
+    // written. A complete malformed frame is corruption and must fail startup;
+    // exhaustive guarded-WAL unit tests cover that fail-closed path.
     let storage_dir = srv.data_dir().join("storage");
     if storage_dir.exists() {
         for entry in std::fs::read_dir(&storage_dir).unwrap() {
@@ -1014,17 +1154,14 @@ fn corrupted_wal_frames_skipped_on_startup() {
                         .append(true)
                         .open(&wal_path)
                         .unwrap();
-                    // Write a valid-looking frame_len but corrupt crc + payload.
-                    f.write_all(&50u32.to_le_bytes()).unwrap();
-                    f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap(); // bad crc
-                    f.write_all(&[0xFF; 46]).unwrap(); // garbage payload
-                    f.flush().unwrap();
+                    f.write_all(&[0x32, 0x00, 0x00]).unwrap();
+                    f.sync_all().unwrap();
                 }
             }
         }
     }
 
-    // Server should start despite corrupted WAL frames.
+    // The committed prefix remains recoverable; only the partial suffix drops.
     srv.restart();
     let mut c = srv.conn();
 
@@ -1032,7 +1169,7 @@ fn corrupted_wal_frames_skipped_on_startup() {
     let resp = send(&mut c, &["GET", "good_key"]);
     assert!(
         resp.contains("good_value"),
-        "valid key should survive WAL corruption: {resp}"
+        "valid key should survive a partial final append: {resp}"
     );
 
     // Server should be functional.
@@ -1126,10 +1263,8 @@ fn row_ttl_survives_restart() {
 }
 
 // Row TTL recovered purely from WAL replay (no snapshot since the write). The
-// WAL stores the relative command, so replay REFRESHES the deadline -- exactly
-// like KV EXPIRE/SETEX. The guarantee here is: the row survives recovery and its
-// TTL is still active (it expires again). Absolute deadline preservation is a
-// snapshot-only guarantee, covered by `row_ttl_survives_restart`.
+// journal stores the resolved absolute deadline, so recovery preserves the
+// original expiry schedule instead of granting the row a fresh lifetime.
 #[test]
 fn row_ttl_active_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
@@ -1156,7 +1291,7 @@ fn row_ttl_active_after_wal_replay() {
     srv.restart();
     let mut c = srv.conn();
 
-    // Both rows survive recovery (gone's TTL was refreshed by replay).
+    // Restart completes before either original deadline has elapsed.
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
         resp.contains("keep"),
@@ -1167,7 +1302,7 @@ fn row_ttl_active_after_wal_replay() {
         "short-TTL row should survive WAL replay: {resp}"
     );
 
-    // The TTL is still active: `gone` expires on its refreshed schedule, `keep` stays.
+    // The original deadline remains active: `gone` expires while `keep` stays.
     thread::sleep(Duration::from_millis(2600));
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
@@ -1176,15 +1311,13 @@ fn row_ttl_active_after_wal_replay() {
     );
     assert!(
         !resp.contains("gone"),
-        "short-TTL row should expire after WAL replay refreshed its TTL: {resp}"
+        "short-TTL row should expire on its original schedule after WAL replay: {resp}"
     );
 }
 
-// A TTL set by an UPDATE must survive WAL replay. The update path applies the TTL
-// in the leaf and logs it as a trailing `TTL <secs>` on the TUPDATE, so replay
-// re-applies it. Without that, the update's TTL is dropped on replay and the row
-// lives forever. Guarantee (WAL-only, relative TTL refreshes on replay): the row
-// recovers AND its TTL stays active, so it still expires.
+// A TTL set by an UPDATE must survive WAL replay. The table leaf records the
+// resolved row image with its absolute deadline. Without that, the update's TTL
+// is dropped on replay and the row lives forever.
 #[test]
 fn update_ttl_active_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
