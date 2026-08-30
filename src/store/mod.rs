@@ -906,20 +906,47 @@ impl Store {
         };
         let (journal, legacy_wals) = if config.durability.policy.is_persistent() {
             let dir = config.journal_dir();
+            let required_journals = crate::snapshot::required_existing_journals(&config)?;
             let mut legacy = Vec::new();
+            let mut opened_journals = HashSet::new();
             for shard in 0..persistence_shard_count {
-                let path = dir.join(format!("shard_{shard}/wal.lux"));
+                let name = format!("shard_{shard}");
+                let path = dir.join(&name).join("wal.lux");
                 if path.exists() {
                     legacy.push((
                         shard,
                         parking_lot::Mutex::new(crate::disk::Wal::open(&dir, shard)?),
                     ));
+                    opened_journals.insert(name);
                 }
             }
+            if let Some(missing) = required_journals
+                .iter()
+                .find(|name| name.as_str() != "global" && !opened_journals.contains(*name))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to create or ignore the missing journal {missing} recorded by the snapshot"
+                    ),
+                ));
+            }
+            let global = if required_journals.contains("global") {
+                crate::disk::Wal::open_named_existing(&dir, "global").map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "refusing to create a missing journal beside an existing journal-aware snapshot",
+                        )
+                    } else {
+                        error
+                    }
+                })?
+            } else {
+                crate::disk::Wal::open_named(&dir, "global")?
+            };
             (
-                Some(parking_lot::Mutex::new(crate::disk::Wal::open_named(
-                    &dir, "global",
-                )?)),
+                Some(parking_lot::Mutex::new(global)),
                 legacy.into_boxed_slice(),
             )
         } else {
@@ -2279,11 +2306,25 @@ impl Store {
         Ok(checkpoints)
     }
 
-    pub fn truncate_wal(&self) -> std::io::Result<()> {
+    pub(crate) fn truncate_wal(
+        &self,
+        checkpoints: &[(String, crate::disk::WalCheckpoint)],
+    ) -> std::io::Result<()> {
         let mut first_error = None;
-        for (_, w) in &self.legacy_wals {
+        for (source, w) in &self.legacy_wals {
             let mut wal = w.lock();
-            if let Err(e) = wal.truncate() {
+            let name = format!("shard_{source}");
+            let result = checkpoints
+                .iter()
+                .find(|(checkpoint_name, _)| checkpoint_name == &name)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("snapshot is missing the {name} WAL checkpoint"),
+                    )
+                })
+                .and_then(|(_, checkpoint)| wal.rotate_after(*checkpoint));
+            if let Err(e) = result {
                 self.emit_error(crate::ServerErrorEvent::WalTruncateFailed {
                     error: e.to_string(),
                 });
@@ -2294,7 +2335,17 @@ impl Store {
         }
         if let Some(journal) = &self.journal {
             let mut wal = journal.lock();
-            if let Err(e) = wal.truncate() {
+            let result = checkpoints
+                .iter()
+                .find(|(name, _)| name == "global")
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "snapshot is missing the global WAL checkpoint",
+                    )
+                })
+                .and_then(|(_, checkpoint)| wal.rotate_after(*checkpoint));
+            if let Err(e) = result {
                 self.emit_error(crate::ServerErrorEvent::WalTruncateFailed {
                     error: e.to_string(),
                 });
@@ -6326,6 +6377,73 @@ mod tests {
 
     fn now() -> Instant {
         Instant::now()
+    }
+
+    fn persistent_test_config(dir: &std::path::Path) -> Arc<crate::ServerConfig> {
+        Arc::new(crate::ServerConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn wal_rotation_requires_the_global_snapshot_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::try_new_with_config(persistent_test_config(dir.path())).unwrap();
+
+        let error = store
+            .truncate_wal(&[])
+            .expect_err("a snapshot without its global checkpoint must not rotate the journal");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("global WAL checkpoint"));
+    }
+
+    #[test]
+    fn wal_rotation_requires_every_legacy_snapshot_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = persistent_test_config(dir.path());
+        drop(crate::disk::Wal::open(&config.journal_dir(), 0).unwrap());
+        let store = Store::try_new_with_config(config).unwrap();
+        let checkpoints = store.wal_checkpoints().unwrap();
+        let global_only: Vec<_> = checkpoints
+            .iter()
+            .filter(|(name, _)| name == "global")
+            .cloned()
+            .collect();
+
+        let error = store
+            .truncate_wal(&global_only)
+            .expect_err("a snapshot missing a legacy checkpoint must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("shard_0 WAL checkpoint"));
+    }
+
+    #[test]
+    fn wal_rotation_applies_every_complete_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = persistent_test_config(dir.path());
+        drop(crate::disk::Wal::open(&config.journal_dir(), 0).unwrap());
+        let store = Store::try_new_with_config(config).unwrap();
+        let checkpoints = store.wal_checkpoints().unwrap();
+
+        store.truncate_wal(&checkpoints).unwrap();
+        let rotated = store.wal_checkpoints().unwrap();
+        for (name, checkpoint) in checkpoints {
+            let replacement = rotated
+                .iter()
+                .find(|(rotated_name, _)| rotated_name == &name)
+                .map(|(_, checkpoint)| checkpoint)
+                .unwrap();
+            assert_eq!(
+                Some(replacement.generation),
+                checkpoint.successor_generation,
+                "{name} did not rotate to the snapshot-authorized successor"
+            );
+        }
     }
 
     #[test]
