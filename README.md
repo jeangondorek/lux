@@ -88,7 +88,7 @@ is MIT licensed and runs as a normal binary or container.
 - **Borrowed RESP parser** -- RESP arguments are parsed as byte slices from the
   read buffer; larger command argument lists may allocate
 - **Pipeline batching** -- consecutive same-shard commands batched under a single lock
-- **Persistence** -- automatic snapshots, write-ahead log (WAL) with CRC32 checksums, tiered hot/cold storage with automatic eviction to disk
+- **Persistence** -- automatic and asynchronous on-demand snapshots, write-ahead log (WAL) with CRC32 checksums, tiered hot/cold storage with automatic eviction to disk
 - **Auth** -- project secret/publishable keys or the `LUX_PASSWORD` operator credential, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, auth-owned system tables, and per-table row-level grants (`GRANT read, write ON t WHERE user_id = auth.uid()`) that gate reads, writes, and `.live()`
 - **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, PUBLISH, plus KSUB/KUNSUB for realtime key change events
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
@@ -344,6 +344,7 @@ lux start                              # run a local engine + Studio (web UI) in
 lux start --bind 0.0.0.0               # explicitly expose local ports on the network
 lux studio                             # open Lux Studio against the local engine
 lux stop                               # stop the local engine + Studio
+lux restore ./lux.dat                  # transactionally restore the local engine
 lux login                              # authenticate with a lux_ token
 lux link my-app                        # associate this repo with a cloud project
 lux target                             # show local, linked-cloud, and app-env targets
