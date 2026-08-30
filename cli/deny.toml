@@ -1,0 +1,33 @@
+[graph]
+all-features = true
+exclude-dev = false
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+db-path = "target/cargo-deny/advisory-dbs"
+unmaintained = "workspace"
+unsound = "all"
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+unused-allowed-license = "warn"
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+exceptions = [
+    { crate = "colored@3.1.1", allow = ["MPL-2.0"] },
+    { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+]

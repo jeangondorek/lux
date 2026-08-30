@@ -1742,6 +1742,12 @@ impl Store {
             && !self.journal_poisoned.load(Ordering::Acquire)
     }
 
+    /// Whether this instance can safely accept normal traffic.
+    pub(crate) fn ready_for_traffic(&self) -> bool {
+        self.accepting_mutations.load(Ordering::Acquire)
+            && !self.journal_poisoned.load(Ordering::Acquire)
+    }
+
     pub(crate) fn ensure_journal_healthy(&self) -> std::io::Result<()> {
         if self.journal_poisoned.load(Ordering::Acquire) {
             Err(std::io::Error::other(
@@ -7906,6 +7912,7 @@ mod tests {
         assert!(error.to_string().contains("restart required"));
         assert!(store.get(b"unsafe", now()).is_none());
         assert!(!store.wal_enabled());
+        assert!(!store.ready_for_traffic());
     }
 
     #[test]
@@ -8307,6 +8314,7 @@ mod tests {
 
         entered_rx.recv().unwrap();
         store.begin_shutdown();
+        assert!(!store.ready_for_traffic());
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let final_store = store.clone();
         let finalizer = std::thread::spawn(move || {
