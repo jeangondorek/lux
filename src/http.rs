@@ -574,16 +574,19 @@ async fn stream_snapshot(
             }
         };
 
-    let mut file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            let body = format!(
-                r#"{{"error":"snapshot open failed: {}"}}"#,
-                escape_json(&e.to_string())
-            );
-            return send_json(socket, 500, "Internal Server Error", &body).await;
-        }
-    };
+    let mut file =
+        match crate::file_security::open_private_file(std::path::Path::new(&path), |options| {
+            options.read(true);
+        }) {
+            Ok(file) => tokio::fs::File::from_std(file),
+            Err(e) => {
+                let body = format!(
+                    r#"{{"error":"snapshot open failed: {}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json(socket, 500, "Internal Server Error", &body).await;
+            }
+        };
     let len = file.metadata().await?.len();
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
@@ -5001,6 +5004,41 @@ fn escape_json(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::tables::JoinType;
+
+    #[tokio::test]
+    async fn snapshot_stream_serves_the_securely_opened_installed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        store.set(b"backup", b"value", None, Instant::now());
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (mut socket, _) = listener.accept().await.unwrap();
+
+        assert!(stream_snapshot(&mut socket, &store).await.unwrap());
+        drop(socket);
+        let response = client.await.unwrap();
+        let body_start = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response[body_start..].starts_with(b"LUX\x06"));
+    }
 
     #[tokio::test]
     async fn failed_ivm_live_snapshot_reclaims_receivers() {

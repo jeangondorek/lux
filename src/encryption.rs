@@ -136,6 +136,75 @@ struct SealedState {
     ciphertext: String,
 }
 
+struct PersistStateError {
+    message: String,
+    installed: bool,
+}
+
+impl PersistStateError {
+    fn before_install(message: String) -> Self {
+        Self {
+            message,
+            installed: false,
+        }
+    }
+
+    fn after_install(message: String) -> Self {
+        Self {
+            message,
+            installed: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod persistence_fault_injection {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Point {
+        BeforeWrite,
+        BeforeRename,
+        AfterRename,
+        BeforeDirectorySync,
+    }
+
+    thread_local! {
+        static POINT: Cell<Option<Point>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            POINT.set(None);
+        }
+    }
+
+    pub(crate) fn inject(point: Point) -> Guard {
+        POINT.with(|slot| {
+            assert!(
+                slot.replace(Some(point)).is_none(),
+                "persistence fault already injected"
+            );
+        });
+        Guard
+    }
+
+    pub(crate) fn check(point: Point) -> Result<(), String> {
+        POINT.with(|slot| {
+            if slot.get() == Some(point) {
+                slot.set(None);
+                Err(format!(
+                    "injected encryption persistence failure at {point:?}"
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
 impl EncryptionKeyring {
     pub(crate) fn open(config: &EncryptionConfig, data_dir: &str) -> Result<Self, String> {
         let state_path = resolve_path(config.state_path.as_deref(), data_dir, "lux.enc");
@@ -174,7 +243,9 @@ impl EncryptionKeyring {
         // when it was opened with a previous or on-disk seal.
         if needs_reseal {
             let inner = keyring.inner.read();
-            keyring.persist_state(&inner)?;
+            keyring
+                .persist_state(&inner)
+                .map_err(|error| error.message)?;
         }
 
         if config.auto_init && !keyring.has_active_key() {
@@ -207,6 +278,41 @@ impl EncryptionKeyring {
     fn validate(&self) -> Result<(), String> {
         let inner = self.inner.read();
         validate_active_key(inner.active_key_id.as_deref(), &inner.keys)
+    }
+
+    fn commit_state(
+        &self,
+        inner: &mut EncryptionState,
+        candidate: EncryptionState,
+    ) -> Result<(), String> {
+        match self.persist_state(&candidate) {
+            Ok(()) => {
+                *inner = candidate;
+                Ok(())
+            }
+            Err(error) => {
+                // A rename is the commit point. If a later identity check or
+                // directory fsync fails, keep the live keyring aligned with
+                // the state file that was installed before reporting the
+                // ambiguous durability failure.
+                if error.installed {
+                    *inner = candidate;
+                }
+                Err(error.message)
+            }
+        }
+    }
+
+    fn key_configs(inner: &EncryptionState) -> Vec<EncryptionKeyConfig> {
+        inner
+            .keys
+            .iter()
+            .map(|(id, key)| EncryptionKeyConfig {
+                id: id.clone(),
+                secret: key.secret.clone(),
+                decrypt_only: key.decrypt_only,
+            })
+            .collect()
     }
 
     pub(crate) fn status(&self) -> EncryptionStatus {
@@ -253,9 +359,11 @@ impl EncryptionKeyring {
             secret: generate_secret(),
             decrypt_only: false,
         };
-        inner.keys = build_network_keys(&[key])?;
-        inner.active_key_id = Some(id.clone());
-        self.persist_state(&inner)?;
+        let candidate = EncryptionState {
+            active_key_id: Some(id.clone()),
+            keys: build_network_keys(&[key])?,
+        };
+        self.commit_state(&mut inner, candidate)?;
         Ok(id)
     }
 
@@ -272,20 +380,20 @@ impl EncryptionKeyring {
         if inner.keys.contains_key(&id) {
             return Err(format!("ERR ENC key '{}' already exists", id));
         }
-        for key in inner.keys.values_mut() {
+        let mut configs = Self::key_configs(&inner);
+        for key in &mut configs {
             key.decrypt_only = true;
         }
-        let config = EncryptionKeyConfig {
+        configs.push(EncryptionKeyConfig {
             id: id.clone(),
             secret: generate_secret(),
             decrypt_only: false,
+        });
+        let candidate = EncryptionState {
+            active_key_id: Some(id.clone()),
+            keys: build_network_keys(&configs)?,
         };
-        let mut new_keys = build_network_keys(&[config])?;
-        inner
-            .keys
-            .insert(id.clone(), new_keys.remove(&id).expect("new key exists"));
-        inner.active_key_id = Some(id.clone());
-        self.persist_state(&inner)?;
+        self.commit_state(&mut inner, candidate)?;
         Ok(id)
     }
 
@@ -294,10 +402,18 @@ impl EncryptionKeyring {
         if inner.active_key_id.as_deref() == Some(key_id) {
             return Err("ERR ENC cannot retire the active key".to_string());
         }
-        if inner.keys.remove(key_id).is_none() {
+        if !inner.keys.contains_key(key_id) {
             return Err(format!("ERR ENC key '{}' does not exist", key_id));
         }
-        self.persist_state(&inner)
+        let configs = Self::key_configs(&inner)
+            .into_iter()
+            .filter(|key| key.id != key_id)
+            .collect::<Vec<_>>();
+        let candidate = EncryptionState {
+            active_key_id: inner.active_key_id.clone(),
+            keys: build_network_keys(&configs)?,
+        };
+        self.commit_state(&mut inner, candidate)
     }
 
     pub(crate) fn remaining_key_ids_without(&self, key_id: &str) -> HashSet<String> {
@@ -542,7 +658,14 @@ impl EncryptionKeyring {
         state_path: &Path,
         candidates: &[[u8; 32]],
     ) -> Result<(EncryptionState, [u8; 32]), String> {
-        let raw = fs::read(state_path).map_err(|e| format!("ERR ENC state read failed: {e}"))?;
+        use std::io::Read as _;
+        let mut file = crate::file_security::open_private_file(state_path, |options| {
+            options.read(true);
+        })
+        .map_err(|e| format!("ERR ENC state read failed: {e}"))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|e| format!("ERR ENC state read failed: {e}"))?;
         let sealed: SealedState =
             serde_json::from_slice(&raw).map_err(|e| format!("ERR ENC state is invalid: {e}"))?;
         if sealed.version != 1 {
@@ -600,12 +723,12 @@ impl EncryptionKeyring {
         Err("ERR ENC state could not be unsealed".to_string())
     }
 
-    fn persist_state(&self, inner: &EncryptionState) -> Result<(), String> {
-        let state_path = self
-            .state_path
-            .as_ref()
-            .ok_or_else(|| "ERR ENC state path is not configured".to_string())?;
-        let seal = current_seal(self.seal_secret, self.seal_path.as_deref())?;
+    fn persist_state(&self, inner: &EncryptionState) -> Result<(), PersistStateError> {
+        let state_path = self.state_path.as_ref().ok_or_else(|| {
+            PersistStateError::before_install("ERR ENC state path is not configured".to_string())
+        })?;
+        let seal = current_seal(self.seal_secret, self.seal_path.as_deref())
+            .map_err(PersistStateError::before_install)?;
         let mut key_ids: Vec<&String> = inner.keys.keys().collect();
         key_ids.sort();
         let plain = PlainState {
@@ -623,43 +746,86 @@ impl EncryptionKeyring {
                 })
                 .collect(),
         };
-        let mut plaintext = serde_json::to_vec(&plain)
-            .map_err(|e| format!("ERR ENC state serialize failed: {e}"))?;
+        let mut plaintext = serde_json::to_vec(&plain).map_err(|e| {
+            PersistStateError::before_install(format!("ERR ENC state serialize failed: {e}"))
+        })?;
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
-        let key = seal_state_key(&seal)?;
+        let key = seal_state_key(&seal).map_err(PersistStateError::before_install)?;
         key.seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(STATE_MAGIC),
             &mut plaintext,
         )
-        .map_err(|_| "ERR ENC state seal failed".to_string())?;
+        .map_err(|_| PersistStateError::before_install("ERR ENC state seal failed".to_string()))?;
         let sealed = SealedState {
             version: 1,
             nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
             ciphertext: base64::engine::general_purpose::STANDARD.encode(plaintext),
         };
-        let raw = serde_json::to_vec_pretty(&sealed)
-            .map_err(|e| format!("ERR ENC state serialize failed: {e}"))?;
-        if let Some(parent) = state_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("ERR ENC state mkdir failed: {e}"))?;
-        }
-        let tmp = state_path.with_extension("enc.tmp");
-        {
+        let raw = serde_json::to_vec_pretty(&sealed).map_err(|e| {
+            PersistStateError::before_install(format!("ERR ENC state serialize failed: {e}"))
+        })?;
+        let mut tmp_nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut tmp_nonce);
+        let tmp = state_path.with_extension(format!("enc.tmp.{}", hex(&tmp_nonce)));
+        let staged = (|| -> Result<fs::File, String> {
             use std::io::Write;
-            let mut file =
-                fs::File::create(&tmp).map_err(|e| format!("ERR ENC state write failed: {e}"))?;
+            #[cfg(test)]
+            persistence_fault_injection::check(persistence_fault_injection::Point::BeforeWrite)?;
+            let mut file = crate::file_security::open_private_file(&tmp, |options| {
+                options.create_new(true).write(true);
+            })
+            .map_err(|e| format!("ERR ENC state write failed: {e}"))?;
             file.write_all(&raw)
                 .map_err(|e| format!("ERR ENC state write failed: {e}"))?;
             file.sync_all()
                 .map_err(|e| format!("ERR ENC state sync failed: {e}"))?;
-        }
-        fs::rename(&tmp, state_path).map_err(|e| format!("ERR ENC state replace failed: {e}"))?;
-        // fsync the directory so the rename itself is durable across a crash.
-        if let Some(parent) = state_path.parent() {
-            if let Ok(dir) = fs::File::open(parent) {
-                let _ = dir.sync_all();
+            Ok(file)
+        })();
+        let file = match staged {
+            Ok(file) => file,
+            Err(message) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(PersistStateError::before_install(message));
             }
+        };
+        if let Err(error) = crate::file_security::ensure_regular_or_missing(state_path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(PersistStateError::before_install(format!(
+                "ERR ENC state replace failed: {error}"
+            )));
+        }
+        #[cfg(test)]
+        let rename_result =
+            persistence_fault_injection::check(persistence_fault_injection::Point::BeforeRename)
+                .map_err(std::io::Error::other)
+                .and_then(|_| fs::rename(&tmp, state_path));
+        #[cfg(not(test))]
+        let rename_result = fs::rename(&tmp, state_path);
+        if let Err(error) = rename_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(PersistStateError::before_install(format!(
+                "ERR ENC state replace failed: {error}"
+            )));
+        }
+        #[cfg(test)]
+        persistence_fault_injection::check(persistence_fault_injection::Point::AfterRename)
+            .map_err(PersistStateError::after_install)?;
+        crate::file_security::verify_installed_file(state_path, &file).map_err(|e| {
+            PersistStateError::after_install(format!("ERR ENC state replace failed: {e}"))
+        })?;
+        if let Some(parent) = state_path.parent() {
+            #[cfg(test)]
+            persistence_fault_injection::check(
+                persistence_fault_injection::Point::BeforeDirectorySync,
+            )
+            .map_err(PersistStateError::after_install)?;
+            crate::disk::sync_directory(parent).map_err(|e| {
+                PersistStateError::after_install(format!(
+                    "ERR ENC state directory sync failed: {e}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -884,7 +1050,25 @@ fn generate_secret() -> Vec<u8> {
 }
 
 fn read_seal_key(path: &Path, create: bool) -> Result<[u8; 32], String> {
-    match fs::read(path) {
+    #[cfg(not(unix))]
+    {
+        let _ = (path, create);
+        return Err(
+            "ERR ENC on-disk seal files require Unix owner-only permissions; configure LUX_ENC_SEAL_SECRET"
+                .to_string(),
+        );
+    }
+
+    #[cfg(unix)]
+    match (|| {
+        use std::io::Read as _;
+        let mut file = crate::file_security::open_private_file(path, |options| {
+            options.read(true);
+        })?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)?;
+        Ok::<_, std::io::Error>(raw)
+    })() {
         Ok(raw) => {
             let text = String::from_utf8(raw)
                 .map_err(|_| "ERR ENC seal file is not valid UTF-8".to_string())?;
@@ -896,10 +1080,6 @@ fn read_seal_key(path: &Path, create: bool) -> Result<[u8; 32], String> {
                 .map_err(|_| "ERR ENC seal file has invalid length".to_string())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("ERR ENC seal mkdir failed: {e}"))?;
-            }
             let mut seal = [0u8; 32];
             OsRng.fill_bytes(&mut seal);
             let encoded = base64::engine::general_purpose::STANDARD.encode(seal);
@@ -914,23 +1094,29 @@ fn write_new_seal_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| format!("ERR ENC seal create failed: {e}"))?;
+        let mut file = crate::file_security::open_private_file(path, |options| {
+            options.write(true).create_new(true);
+        })
+        .map_err(|e| format!("ERR ENC seal create failed: {e}"))?;
         file.write_all(bytes)
             .map_err(|e| format!("ERR ENC seal write failed: {e}"))?;
         file.write_all(b"\n")
             .map_err(|e| format!("ERR ENC seal write failed: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("ERR ENC seal sync failed: {e}"))?;
+        if let Some(parent) = path.parent() {
+            crate::disk::sync_directory(parent)
+                .map_err(|e| format!("ERR ENC seal directory sync failed: {e}"))?;
+        }
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, [bytes, b"\n"].concat())
-            .map_err(|e| format!("ERR ENC seal write failed: {e}"))
+        let _ = (path, bytes);
+        Err(
+            "ERR ENC on-disk seal files require Unix owner-only permissions; configure LUX_ENC_SEAL_SECRET"
+                .to_string(),
+        )
     }
 }
 
@@ -1203,6 +1389,21 @@ mod adversarial_tests {
         let ct = ring.encrypt("t", "f", "1", b"persisted").unwrap();
         drop(ring);
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["lux.enc", "lux.enc.seal"] {
+                assert_eq!(
+                    std::fs::metadata(dir.path().join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+
         // Reopen from the same dir: state unseals, data decrypts.
         let reopened = EncryptionKeyring::open(&config, &data_dir).unwrap();
         assert!(reopened.has_active_key());
@@ -1219,6 +1420,93 @@ mod adversarial_tests {
             EncryptionKeyring::open(&config, &data_dir).is_err(),
             "wrong seal must not unseal the keyring"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_disk_seal_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, dir.path().join("lux.enc.seal")).unwrap();
+
+        let config = EncryptionConfig::default();
+        let ring = EncryptionKeyring::open(&config, dir.path().to_str().unwrap()).unwrap();
+        assert!(ring.init(Some("k1")).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_keyring_persistence_does_not_change_live_state() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let ring = EncryptionKeyring::open(&EncryptionConfig::default(), &data_dir).unwrap();
+        ring.init(Some("k1")).unwrap();
+
+        let state_path = dir.path().join("lux.enc");
+        std::fs::remove_file(&state_path).unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &state_path).unwrap();
+
+        let error = ring.rotate(Some("k2")).unwrap_err();
+        assert!(error.contains("symbolic links"), "{error}");
+        assert_eq!(ring.status().active_key_id.as_deref(), Some("k1"));
+        assert_eq!(
+            ring.list(),
+            vec![EncryptionKeyInfo {
+                id: "k1".to_string(),
+                status: "active",
+            }]
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("lux.enc.tmp.")
+        }));
+    }
+
+    #[test]
+    fn keyring_state_matches_the_installed_file_at_every_persistence_boundary() {
+        use super::persistence_fault_injection::{self, Point};
+
+        for (point, installed) in [
+            (Point::BeforeWrite, false),
+            (Point::BeforeRename, false),
+            (Point::AfterRename, true),
+            (Point::BeforeDirectorySync, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = dir.path().to_string_lossy().to_string();
+            let config = EncryptionConfig::default();
+            let ring = EncryptionKeyring::open(&config, &data_dir).unwrap();
+            ring.init(Some("k1")).unwrap();
+
+            let _fault = persistence_fault_injection::inject(point);
+            let error = ring.rotate(Some("k2")).unwrap_err();
+            assert!(error.contains("injected encryption persistence failure"));
+            let expected = if installed { "k2" } else { "k1" };
+            assert_eq!(ring.status().active_key_id.as_deref(), Some(expected));
+            drop(ring);
+
+            let reopened = EncryptionKeyring::open(&config, &data_dir).unwrap();
+            assert_eq!(reopened.status().active_key_id.as_deref(), Some(expected));
+            assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("lux.enc.tmp.")
+            }));
+        }
     }
 
     #[test]

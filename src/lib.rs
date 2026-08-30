@@ -13,6 +13,7 @@ mod durability;
 mod embedded;
 mod encryption;
 mod eviction;
+mod file_security;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
 mod geo;
@@ -599,35 +600,28 @@ fn has_persistence_state(dir: &std::path::Path) -> std::io::Result<bool> {
 }
 
 fn verify_writable_directory(path: &std::path::Path, field: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(path).map_err(|error| {
+    crate::file_security::ensure_safe_dir(path).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!("cannot create {field} {}: {error}", path.display()),
         )
     })?;
-    if !std::fs::metadata(path)?.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{field} must be a directory: {}", path.display()),
-        ));
-    }
-
     static PROBE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let from = path.join(format!(".lux-write-probe-{}-{id}", std::process::id()));
     let to = path.join(format!(".lux-rename-probe-{}-{id}", std::process::id()));
     let result = (|| {
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&from)?;
+        let mut file = crate::file_security::open_private_file(&from, |options| {
+            options.create_new(true).write(true);
+        })?;
         file.write_all(b"lux")?;
         file.sync_all()?;
         std::fs::rename(&from, &to)?;
-        #[cfg(unix)]
-        std::fs::File::open(path)?.sync_all()?;
+        crate::file_security::verify_installed_file(&to, &file)?;
+        crate::disk::sync_directory(path)?;
         std::fs::remove_file(&to)?;
+        crate::disk::sync_directory(path)?;
         Ok::<_, std::io::Error>(())
     })();
     let _ = std::fs::remove_file(&from);
@@ -693,6 +687,23 @@ fn resolve_and_validate_persistence(config: &mut ServerConfig) -> std::io::Resul
         verify_writable_directory(&journal_dir, "journal directory")?;
     }
     Ok(())
+}
+
+fn acquire_persistence_locks(config: &ServerConfig) -> std::io::Result<Vec<std::fs::File>> {
+    if !config.durability.policy.is_persistent() {
+        return Ok(Vec::new());
+    }
+
+    let mut roots = vec![std::fs::canonicalize(&config.data_dir)?];
+    if config.storage.mode == StorageMode::Tiered {
+        roots.push(std::fs::canonicalize(&config.storage.dir)?);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+        .iter()
+        .map(|root| crate::file_security::lock_state_dir(root))
+        .collect()
 }
 
 fn validate_encryption_config(config: &ServerConfig) -> std::io::Result<()> {
@@ -780,6 +791,16 @@ struct Runtime {
     script_engine: Arc<lua::ScriptEngine>,
     config: Arc<ServerConfig>,
     accepting_work: std::sync::atomic::AtomicBool,
+    /// Open descriptors hold the advisory locks for every persistent root.
+    /// Shutdown releases them after the final persistence barrier even when a
+    /// stale embedded client keeps the otherwise-fenced runtime alive.
+    persistence_locks: parking_lot::Mutex<Option<Vec<std::fs::File>>>,
+}
+
+impl Runtime {
+    fn release_persistence_locks(&self) {
+        self.persistence_locks.lock().take();
+    }
 }
 
 pub fn default_shard_count() -> usize {
@@ -2303,6 +2324,7 @@ pub async fn run_with_config(mut config: ServerConfig) -> std::io::Result<Server
     validate_auth_config(&config)?;
     validate_shard_count(&config)?;
     resolve_and_validate_persistence(&mut config)?;
+    let persistence_locks = acquire_persistence_locks(&config)?;
     validate_encryption_config(&config)?;
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
@@ -2317,7 +2339,13 @@ pub async fn run_with_config(mut config: ServerConfig) -> std::io::Result<Server
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(None);
     let (ready_tx, ready_rx) = oneshot::channel();
-    let server_task = tokio::spawn(server_main(listener, config, shutdown_rx, ready_tx));
+    let server_task = tokio::spawn(server_main(
+        listener,
+        config,
+        persistence_locks,
+        shutdown_rx,
+        ready_tx,
+    ));
     let runtime =
         wait_for_startup(ready_rx, "server startup failed before readiness signal").await?;
     Ok(ServerHandle {
@@ -2331,11 +2359,12 @@ pub async fn run_with_config(mut config: ServerConfig) -> std::io::Result<Server
 async fn server_main(
     listener: Option<TcpListener>,
     config: ServerConfig,
+    persistence_locks: Vec<std::fs::File>,
     mut shutdown_rx: watch::Receiver<Option<Duration>>,
     ready_tx: oneshot::Sender<std::io::Result<Arc<Runtime>>>,
 ) -> Result<ShutdownOutcome, ShutdownError> {
     let mut background_tasks = JoinSet::new();
-    let runtime = match Runtime::start(config, &mut background_tasks).await {
+    let runtime = match Runtime::start(config, persistence_locks, &mut background_tasks).await {
         Ok(runtime) => runtime,
         Err(error) => {
             let ready_error = std::io::Error::new(error.kind(), error.to_string());
@@ -2465,10 +2494,9 @@ async fn server_main(
     // A clean drain has no request or maintenance tasks left. Closing the
     // mutation boundary here also protects against stale embedded clients.
     runtime.store.begin_shutdown();
-    runtime
-        .store
-        .finalize_shutdown()
-        .map_err(ShutdownError::Persistence)?;
+    let final_sync = runtime.store.finalize_shutdown();
+    runtime.release_persistence_locks();
+    final_sync.map_err(ShutdownError::Persistence)?;
 
     if let Some(error) = runtime_failure {
         return Err(ShutdownError::Runtime(error));
@@ -2484,6 +2512,7 @@ async fn server_main(
 impl Runtime {
     async fn start(
         config: ServerConfig,
+        persistence_locks: Vec<std::fs::File>,
         background_tasks: &mut JoinSet<()>,
     ) -> std::io::Result<Arc<Self>> {
         snapshot::complete_pending_restore(&config)?;
@@ -2510,6 +2539,7 @@ impl Runtime {
             script_engine,
             config,
             accepting_work: std::sync::atomic::AtomicBool::new(true),
+            persistence_locks: parking_lot::Mutex::new(Some(persistence_locks)),
         });
 
         emit_info(
@@ -4533,6 +4563,36 @@ mod persistence_config_tests {
             error.to_string(),
             "server startup failed before readiness signal"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_directory_cannot_be_opened_by_two_runtimes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), StorageMode::Memory);
+        config.enable_resp = false;
+        config.save_interval = Duration::ZERO;
+
+        let first = run_with_config(config.clone()).await.unwrap();
+        let error = match run_with_config(config.clone()).await {
+            Ok(_) => panic!("second runtime unexpectedly acquired the persistent directory"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("already in use"), "{error}");
+
+        let stale_client = first.client();
+        first.shutdown_and_wait().await.unwrap();
+        run_with_config(config)
+            .await
+            .unwrap()
+            .shutdown_and_wait()
+            .await
+            .unwrap();
+        assert!(stale_client
+            .execute_value("SET", &["after-shutdown", "rejected"])
+            .await
+            .is_err());
     }
 }
 

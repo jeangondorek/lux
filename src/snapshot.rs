@@ -1,5 +1,6 @@
 use crate::store::{DumpValue, Store};
 use hashbrown::{HashMap, HashSet};
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
@@ -115,11 +116,12 @@ pub(crate) fn required_existing_journals(
     config: &crate::ServerConfig,
 ) -> io::Result<HashSet<String>> {
     let path = snapshot_path_for_config(config);
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(error) => return Err(error),
-    };
+    if !crate::file_security::regular_file_exists(&path)? {
+        return Ok(HashSet::new());
+    }
+    let mut file = crate::file_security::open_private_file(&path, |options| {
+        options.read(true);
+    })?;
     let mut header = [0u8; 4];
     let read = file.read(&mut header)?;
     if read < header.len() {
@@ -159,11 +161,15 @@ fn restore_staged_path(config: &crate::ServerConfig) -> std::path::PathBuf {
 /// represents a completed save. A missing snapshot means the engine has not
 /// completed a save yet.
 pub(crate) fn last_save_unix_seconds(store: &Store) -> io::Result<Option<u64>> {
-    let modified = match fs::metadata(snapshot_path(store)) {
-        Ok(metadata) => metadata.modified()?,
+    let path = snapshot_path(store);
+    let file = match crate::file_security::open_private_file(Path::new(&path), |options| {
+        options.read(true);
+    }) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    let modified = file.metadata()?.modified()?;
     Ok(Some(
         modified
             .duration_since(std::time::UNIX_EPOCH)
@@ -289,13 +295,26 @@ fn save_entries(
     if let Some(parent) = Path::new(&path).parent() {
         crate::disk::create_dir_all_synced(parent)?;
     }
-    let tmp = format!("{path}.{}.tmp", std::process::id());
-    let file = fs::File::create(&tmp)?;
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let tmp = format!("{path}.{}.{nonce}.tmp", std::process::id());
+    let file = crate::file_security::open_private_file(Path::new(&tmp), |options| {
+        options.create_new(true).write(true);
+    })?;
     let mut w = BufWriter::new(file);
     save_snapshot_binary(&mut w, entries, store, checkpoints)?;
-    w.into_inner().map_err(io::Error::other)?.sync_all()?;
+    let file = w.into_inner().map_err(io::Error::other)?;
+    file.sync_all()?;
     #[cfg(test)]
     if let Err(error) = fault_injection::check(fault_injection::Point::BeforeSnapshotRename) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = crate::file_security::ensure_regular_or_missing(Path::new(&path)) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
@@ -303,6 +322,7 @@ fn save_entries(
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
+    crate::file_security::verify_installed_file(Path::new(&path), &file)?;
     #[cfg(test)]
     fault_injection::check(fault_injection::Point::AfterSnapshotRename)?;
     if let Some(parent) = Path::new(&path).parent() {
@@ -399,19 +419,26 @@ fn stage_restore(config: &crate::ServerConfig, dump: &[u8]) -> io::Result<()> {
     let data_dir = Path::new(&config.data_dir);
     crate::disk::create_dir_all_synced(data_dir)?;
     let staged = restore_staged_path(config);
-    let mut file = fs::File::create(&staged)?;
+    let mut file = crate::file_security::open_private_file(&staged, |options| {
+        options.create(true).truncate(true).write(true);
+    })?;
     file.write_all(dump)?;
     file.sync_all()?;
+    crate::file_security::verify_installed_file(&staged, &file)?;
     crate::disk::sync_directory(data_dir)?;
 
     let marker = restore_marker_path(config);
     let marker_tmp = data_dir.join(RESTORE_MARKER_TMP);
-    let mut file = fs::File::create(&marker_tmp)?;
+    let mut file = crate::file_security::open_private_file(&marker_tmp, |options| {
+        options.create(true).truncate(true).write(true);
+    })?;
     file.write_all(b"LUX-RESTORE-1")?;
     file.sync_all()?;
     #[cfg(test)]
     fault_injection::check(fault_injection::Point::BeforeRestoreMarkerRename)?;
+    crate::file_security::ensure_regular_or_missing(&marker)?;
     fs::rename(&marker_tmp, &marker)?;
+    crate::file_security::verify_installed_file(&marker, &file)?;
     #[cfg(test)]
     fault_injection::check(fault_injection::Point::AfterRestoreMarkerRename)?;
     crate::disk::sync_directory(data_dir)
@@ -426,15 +453,15 @@ fn apply_pending_restore(config: &crate::ServerConfig, finalize: bool) -> io::Re
     let marker = restore_marker_path(config);
     let staged = restore_staged_path(config);
     let data_dir = Path::new(&config.data_dir);
-    if !marker.exists() {
+    if !crate::file_security::regular_file_exists(&marker)? {
         // A crash before the marker became durable leaves the old database
         // authoritative. Discard only the uncommitted staged file.
-        if staged.exists() {
+        if crate::file_security::regular_file_exists(&staged)? {
             fs::remove_file(staged)?;
             crate::disk::sync_directory(data_dir)?;
         }
         let marker_tmp = data_dir.join(RESTORE_MARKER_TMP);
-        if marker_tmp.exists() {
+        if crate::file_security::regular_file_exists(&marker_tmp)? {
             fs::remove_file(marker_tmp)?;
             crate::disk::sync_directory(data_dir)?;
         }
@@ -442,16 +469,30 @@ fn apply_pending_restore(config: &crate::ServerConfig, finalize: bool) -> io::Re
     }
 
     let destination = snapshot_path_for_config(config);
-    if staged.exists() {
-        validate_restore_reader(config, fs::File::open(&staged)?)?;
+    if crate::file_security::regular_file_exists(&staged)? {
+        validate_restore_reader(
+            config,
+            crate::file_security::open_private_file(&staged, |options| {
+                options.read(true);
+            })?,
+        )?;
+        crate::file_security::ensure_regular_or_missing(&destination)?;
         #[cfg(test)]
         fault_injection::check(fault_injection::Point::BeforeRestoreSnapshotRename)?;
         fs::rename(&staged, &destination)?;
         #[cfg(test)]
         fault_injection::check(fault_injection::Point::AfterRestoreSnapshotRename)?;
+        crate::file_security::open_private_file(&destination, |options| {
+            options.read(true);
+        })?;
         crate::disk::sync_directory(data_dir)?;
     } else {
-        validate_restore_reader(config, fs::File::open(&destination)?)?;
+        validate_restore_reader(
+            config,
+            crate::file_security::open_private_file(&destination, |options| {
+                options.read(true);
+            })?,
+        )?;
     }
 
     let journal_dir = config.journal_dir();
@@ -489,7 +530,9 @@ fn install_restored_journal(config: &crate::ServerConfig) -> io::Result<()> {
 }
 
 fn authorized_global_successor(path: &Path) -> io::Result<Option<[u8; 16]>> {
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::file_security::open_private_file(path, |options| {
+        options.read(true);
+    })?;
     let mut header = [0u8; 4];
     file.read_exact(&mut header)?;
     if &header != HEADER_V6 {
@@ -766,10 +809,12 @@ pub(crate) fn load_for_recovery(store: &Store) -> io::Result<usize> {
 fn load_with_mode(store: &Store, preserve_expired: bool) -> io::Result<usize> {
     let path_str = snapshot_path(store);
     let path = Path::new(&path_str);
-    if !path.exists() {
+    if !crate::file_security::regular_file_exists(path)? {
         return Ok(0);
     }
-    let file = fs::File::open(path)?;
+    let file = crate::file_security::open_private_file(path, |options| {
+        options.read(true);
+    })?;
     load_from_reader(store, file, preserve_expired)
 }
 
@@ -1609,6 +1654,22 @@ mod tests {
     }
 
     #[test]
+    fn last_save_time_only_reports_an_installed_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let store = Store::new_with_config(config);
+
+        assert_eq!(last_save_unix_seconds(&store).unwrap(), None);
+        store.set(b"saved", b"value", None, Instant::now());
+        save_and_truncate_wal_consistent(&store).unwrap();
+
+        assert!(last_save_unix_seconds(&store).unwrap().is_some());
+    }
+
+    #[test]
     fn snapshot_waits_for_in_flight_journal_commit_before_truncating() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(crate::ServerConfig {
@@ -1644,6 +1705,19 @@ mod tests {
         done_rx.recv().unwrap().unwrap();
         snapshot_thread.join().unwrap();
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(Path::new(&config.data_dir).join("lux.dat"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
         let recovered = Store::new_with_config(config);
         assert_eq!(load(&recovered).unwrap(), 1);
         recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
@@ -1651,6 +1725,49 @@ mod tests {
             recovered.get(b"snapshot-race", Instant::now()).unwrap(),
             &b"durable"[..]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_load_rejects_symlink_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"not-a-snapshot").unwrap();
+        symlink(&target, dir.path().join("lux.dat")).unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let store = Store::new_with_config(config);
+
+        let error = load(&store).unwrap_err();
+        assert!(error.to_string().contains("symbolic links"), "{error}");
+        assert_eq!(fs::read(target).unwrap(), b"not-a-snapshot");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_aware_probe_rejects_snapshot_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, HEADER_V6).unwrap();
+        symlink(&target, dir.path().join("lux.dat")).unwrap();
+        let config = crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let error = required_existing_journals(&config).unwrap_err();
+        assert!(error.to_string().contains("symbolic links"), "{error}");
+        assert_eq!(fs::read(target).unwrap(), HEADER_V6);
     }
 
     #[test]
